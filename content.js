@@ -55,7 +55,6 @@ const assetToNameMap = new Map(); // Maps Steam AssetIDs to their market names
 
 /**
  * Universally extracts and formats the item name and price.
- * Supports various API schema structures.
  */
 function extractNameAndPrice(item) {
     if (!item) return null;
@@ -65,10 +64,12 @@ function extractNameAndPrice(item) {
 
     if (typeof item === 'object') {
         rawName = item.marketHashName || item.market_hash_name || item.hash_name || item.name || item.marketName || item.market_name || item.title || item.item_name;
-        rawPrice = item.priceCents ?? item.price_cents ?? item.scmPriceCents ?? item.basePriceCents ?? item.price ?? item.lowest_price ?? item.cost ?? item.value;
+        
+    
+        rawPrice = item.collectorAvgSaleCents || item.collectorLowestAskCents || item.priceCents || item.price_cents || item.scmPriceCents || item.basePriceCents || item.price || item.lowest_price || item.cost || item.value;
     }
 
-    if (!rawName || rawPrice === undefined || rawPrice === null) return null;
+    if (!rawName || rawPrice === undefined || rawPrice === null || rawPrice === 0) return null;
 
     // Convert price to float
     let priceNum = rawPrice;
@@ -80,8 +81,8 @@ function extractNameAndPrice(item) {
     if (isNaN(priceNum) || priceNum <= 0) return null;
 
     let formattedPrice;
-    // Format price logic (simplified)
-    if (item.priceCents !== undefined || item.price_cents !== undefined || item.scmPriceCents !== undefined || item.basePriceCents !== undefined || Number.isInteger(priceNum)) {
+    
+    if (item.collectorAvgSaleCents !== undefined || item.collectorLowestAskCents !== undefined || item.priceCents !== undefined || item.price_cents !== undefined || item.scmPriceCents !== undefined || item.basePriceCents !== undefined || Number.isInteger(priceNum)) {
         formattedPrice = (priceNum / 100).toFixed(2);
     } else {
         formattedPrice = priceNum.toFixed(2);
