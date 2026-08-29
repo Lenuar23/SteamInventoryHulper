@@ -1,7 +1,7 @@
 console.log("SIH Lite: Extension loaded!");
 
 /**
- * Injects CSS for badges without affecting Steam clicks or slot layouts
+ * Injects CSS rules for price badges and total value header.
  */
 function injectStyles() {
     if (document.getElementById("sih-lite-styles")) return;
@@ -47,18 +47,15 @@ function injectStyles() {
     document.head.appendChild(style);
 }
 
-// Stores
-const priceByNameMap = new Map();
-const assetPrices = new Map();
-const iconPrices = new Map();
-const assetCaches = new Set();
-const iconCaches = new Set();
-
-const assetToNameMap = new Map();
-const assetToIconMap = new Map();
+// Global data stores for fast lookups
+const priceByNameMap = new Map(); // Name-based prices
+const apiAssetPrices = new Map(); // Direct AssetID to Price mapping (great for items with specific gems)
+const assetCaches = new Set();    // Set containing AssetIDs of Collector's Cache items
+const assetToNameMap = new Map(); // Maps Steam AssetIDs to their market names
 
 /**
- * Universal name & price extractor supporting camelCase and snake_case API schemas
+ * Universally extracts and formats the item name and price.
+ * Supports various API schema structures.
  */
 function extractNameAndPrice(item) {
     if (!item) return null;
@@ -67,16 +64,13 @@ function extractNameAndPrice(item) {
     let rawPrice = null;
 
     if (typeof item === 'object') {
-        // Name detection (Fixed: added marketHashName)
         rawName = item.marketHashName || item.market_hash_name || item.hash_name || item.name || item.marketName || item.market_name || item.title || item.item_name;
-
-        // Price detection
         rawPrice = item.priceCents ?? item.price_cents ?? item.scmPriceCents ?? item.basePriceCents ?? item.price ?? item.lowest_price ?? item.cost ?? item.value;
     }
 
     if (!rawName || rawPrice === undefined || rawPrice === null) return null;
 
-    // Parse price value
+    // Convert price to float
     let priceNum = rawPrice;
     if (typeof priceNum === 'string') {
         const cleaned = priceNum.replace(/[^0-9.,]/g, '').replace(',', '.');
@@ -86,12 +80,8 @@ function extractNameAndPrice(item) {
     if (isNaN(priceNum) || priceNum <= 0) return null;
 
     let formattedPrice;
-    // Check if the source explicitly uses cents
-    if (item.priceCents !== undefined || item.price_cents !== undefined || item.scmPriceCents !== undefined || item.basePriceCents !== undefined) {
-        formattedPrice = (priceNum / 100).toFixed(2);
-    } else if (priceNum >= 100 && Number.isInteger(priceNum)) {
-        formattedPrice = (priceNum / 100).toFixed(2);
-    } else if (priceNum < 100 && Number.isInteger(priceNum)) {
+    // Format price logic (simplified)
+    if (item.priceCents !== undefined || item.price_cents !== undefined || item.scmPriceCents !== undefined || item.basePriceCents !== undefined || Number.isInteger(priceNum)) {
         formattedPrice = (priceNum / 100).toFixed(2);
     } else {
         formattedPrice = priceNum.toFixed(2);
@@ -101,7 +91,8 @@ function extractNameAndPrice(item) {
 }
 
 /**
- * Cleans item names (removes qualities & set/bundle prefixes/suffixes)
+ * Cleans item names by removing extraneous prefixes/suffixes.
+ * E.g., "Inscribed Demon Eater" -> "demon eater"
  */
 function cleanName(name) {
     if (!name) return "";
@@ -113,33 +104,26 @@ function cleanName(name) {
 }
 
 /**
- * Matches item name to price map
+ * Looks up an item's price in the name map (checks both raw and cleaned names).
  */
 function getPriceForName(name) {
     if (!name) return null;
     const raw = name.trim().toLowerCase();
     if (priceByNameMap.has(raw)) return priceByNameMap.get(raw);
+    
     const cleaned = cleanName(name);
     if (priceByNameMap.has(cleaned)) return priceByNameMap.get(cleaned);
+    
     return null;
 }
 
 /**
- * Extracts Economy Image Hash
+ * Fetches the user's Steam inventory.
+ * Supports both modern and legacy API endpoints to bypass 403 Forbidden errors.
  */
-function extractIconUrl(imgSrc) {
-    if (!imgSrc) return null;
-    const match = imgSrc.match(/\/economy\/image\/([^\/\?#]+)/);
-    return match ? match[1] : null;
-}
-
-/**
- * Legacy Steam Inventory parser
- */
-async function fetchLegacySteamInventory(steamId) {
-    const basePath = window.location.pathname.split('/inventory')[0];
+async function fetchSteamInventory(steamId) {
     const urls = [
-        `${window.location.origin}${basePath}/inventory/json/570/2?l=english`,
+        `${window.location.origin}/inventory/${steamId}/570/2?l=english`,
         `${window.location.origin}/profiles/${steamId}/inventory/json/570/2?l=english`
     ];
 
@@ -149,30 +133,40 @@ async function fetchLegacySteamInventory(steamId) {
             if (!res.ok) continue;
 
             const data = await res.json();
-            if (!data || !data.rgInventory || !data.rgDescriptions) continue;
+            
+            let assets = [];
+            let descriptions = [];
+
+            // Compatibility for both modern and legacy JSON responses
+            if (data.assets && data.descriptions) {
+                assets = data.assets;
+                descriptions = data.descriptions;
+            } else if (data.rgInventory && data.rgDescriptions) {
+                assets = Object.values(data.rgInventory);
+                descriptions = Object.values(data.rgDescriptions);
+            } else {
+                continue;
+            }
 
             const descMap = new Map();
 
-            Object.entries(data.rgDescriptions).forEach(([key, desc]) => {
+            // Map descriptions by classid_instanceid
+            descriptions.forEach(desc => {
                 const name = desc.market_hash_name || desc.name || desc.market_name;
-                const iconUrl = desc.icon_url;
                 const classId = String(desc.classid);
                 const instanceId = String(desc.instanceid || '0');
                 const compositeKey = `${classId}_${instanceId}`;
 
-                const isCache = (name && name.toLowerCase().includes("collector's cache")) ||
-                    (desc.tags && desc.tags.some(t => 
-                        (t.name && t.name.toLowerCase().includes("collector's cache")) || 
-                        (t.category_name && t.category_name.toLowerCase().includes("collector's cache"))
-                    ));
+                const descStr = JSON.stringify(desc).toLowerCase();
+                const isCache = descStr.includes("collector's cache") || descStr.includes("collectors cache");
 
-                const info = { name, iconUrl, isCache };
+                const info = { name, isCache };
                 descMap.set(compositeKey, info);
-                descMap.set(classId, info);
-                descMap.set(key, info);
+                descMap.set(classId, info); // Fallback mapping
             });
 
-            Object.values(data.rgInventory).forEach(item => {
+            // Associate specific Asset IDs with their resolved names and cache status
+            assets.forEach(item => {
                 const assetId = String(item.id || item.assetid);
                 const classId = String(item.classid);
                 const instanceId = String(item.instanceid || '0');
@@ -181,48 +175,31 @@ async function fetchLegacySteamInventory(steamId) {
                 const info = descMap.get(compositeKey) || descMap.get(classId);
                 if (info && assetId) {
                     if (info.name) assetToNameMap.set(assetId, info.name);
-                    if (info.iconUrl) assetToIconMap.set(assetId, info.iconUrl);
-                    if (info.isCache) {
-                        assetCaches.add(assetId);
-                        if (info.iconUrl) iconCaches.add(info.iconUrl);
-                    }
+                    if (info.isCache) assetCaches.add(assetId);
                 }
             });
 
-            console.log(`SIH Lite: Indexed ${assetToNameMap.size} inventory items.`);
-            recalculateAndRender();
+            console.log(`SIH Lite: Indexed ${assetToNameMap.size} inventory items from Steam.`);
+            renderPrices(); // Trigger visual update
             return true;
         } catch (err) {
-            console.error("SIH Lite: Legacy inventory fetch error", err);
+            console.error("SIH Lite: Inventory fetch error", err);
         }
     }
-    return false;
+    return false; // Returns false if all endpoints failed
 }
 
 /**
- * Cross-links price dictionary to parsed items & icons
- */
-function recalculateAndRender() {
-    assetToNameMap.forEach((name, assetId) => {
-        const price = getPriceForName(name);
-        if (price) {
-            assetPrices.set(assetId, price);
-            const iconUrl = assetToIconMap.get(assetId);
-            if (iconUrl) iconPrices.set(iconUrl, price);
-        }
-    });
-    renderPrices();
-}
-
-/**
- * Resolves SteamID64
+ * Attempts to resolve the SteamID64 of the current inventory owner from the DOM.
  */
 async function getInventoryOwnerSteamId() {
     const pathname = window.location.pathname;
 
+    // Direct match from URL
     const profileMatch = pathname.match(/\/profiles\/(7656119\d{10})/);
     if (profileMatch) return profileMatch[1];
 
+    // Search page scripts for global variables
     const scripts = document.querySelectorAll('script');
     for (const script of scripts) {
         const text = script.textContent;
@@ -234,6 +211,7 @@ async function getInventoryOwnerSteamId() {
         if (viewingMatch) return viewingMatch[1];
     }
 
+    // Resolve custom URL slug to SteamID64 via XML endpoint
     const customIdMatch = pathname.match(/\/id\/([^\/]+)/);
     if (customIdMatch) {
         const customSlug = customIdMatch[1];
@@ -252,41 +230,51 @@ async function getInventoryOwnerSteamId() {
 }
 
 /**
- * Builds price lookup map with universal extractor
+ * Populates price maps from external API data.
  */
 function buildPriceMap(items) {
     priceByNameMap.clear();
+    apiAssetPrices.clear();
 
     items.forEach(item => {
         const parsed = extractNameAndPrice(item);
         if (!parsed) return;
 
+        // If the API provides a specific assetid (e.g. for items with gems), bind strictly to it
+        const assetId = item.assetid || item.assetId || item.id || item.asset_id;
+        if (assetId) {
+            apiAssetPrices.set(String(assetId), parsed.price);
+        }
+
+        // Fallback: Bind by exact and cleaned name
         priceByNameMap.set(parsed.name.trim().toLowerCase(), parsed.price);
         priceByNameMap.set(cleanName(parsed.name), parsed.price);
     });
 
-    console.log(`SIH Lite: Processed ${priceByNameMap.size} valid prices.`);
-    recalculateAndRender();
+    console.log(`SIH Lite: Processed ${priceByNameMap.size} prices (${apiAssetPrices.size} specific Asset IDs).`);
+    renderPrices();
 }
 
 /**
- * Renders inventory value banner
+ * Calculates and displays the total inventory value at the top of the page.
  */
 function renderTotalValue(items) {
     if (!Array.isArray(items)) return;
 
-    let totalDollars = 0;
-    items.forEach(item => {
+    // Calculate sum using Array.reduce
+    let totalDollars = items.reduce((sum, item) => {
         const parsed = extractNameAndPrice(item);
-        if (parsed) totalDollars += parseFloat(parsed.price);
-    });
+        return parsed ? sum + parseFloat(parsed.price) : sum;
+    }, 0);
 
     let header = document.querySelector('.sih-lite-total');
+    
+    // Inject the header if it doesn't exist yet
     if (!header) {
-        header = document.createElement('div');
-        header.className = 'sih-lite-total';
-        const targetContainer = document.querySelector('#inventory_items') || document.querySelector('.inventory_header');
+        const targetContainer = document.querySelector('#inventory_items, .inventory_header');
         if (targetContainer && targetContainer.parentNode) {
+            header = document.createElement('div');
+            header.className = 'sih-lite-total';
             targetContainer.parentNode.insertBefore(header, targetContainer);
         }
     }
@@ -297,7 +285,7 @@ function renderTotalValue(items) {
 }
 
 /**
- * Main rendering engine
+ * Main DOM manipulation function. Scans item slots and injects badges.
  */
 function renderPrices() {
     const itemSlots = document.querySelectorAll('.itemHolder .item, div.item');
@@ -305,11 +293,13 @@ function renderPrices() {
     itemSlots.forEach(slot => {
         let assetId = null;
 
+        // Extract AssetID directly from the slot element ID
         if (slot.id) {
             const match = slot.id.match(/570_2_(\d+)/);
             if (match) assetId = match[1];
         }
 
+        // Extract AssetID from nested link as fallback
         if (!assetId) {
             const link = slot.querySelector('a.inventory_item_link');
             if (link && link.href) {
@@ -319,49 +309,43 @@ function renderPrices() {
         }
 
         const img = slot.querySelector('img');
-        const iconUrl = img ? extractIconUrl(img.src) : null;
         const titleName = img ? (img.alt || img.title || '') : '';
 
         let price = null;
         let isCache = false;
 
-        // Step 1: Asset ID lookup
+        // Step 1: Secure Asset ID lookup
         if (assetId) {
-            price = assetPrices.get(assetId);
+            price = apiAssetPrices.get(assetId); // Perfect match lookup
+            
+            // Name-based fallback utilizing the assetToNameMap
             if (!price && assetToNameMap.has(assetId)) {
                 price = getPriceForName(assetToNameMap.get(assetId));
             }
+            
             if (assetCaches.has(assetId)) isCache = true;
         }
 
-        // Step 2: Icon Hash lookup (for duplicates)
-        if (!price && iconUrl) {
-            price = iconPrices.get(iconUrl);
-            if (iconCaches.has(iconUrl)) isCache = true;
-        }
-
-        // Step 3: Image Title / Alt text fallback
+        // Step 2: Desperate DOM text fallback
         if (!price && titleName) {
             price = getPriceForName(titleName);
-            if (titleName.toLowerCase().includes("collector's cache")) isCache = true;
+            const lowerTitle = titleName.toLowerCase();
+            if (lowerTitle.includes("cache") || lowerTitle.includes("коллекторс")) isCache = true;
         }
 
-        // Automatic icon -> price auto-learning
-        if (price && iconUrl && !iconPrices.has(iconUrl)) {
-            iconPrices.set(iconUrl, price);
-        }
-
+        // Determine badge type
         let badgeType = null;
         let badgeValue = null;
 
-        if (price) {
-            badgeType = 'price';
-            badgeValue = `$${price}`;
-        } else if (isCache) {
+        if (isCache && !price) {
             badgeType = 'cache';
             badgeValue = 'Cache';
+        } else if (price) {
+            badgeType = 'price';
+            badgeValue = `$${price}`;
         }
 
+        // DOM Injection
         let badge = slot.querySelector('.sih-lite-badge');
 
         if (badgeType && badgeValue) {
@@ -373,16 +357,19 @@ function renderPrices() {
                 badge.textContent = badgeValue;
                 slot.appendChild(badge);
             } else {
+                // Only update DOM if changes occurred to save performance
                 if (badge.className !== className) badge.className = className;
                 if (badge.textContent !== badgeValue) badge.textContent = badgeValue;
             }
         } else if (badge) {
-            badge.remove();
+            badge.remove(); // Cleanup invalid badges
         }
     });
 }
 
-// Execution
+// ==========================================
+// Extension Initialization Execution
+// ==========================================
 injectStyles();
 
 (async function init() {
@@ -391,9 +378,11 @@ injectStyles();
     if (targetSteamId) {
         console.log("SIH Lite: Detected inventory owner Steam ID ->", targetSteamId);
 
+        // Runs repeatedly to catch DOM updates (page turns, filters).
+        // Consider switching to MutationObserver for better performance in the future.
         setInterval(renderPrices, 350);
 
-        fetchLegacySteamInventory(targetSteamId);
+        fetchSteamInventory(targetSteamId);
 
         chrome.runtime.sendMessage({ action: "fetchPrices", steamId: targetSteamId }, (response) => {
             if (response && response.success && response.data?.items) {
