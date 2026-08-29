@@ -1,0 +1,25 @@
+{
+  "manifest_version": 3,
+  "name": "SIH Lite",
+  "version": "1.0",
+  "description": "A lightweight extension to fetch Steam inventory prices.",
+  "permissions": [
+    "activeTab"
+  ],
+  "host_permissions": [
+    "https://steamprice.com/*",
+    "*://*.steamcommunity.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "*://steamcommunity.com/profiles/*/inventory*", 
+        "*://steamcommunity.com/id/*/inventory*"
+      ],
+      "js": ["content.js"]
+    }
+  ]
+}
