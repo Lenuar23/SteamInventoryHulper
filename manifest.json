@@ -4,7 +4,8 @@
   "version": "1.0",
   "description": "A lightweight extension to fetch Steam inventory prices.",
   "permissions": [
-    "activeTab"
+    "activeTab",
+    "tabs"
   ],
   "host_permissions": [
     "https://steamprice.com/*",
