@@ -59,13 +59,13 @@
 
     function request(action, id) {
         return new Promise((resolve, reject) => {
-            const timer = setTimeout(() => reject(new Error('Час очікування Steamprice вичерпано. Спробуйте ще раз.')), 180000);
+            const timer = setTimeout(() => reject(new Error('Steamprice request timed out. Please try again.')), 180000);
             try {
                 chrome.runtime.sendMessage({ action, steamId: id }, response => {
                     clearTimeout(timer);
                     const error = chrome.runtime.lastError;
                     if (error) reject(new Error(error.message));
-                    else if (!response?.success) reject(new Error(response?.error || 'Steamprice не повернув дані.'));
+                    else if (!response?.success) reject(new Error(response?.error || 'Steamprice did not return any data.'));
                     else resolve(response.data);
                 });
             } catch (error) { clearTimeout(timer); reject(error); }
@@ -77,7 +77,7 @@
         try {
             const data = await request('fetchPrices', id);
             if (currentGeneration !== generation) return;
-            if (!Array.isArray(data?.items)) throw new Error('Некоректна відповідь з цінами.');
+            if (!Array.isArray(data?.items)) throw new Error('Invalid price response.');
             buildPrices(data.items);
             priceState = 'ready';
             queueRender();
@@ -99,7 +99,7 @@
             if (currentGeneration !== generation) return;
             const value = data?.totalValueCents;
             if (value === null || value === undefined || value === '' || !Number.isFinite(Number(value)) || Number(value) < 0) {
-                throw new Error('Steamprice не повернув totalValueCents.');
+                throw new Error('Steamprice did not return totalValueCents.');
             }
             totalCents = Math.round(Number(value));
         } catch (error) {
@@ -123,11 +123,11 @@
 
     function sortInventory(order) {
         if (!activeDota || busy || (order !== 'original' && priceState !== 'ready')) return;
-        busy = true; sortStatus = 'Завантажуємо всі предмети інвентарю…';
+        busy = true; sortStatus = 'Loading all inventory items…';
         const requestId = `${Date.now()}-${++requestNumber}`;
         const timer = setTimeout(() => {
             pendingSorts.delete(requestId); busy = false;
-            sortStatus = 'Steam не завершив завантаження. Спробуйте ще раз.'; queueRender();
+            sortStatus = 'Steam did not finish loading. Please try again.'; queueRender();
         }, 125000);
         pendingSorts.set(requestId, { timer, order, generation });
         window.postMessage({source: 'SIH_LITE_CONTENT', type: 'SORT', requestId, steamId, order,
@@ -165,13 +165,13 @@
         panel = document.createElement('div'); panel.id = 'sih-lite-ui-container';
         const total = document.createElement('span'); total.id = 'sih-lite-total-text'; total.className = 'sih-lite-total';
         panel.appendChild(total);
-        for (const [order, label] of [['desc', 'Ціна ↓'], ['asc', 'Ціна ↑'], ['original', 'Порядок Steam']]) {
+        for (const [order, label] of [['desc', 'Price ↓'], ['asc', 'Price ↑'], ['original', 'Steam order']]) {
             const button = document.createElement('button'); button.type = 'button'; button.className = 'sih-lite-sort-btn';
             button.dataset.order = order; button.textContent = label;
             button.addEventListener('click', () => sortInventory(order)); panel.appendChild(button);
         }
         const retry = document.createElement('button'); retry.type = 'button'; retry.id = 'sih-lite-retry';
-        retry.className = 'sih-lite-sort-btn'; retry.textContent = 'Повторити';
+        retry.className = 'sih-lite-sort-btn'; retry.textContent = 'Retry';
         retry.addEventListener('click', () => {
             if (!steamId) return;
             if (priceState === 'error') loadPrices(steamId, generation);
@@ -192,14 +192,14 @@
         if (panel) {
             panel.hidden = !activeDota;
             setText(panel.querySelector('#sih-lite-total-text'), totalCents !== null
-                ? `Вартість Dota 2: ${money(totalCents)}` : profileError ? 'Вартість недоступна' : 'Завантажуємо вартість…');
-            panel.querySelector('#sih-lite-total-text').title = 'Повна оцінка інвентарю від Steamprice; дані можуть оновлюватися із затримкою.';
+                ? `Dota 2 value: ${money(totalCents)}` : profileError ? 'Inventory value unavailable' : 'Loading inventory value…');
+            panel.querySelector('#sih-lite-total-text').title = 'Full inventory valuation from Steamprice; updates may be delayed.';
             for (const button of panel.querySelectorAll('[data-order]')) {
                 button.disabled = busy || (button.dataset.order !== 'original' && priceState !== 'ready');
                 button.setAttribute('aria-pressed', String(button.dataset.order === sortOrder));
             }
             panel.querySelector('#sih-lite-retry').hidden = !profileError && priceState !== 'error';
-            setText(panel.querySelector('#sih-lite-status'), [priceState === 'loading' ? 'Завантажуємо ціни Steamprice…' : priceError,
+            setText(panel.querySelector('#sih-lite-status'), [priceState === 'loading' ? 'Loading Steamprice prices…' : priceError,
                 profileError, sortStatus].filter(Boolean).join(' '));
         }
         for (const slot of document.querySelectorAll('.itemHolder .item, div.item')) {
@@ -244,14 +244,14 @@
             if (!pending || pending.generation !== generation) return;
             if (message.type === 'SORT_PROGRESS') sortStatus = message.message ||
                 (Number.isSafeInteger(message.loaded) && Number.isSafeInteger(message.total)
-                    ? `Завантажуємо предмети: ${message.loaded} / ${message.total}…` : 'Завантажуємо всі предмети…');
+                    ? `Loading items: ${message.loaded} / ${message.total}…` : 'Loading all items…');
             else {
                 clearTimeout(pending.timer); pendingSorts.delete(message.requestId); busy = false;
                 if (message.success) {
                     sortOrder = pending.order;
-                    sortStatus = pending.order === 'original' ? 'Відновлено порядок Steam.'
-                        : `Відсортовано ${message.count} предметів. Предмети без ціни — в кінці.`;
-                } else sortStatus = message.error || 'Не вдалося відсортувати інвентар.';
+                    sortStatus = pending.order === 'original' ? 'Steam order restored.'
+                        : `Sorted ${message.count} items. Unpriced items are shown last.`;
+                } else sortStatus = message.error || 'Could not sort the inventory.';
             }
             queueRender();
         }

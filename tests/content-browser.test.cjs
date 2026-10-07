@@ -118,7 +118,7 @@ async function settleRender(page) {
 
 test('numeric-string total is cents and exact asset prices take precedence over shared names', async t => {
     const page = await openFixture(t);
-    await waitText(page.locator('#sih-lite-total-text'), 'Вартість Dota 2: $123.45');
+    await waitText(page.locator('#sih-lite-total-text'), 'Dota 2 value: $123.45');
     await waitText(badge(page, '100'), '$2.50');
     await waitText(badge(page, '101'), '$9.99');
     assert.equal(await badge(page, '102').count(), 0);
@@ -132,7 +132,7 @@ test('zero total and zero item prices display as $0.00', async t => {
         totalValueCents: '0',
         items: [{ assetid: '100', marketHashName: 'Free Item', priceCents: '0' }]
     });
-    await waitText(page.locator('#sih-lite-total-text'), 'Вартість Dota 2: $0.00');
+    await waitText(page.locator('#sih-lite-total-text'), 'Dota 2 value: $0.00');
     await waitText(badge(page), '$0.00');
     assert.equal(await sortButton(page, 'desc').isEnabled(), true);
 });
@@ -159,7 +159,7 @@ test('all sort buttons work when profile total fails and send complete known pri
     const page = await openFixture(t, {
         plans: { fetchProfile: [{ success: false, error: 'Profile total unavailable' }] }
     });
-    await waitText(page.locator('#sih-lite-total-text'), 'Вартість недоступна');
+    await waitText(page.locator('#sih-lite-total-text'), 'Inventory value unavailable');
     await waitText(badge(page), '$2.50');
     for (const order of ['desc', 'asc', 'original']) {
         await sortButton(page, order).click();
@@ -171,7 +171,7 @@ test('all sort buttons work when profile total fails and send complete known pri
     assert.ok(requests.every(request => request.steamId === OWNER));
     assert.deepEqual(requests[0].prices.assetPrices, [['100', 250], ['101', 999]]);
     assert.ok(requests[0].prices.namePrices.some(([name, price]) => name === 'same name' && price === 999));
-    assert.equal(await page.locator('#sih-lite-status').textContent(), 'Profile total unavailable Відновлено порядок Steam.');
+    assert.equal(await page.locator('#sih-lite-status').textContent(), 'Profile total unavailable Steam order restored.');
 });
 
 test('retry recovers price and profile failures and enables price sorting', async t => {
@@ -191,7 +191,7 @@ test('retry recovers price and profile failures and enables price sorting', asyn
         document.querySelector('#sih-lite-status')?.textContent.includes('Total service unavailable'));
     assert.equal(await sortButton(page, 'desc').isEnabled(), false);
     await page.locator('#sih-lite-retry').click();
-    await waitText(page.locator('#sih-lite-total-text'), 'Вартість Dota 2: $98.76');
+    await waitText(page.locator('#sih-lite-total-text'), 'Dota 2 value: $98.76');
     await waitText(badge(page), '$2.50');
     assert.equal(await sortButton(page, 'desc').isEnabled(), true);
     assert.equal(await page.locator('#sih-lite-retry').isVisible(), false);
@@ -210,7 +210,7 @@ test('failed inventory sorting displays the failure and permits another attempt'
     assert.equal(await sortButton(page, 'desc').getAttribute('aria-pressed'), 'false');
     await page.evaluate(() => { window.__sortReply = { success: true, count: 4 }; });
     await sortButton(page, 'desc').click();
-    await waitText(page.locator('#sih-lite-status'), 'Відсортовано 4 предметів. Предмети без ціни — в кінці.');
+    await waitText(page.locator('#sih-lite-status'), 'Sorted 4 items. Unpriced items are shown last.');
     assert.equal(await sortButton(page, 'desc').getAttribute('aria-pressed'), 'true');
     assert.equal(await page.evaluate(() => window.__sortRequests.length), 2);
 });
@@ -226,7 +226,7 @@ test('late price and total responses from a previous owner cannot replace the cu
     });
     await page.waitForFunction(() => window.__pendingResponses.length === 2);
     await state(page, OTHER_OWNER);
-    await waitText(page.locator('#sih-lite-total-text'), 'Вартість Dota 2: $22.00');
+    await waitText(page.locator('#sih-lite-total-text'), 'Dota 2 value: $22.00');
     await waitText(badge(page), '$3.00');
     await page.evaluate(oldOwner => {
         const pending = window.__pendingResponses.splice(0);
@@ -238,7 +238,7 @@ test('late price and total responses from a previous owner cannot replace the cu
         }
     }, OWNER);
     await settleRender(page);
-    assert.equal(await page.locator('#sih-lite-total-text').textContent(), 'Вартість Dota 2: $22.00');
+    assert.equal(await page.locator('#sih-lite-total-text').textContent(), 'Dota 2 value: $22.00');
     assert.equal(await badge(page).textContent(), '$3.00');
     await sortButton(page, 'asc').click();
     await page.waitForFunction(() => window.__sortRequests.length === 1);

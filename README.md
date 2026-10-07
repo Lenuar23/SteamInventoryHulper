@@ -1,47 +1,47 @@
 # SIH Beta
 
-Розширення Chromium для цін інвентарю **Dota 2** у Steam.
+A Chromium extension that shows prices for your **Dota 2** inventory on Steam.
 
-- Показує ціну предмета та загальну оцінку інвентарю з `Steamprice /api/dota2/profile/{steamId}` (`totalValueCents`).
-- Сортує весь інвентар за зростанням або спаданням ціни, а не лише відкриту сторінку. Предмети без відомої ціни залишаються в кінці; нульова ціна враховується.
-- Кнопка **«Порядок Steam»** повертає початковий порядок предметів.
-- Зберігає штатні сторінки, вигляд, фільтри та елементи предметів Steam. Власної сітки немає.
+- Shows individual item prices and the total inventory valuation from Steamprice. The total comes from `/api/dota2/profile/{steamId}` (`totalValueCents`).
+- Sorts the entire inventory by price in ascending or descending order, including items on unopened pages. Items with unknown prices stay at the end; zero prices are included.
+- The **Steam order** button restores the original item order.
+- Keeps Steam's native pages, appearance, filters, and item elements.
 
-## Встановлення
+## Installation
 
-1. Розпакуйте архів розширення в окрему папку.
-2. Відкрийте `chrome://extensions` і ввімкніть режим розробника.
-3. Натисніть **«Завантажити розпаковане розширення»** та виберіть папку з `manifest.json`.
-4. Якщо попередня версія вже встановлена, вимкніть її, щоб дві версії не змінювали інвентар одночасно.
-5. Оновіть сторінку інвентарю Steam і виберіть Dota 2. Підтримуються адреси `/profiles/.../inventory` та `/id/.../inventory`.
+1. Download or clone the extension into a separate folder.
+2. Open `chrome://extensions` and enable **Developer mode**.
+3. Click **Load unpacked** and select the folder containing `manifest.json`.
+4. If an earlier version is installed, disable it so that two versions do not modify the inventory at the same time.
+5. Reload your Steam inventory page and select Dota 2. Both `/profiles/.../inventory` and `/id/.../inventory` URLs are supported.
 
-Потрібен Chrome/Chromium 111+ або сумісний браузер із підтримкою Manifest V3. Для встановлення у керованому браузері його політика має дозволяти розширення.
+Requires Chrome/Chromium 111+ or a compatible browser with Manifest V3 support. A managed browser must allow extension installation through its policy.
 
-## Сортування
+## Sorting
 
-Після отримання цін натисніть **«Ціна ↓»** або **«Ціна ↑»**. При першому сортуванні Steam завантажує всі предмети через свій `LoadCompleteInventory()`. Прогрес видно в панелі; під час завантаження кнопки заблоковані. Після сортування відкривається перша штатна сторінка. Подальші сортування використовують уже завантажені предмети.
+Once prices have loaded, click **Price ↓** or **Price ↑**. On the first sort, Steam loads every item through its `LoadCompleteInventory()` method. The panel shows progress, and the buttons remain disabled during loading. Sorting opens the first native inventory page. Subsequent sorts reuse the loaded items.
 
-Якщо Steam повертає помилку завантаження або обмеження запитів, розширення залишає попередній порядок і показує помилку. Зачекайте кілька секунд і повторіть натискання. Якщо помилку повернув Steamprice, кнопка **«Повторити»** повторює запити цін або загальної вартості. Невдалий запит не показується як успішно завантажений частковий інвентар.
+If Steam fails to load the inventory or limits requests, the extension keeps the previous order and displays an error. Wait a few seconds and click the sort button again. If Steamprice returns an error, **Retry** repeats the failed price or total-value requests. Failed requests produce an error instead of reporting an incomplete inventory as successfully loaded.
 
-Оцінка Steamprice може бути застарілою або відрізнятися від цін Steam Market. Загальна вартість береться саме з профільного API, а не із суми відображених предметів. Спочатку ціна шукається за AssetID, потім за назвою; пошук за очищеною назвою зберігає поведінку попередньої версії. Якщо Steamprice не має кешу інвентарю, розширення тимчасово відкриває неактивну вкладку цього сервісу для сканування та закриває її.
+Steamprice valuations may be outdated or differ from Steam Market prices. The total value comes directly from the profile API rather than the sum of the displayed items. Item prices are matched by AssetID first, then by name; matching by a cleaned name preserves the previous version's behavior. If Steamprice has no cached inventory, the extension temporarily opens a background tab on the service to trigger a scan, then closes it.
 
-Підтримка сортування залежить від внутрішніх методів Steam (`LoadCompleteInventory`, `LayoutPages` та масиву штатних item holders); якщо Steam змінить їх, може знадобитися оновлення розширення. Захисні ліміти: 100 000 предметів і 1 000 сторінок цін; перевищення дає явну помилку.
+Sorting relies on Steam's internal methods (`LoadCompleteInventory`, `LayoutPages`, and the array of native item holders). Changes to these internals may require an extension update. The safety limits are 100,000 items and 1,000 price pages; exceeding either limit produces an explicit error.
 
-## Перевірки розробки
+## Development checks
 
-Збірка та сервер не потрібні. Файли розширення: `manifest.json`, `background.js`, `content.js`, `inject.js`.
+No build step or server is required. The extension consists of `manifest.json`, `background.js`, `content.js`, and `inject.js`.
 
 ```sh
 node --test tests/background.test.cjs tests/native-inventory.test.cjs
 node --test tests/content-browser.test.cjs
 ```
 
-Друга команда потребує Playwright і Chromium (у підготовленому хмарному середовищі вони вже є). Тести перевіряють пагінацію API, центи/нульові ціни, збої запитів, сортування та відновлення порядку і поведінку панелі у браузері. Мережеві відповіді тестів підставні; це не підтверджує актуальність цін реального інвентарю.
+The second command requires Playwright and Chromium, which are already available in the configured cloud environment. The tests cover API pagination, prices in cents and zero prices, request failures, sorting and order restoration, and panel behavior in the browser. Network responses are mocked, so these tests do not verify current prices for a real inventory.
 
-Додатково перевірено 200 предметів, послідовне завантаження п'яти порцій, штатну пагінацію, фільтри та кліки на вузькому екрані з офіційними скриптами Steam. Збережений сценарій можна повторити:
+Additional checks using Steam's official scripts covered 200 items, sequential loading in five batches, native pagination, filters, and clicks on a narrow screen. To rerun that scenario:
 
 ```sh
 SIH_STEAM_FIXTURES=/workspace/.sih-test-fixtures node tests/steam-browser-integration.cjs
 ```
 
-У хмарному середовищі ці файли збережені поза репозиторієм. Для іншої машини помістіть `economy_v2.js`, `jquery-1.11.1.min.js` і `prototype-1.7.js` з `https://steamcommunity.com/public/javascript/` в окрему папку та передайте її через `SIH_STEAM_FIXTURES`. Сам сценарій не виконує мережевих запитів. Шлях до браузера за потреби задається `SIH_CHROMIUM_PATH`.
+In the cloud environment, these fixture files are stored outside the repository. On another machine, place `economy_v2.js`, `jquery-1.11.1.min.js`, and `prototype-1.7.js` from `https://steamcommunity.com/public/javascript/` in a separate folder and set `SIH_STEAM_FIXTURES` to its path. The runner makes no network requests. Set `SIH_CHROMIUM_PATH` if you need to specify the browser executable.
