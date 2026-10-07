@@ -1,399 +1,262 @@
-console.log("SIH Lite: Extension loaded!");
+(() => {
+    'use strict';
+    const assetPrices = new Map();
+    const namePrices = new Map();
+    const inventoryItems = new Map();
+    const pendingSorts = new Map();
+    let steamId = null, activeDota = false, generation = 0;
+    let priceState = 'loading', totalCents = null;
+    let profileError = '', priceError = '', sortStatus = '', sortOrder = 'original';
+    let busy = false, renderQueued = false, requestNumber = 0;
+    let profileLoad = Promise.resolve();
 
-/**
- * Injects CSS rules for price badges and total value header.
- */
-function injectStyles() {
-    if (document.getElementById("sih-lite-styles")) return;
-    const style = document.createElement("style");
-    style.id = "sih-lite-styles";
-    style.textContent = `
-        .sih-lite-badge {
-            position: absolute !important;
-            bottom: 2px !important;
-            right: 2px !important;
-            font-size: 11px !important;
-            font-weight: bold !important;
-            padding: 2px 5px !important;
-            border-radius: 3px !important;
-            z-index: 99 !important;
-            pointer-events: none !important;
-            user-select: none !important;
-            box-shadow: 0 0 4px rgba(0,0,0,0.9) !important;
-            line-height: 1.2 !important;
+    const cleanName = name => String(name || '').toLowerCase()
+        .replace(/^(inscribed|autographed|corrupted|frozen|heroic|cursed|genuine|favored|ascent|elder|unusual|exalted|infused|auspicious|base|legacy|sealed)\s+/i, '')
+        .replace(/\s+(bundle|set)$/i, '').trim();
+    const money = cents => `$${(cents / 100).toFixed(2)}`;
+
+    function parsePrice(item) {
+        if (!item || typeof item !== 'object') return null;
+        for (const key of ['collectorAvgSaleCents', 'collectorLowestAskCents', 'priceCents', 'price_cents', 'scmPriceCents', 'basePriceCents']) {
+            if (!['number', 'string'].includes(typeof item[key]) || String(item[key]).trim() === '') continue;
+            const number = Number(item[key]);
+            if (number >= 0 && Number.isSafeInteger(Math.round(number))) return Math.round(number);
         }
-        .sih-lite-price {
-            background-color: rgba(0, 0, 0, 0.9) !important;
-            color: #5cff5c !important;
-            border: 1px solid rgba(92, 255, 92, 0.6) !important;
+        for (const key of ['price', 'lowest_price', 'cost', 'value']) {
+            if (!['number', 'string'].includes(typeof item[key]) || String(item[key]).trim() === '') continue;
+            const cleaned = typeof item[key] === 'string' ? item[key].replace(/[^0-9.,]/g, '').replace(',', '.') : item[key];
+            if (cleaned === '') continue;
+            const number = typeof item[key] === 'string'
+                ? Number(cleaned) : item[key];
+            if (number >= 0 && Number.isSafeInteger(Math.round(number * 100))) return Math.round(number * 100);
         }
-        .sih-lite-cache {
-            background-color: rgba(45, 10, 60, 0.9) !important;
-            color: #d070ff !important;
-            border: 1px solid rgba(208, 112, 255, 0.7) !important;
-        }
-        .sih-lite-total {
-            font-size: 14px !important;
-            font-weight: bold !important;
-            color: #66c0f4 !important;
-            margin-bottom: 10px !important;
-            padding: 6px 12px !important;
-            background-color: rgba(0, 0, 0, 0.75) !important;
-            border-radius: 4px !important;
-            border-left: 4px solid #5cff5c !important;
-            display: inline-block !important;
-        }
-    `;
-    document.head.appendChild(style);
-}
-
-// Global data stores for fast lookups
-const priceByNameMap = new Map(); // Name-based prices
-const apiAssetPrices = new Map(); // Direct AssetID to Price mapping (great for items with specific gems)
-const assetCaches = new Set();    // Set containing AssetIDs of Collector's Cache items
-const assetToNameMap = new Map(); // Maps Steam AssetIDs to their market names
-
-/**
- * Universally extracts and formats the item name and price.
- */
-function extractNameAndPrice(item) {
-    if (!item) return null;
-
-    let rawName = null;
-    let rawPrice = null;
-
-    if (typeof item === 'object') {
-        rawName = item.marketHashName || item.market_hash_name || item.hash_name || item.name || item.marketName || item.market_name || item.title || item.item_name;
-        
-    
-        rawPrice = item.collectorAvgSaleCents || item.collectorLowestAskCents || item.priceCents || item.price_cents || item.scmPriceCents || item.basePriceCents || item.price || item.lowest_price || item.cost || item.value;
+        return null;
     }
 
-    if (!rawName || rawPrice === undefined || rawPrice === null || rawPrice === 0) return null;
-
-    // Convert price to float
-    let priceNum = rawPrice;
-    if (typeof priceNum === 'string') {
-        const cleaned = priceNum.replace(/[^0-9.,]/g, '').replace(',', '.');
-        priceNum = parseFloat(cleaned);
-    }
-
-    if (isNaN(priceNum) || priceNum <= 0) return null;
-
-    let formattedPrice;
-    
-    if (item.collectorAvgSaleCents !== undefined || item.collectorLowestAskCents !== undefined || item.priceCents !== undefined || item.price_cents !== undefined || item.scmPriceCents !== undefined || item.basePriceCents !== undefined || Number.isInteger(priceNum)) {
-        formattedPrice = (priceNum / 100).toFixed(2);
-    } else {
-        formattedPrice = priceNum.toFixed(2);
-    }
-
-    return { name: String(rawName), price: formattedPrice };
-}
-
-/**
- * Cleans item names by removing extraneous prefixes/suffixes.
- * E.g., "Inscribed Demon Eater" -> "demon eater"
- */
-function cleanName(name) {
-    if (!name) return "";
-    return name
-        .toLowerCase()
-        .replace(/^(inscribed|autographed|corrupted|frozen|heroic|cursed|genuine|favored|ascent|elder|unusual|exalted|infused|auspicious|base|legacy|sealed)\s+/i, "")
-        .replace(/\s+(bundle|set)$/i, "")
-        .trim();
-}
-
-/**
- * Looks up an item's price in the name map (checks both raw and cleaned names).
- */
-function getPriceForName(name) {
-    if (!name) return null;
-    const raw = name.trim().toLowerCase();
-    if (priceByNameMap.has(raw)) return priceByNameMap.get(raw);
-    
-    const cleaned = cleanName(name);
-    if (priceByNameMap.has(cleaned)) return priceByNameMap.get(cleaned);
-    
-    return null;
-}
-
-/**
- * Fetches the user's Steam inventory.
- * Supports both modern and legacy API endpoints to bypass 403 Forbidden errors.
- */
-async function fetchSteamInventory(steamId) {
-    const urls = [
-        `${window.location.origin}/inventory/${steamId}/570/2?l=english`,
-        `${window.location.origin}/profiles/${steamId}/inventory/json/570/2?l=english`
-    ];
-
-    for (const url of urls) {
-        try {
-            const res = await fetch(url);
-            if (!res.ok) continue;
-
-            const data = await res.json();
-            
-            let assets = [];
-            let descriptions = [];
-
-            // Compatibility for both modern and legacy JSON responses
-            if (data.assets && data.descriptions) {
-                assets = data.assets;
-                descriptions = data.descriptions;
-            } else if (data.rgInventory && data.rgDescriptions) {
-                assets = Object.values(data.rgInventory);
-                descriptions = Object.values(data.rgDescriptions);
-            } else {
-                continue;
-            }
-
-            const descMap = new Map();
-
-            // Map descriptions by classid_instanceid
-            descriptions.forEach(desc => {
-                const name = desc.market_hash_name || desc.name || desc.market_name;
-                const classId = String(desc.classid);
-                const instanceId = String(desc.instanceid || '0');
-                const compositeKey = `${classId}_${instanceId}`;
-
-                const descStr = JSON.stringify(desc).toLowerCase();
-                const isCache = descStr.includes("collector's cache") || descStr.includes("collectors cache");
-
-                const info = { name, isCache };
-                descMap.set(compositeKey, info);
-                descMap.set(classId, info); // Fallback mapping
-            });
-
-            // Associate specific Asset IDs with their resolved names and cache status
-            assets.forEach(item => {
-                const assetId = String(item.id || item.assetid);
-                const classId = String(item.classid);
-                const instanceId = String(item.instanceid || '0');
-                const compositeKey = `${classId}_${instanceId}`;
-
-                const info = descMap.get(compositeKey) || descMap.get(classId);
-                if (info && assetId) {
-                    if (info.name) assetToNameMap.set(assetId, info.name);
-                    if (info.isCache) assetCaches.add(assetId);
+    function buildPrices(items) {
+        assetPrices.clear();
+        namePrices.clear();
+        for (const item of items) {
+            const cents = parsePrice(item);
+            if (cents === null) continue;
+            const assetId = item.assetid ?? item.assetId ?? item.asset_id ?? item.id;
+            if (/^\d{1,20}$/.test(String(assetId))) assetPrices.set(String(assetId), cents);
+            const name = item.marketHashName || item.market_hash_name || item.hash_name || item.name || item.marketName || item.market_name || item.title || item.item_name;
+            if (name) {
+                for (const key of [String(name).trim().toLowerCase(), cleanName(name)]) {
+                    if (key && key.length <= 512) namePrices.set(key, cents);
                 }
-            });
-
-            console.log(`SIH Lite: Indexed ${assetToNameMap.size} inventory items from Steam.`);
-            renderPrices(); // Trigger visual update
-            return true;
-        } catch (err) {
-            console.error("SIH Lite: Inventory fetch error", err);
-        }
-    }
-    return false; // Returns false if all endpoints failed
-}
-
-/**
- * Attempts to resolve the SteamID64 of the current inventory owner from the DOM.
- */
-async function getInventoryOwnerSteamId() {
-    const pathname = window.location.pathname;
-
-    // Direct match from URL
-    const profileMatch = pathname.match(/\/profiles\/(7656119\d{10})/);
-    if (profileMatch) return profileMatch[1];
-
-    // Search page scripts for global variables
-    const scripts = document.querySelectorAll('script');
-    for (const script of scripts) {
-        const text = script.textContent;
-
-        const ownerMatch = text.match(/g_ownerSteamID\s*=\s*["']?(7656119\d{10})["']?/);
-        if (ownerMatch) return ownerMatch[1];
-
-        const viewingMatch = text.match(/UserYouAreViewing[\s\S]*?"strSteamId"\s*:\s*"(7656119\d{10})"/);
-        if (viewingMatch) return viewingMatch[1];
-    }
-
-    // Resolve custom URL slug to SteamID64 via XML endpoint
-    const customIdMatch = pathname.match(/\/id\/([^\/]+)/);
-    if (customIdMatch) {
-        const customSlug = customIdMatch[1];
-        try {
-            const xmlUrl = `${window.location.origin}/id/${customSlug}?xml=1`;
-            const response = await fetch(xmlUrl);
-            if (response.ok) {
-                const xmlText = await response.text();
-                const steamIdMatch = xmlText.match(/<steamID64>(7656119\d{10})<\/steamID64>/);
-                if (steamIdMatch) return steamIdMatch[1];
             }
-        } catch (err) {}
-    }
-
-    return null;
-}
-
-/**
- * Populates price maps from external API data.
- */
-function buildPriceMap(items) {
-    priceByNameMap.clear();
-    apiAssetPrices.clear();
-
-    items.forEach(item => {
-        const parsed = extractNameAndPrice(item);
-        if (!parsed) return;
-
-        // If the API provides a specific assetid (e.g. for items with gems), bind strictly to it
-        const assetId = item.assetid || item.assetId || item.id || item.asset_id;
-        if (assetId) {
-            apiAssetPrices.set(String(assetId), parsed.price);
-        }
-
-        // Fallback: Bind by exact and cleaned name
-        priceByNameMap.set(parsed.name.trim().toLowerCase(), parsed.price);
-        priceByNameMap.set(cleanName(parsed.name), parsed.price);
-    });
-
-    console.log(`SIH Lite: Processed ${priceByNameMap.size} prices (${apiAssetPrices.size} specific Asset IDs).`);
-    renderPrices();
-}
-
-/**
- * Calculates and displays the total inventory value at the top of the page.
- */
-function renderTotalValue(items) {
-    if (!Array.isArray(items)) return;
-
-    // Calculate sum using Array.reduce
-    let totalDollars = items.reduce((sum, item) => {
-        const parsed = extractNameAndPrice(item);
-        return parsed ? sum + parseFloat(parsed.price) : sum;
-    }, 0);
-
-    let header = document.querySelector('.sih-lite-total');
-    
-    // Inject the header if it doesn't exist yet
-    if (!header) {
-        const targetContainer = document.querySelector('#inventory_items, .inventory_header');
-        if (targetContainer && targetContainer.parentNode) {
-            header = document.createElement('div');
-            header.className = 'sih-lite-total';
-            targetContainer.parentNode.insertBefore(header, targetContainer);
         }
     }
 
-    if (header) {
-        header.innerText = `Total Inventory Value: $${totalDollars.toFixed(2)}`;
+    function getPrice(assetId, name) {
+        if (assetPrices.has(assetId)) return assetPrices.get(assetId);
+        const raw = String(name || '').trim().toLowerCase();
+        if (namePrices.has(raw)) return namePrices.get(raw);
+        return namePrices.get(cleanName(name)) ?? null;
     }
-}
 
-/**
- * Main DOM manipulation function. Scans item slots and injects badges.
- */
-function renderPrices() {
-    const itemSlots = document.querySelectorAll('.itemHolder .item, div.item');
-
-    itemSlots.forEach(slot => {
-        let assetId = null;
-
-        // Extract AssetID directly from the slot element ID
-        if (slot.id) {
-            const match = slot.id.match(/570_2_(\d+)/);
-            if (match) assetId = match[1];
-        }
-
-        // Extract AssetID from nested link as fallback
-        if (!assetId) {
-            const link = slot.querySelector('a.inventory_item_link');
-            if (link && link.href) {
-                const match = link.href.match(/570_2_(\d+)/);
-                if (match) assetId = match[1];
-            }
-        }
-
-        const img = slot.querySelector('img');
-        const titleName = img ? (img.alt || img.title || '') : '';
-
-        let price = null;
-        let isCache = false;
-
-        // Step 1: Secure Asset ID lookup
-        if (assetId) {
-            price = apiAssetPrices.get(assetId); // Perfect match lookup
-            
-            // Name-based fallback utilizing the assetToNameMap
-            if (!price && assetToNameMap.has(assetId)) {
-                price = getPriceForName(assetToNameMap.get(assetId));
-            }
-            
-            if (assetCaches.has(assetId)) isCache = true;
-        }
-
-        // Step 2: Desperate DOM text fallback
-        if (!price && titleName) {
-            price = getPriceForName(titleName);
-            const lowerTitle = titleName.toLowerCase();
-            if (lowerTitle.includes("cache") || lowerTitle.includes("коллекторс")) isCache = true;
-        }
-
-        // Determine badge type
-        let badgeType = null;
-        let badgeValue = null;
-
-        if (isCache && !price) {
-            badgeType = 'cache';
-            badgeValue = 'Cache';
-        } else if (price) {
-            badgeType = 'price';
-            badgeValue = `$${price}`;
-        }
-
-        // DOM Injection
-        let badge = slot.querySelector('.sih-lite-badge');
-
-        if (badgeType && badgeValue) {
-            const className = `sih-lite-badge sih-lite-${badgeType}`;
-
-            if (!badge) {
-                badge = document.createElement('div');
-                badge.className = className;
-                badge.textContent = badgeValue;
-                slot.appendChild(badge);
-            } else {
-                // Only update DOM if changes occurred to save performance
-                if (badge.className !== className) badge.className = className;
-                if (badge.textContent !== badgeValue) badge.textContent = badgeValue;
-            }
-        } else if (badge) {
-            badge.remove(); // Cleanup invalid badges
-        }
-    });
-}
-
-// ==========================================
-// Extension Initialization Execution
-// ==========================================
-injectStyles();
-
-(async function init() {
-    const targetSteamId = await getInventoryOwnerSteamId();
-
-    if (targetSteamId) {
-        console.log("SIH Lite: Detected inventory owner Steam ID ->", targetSteamId);
-
-        // Runs repeatedly to catch DOM updates (page turns, filters).
-        // Consider switching to MutationObserver for better performance in the future.
-        setInterval(renderPrices, 350);
-
-        fetchSteamInventory(targetSteamId);
-
-        chrome.runtime.sendMessage({ action: "fetchPrices", steamId: targetSteamId }, (response) => {
-            if (response && response.success && response.data?.items) {
-                console.log(`SIH Lite: Loaded ${response.data.items.length} prices from API.`);
-
-                buildPriceMap(response.data.items);
-                renderTotalValue(response.data.items);
-            } else {
-                console.error("SIH Lite: Failed to retrieve prices from API.", response?.error);
-            }
+    function request(action, id) {
+        return new Promise((resolve, reject) => {
+            const timer = setTimeout(() => reject(new Error('Час очікування Steamprice вичерпано. Спробуйте ще раз.')), 180000);
+            try {
+                chrome.runtime.sendMessage({ action, steamId: id }, response => {
+                    clearTimeout(timer);
+                    const error = chrome.runtime.lastError;
+                    if (error) reject(new Error(error.message));
+                    else if (!response?.success) reject(new Error(response?.error || 'Steamprice не повернув дані.'));
+                    else resolve(response.data);
+                });
+            } catch (error) { clearTimeout(timer); reject(error); }
         });
     }
+
+    async function loadPrices(id, currentGeneration) {
+        priceState = 'loading'; priceError = ''; queueRender();
+        try {
+            const data = await request('fetchPrices', id);
+            if (currentGeneration !== generation) return;
+            if (!Array.isArray(data?.items)) throw new Error('Некоректна відповідь з цінами.');
+            buildPrices(data.items);
+            priceState = 'ready';
+            queueRender();
+            // Empty price caches may have triggered a scan; request the total again
+            // after the initial profile request settles, avoiding a stale overwrite.
+            await profileLoad;
+            if (currentGeneration === generation) profileLoad = loadProfile(id, currentGeneration);
+        } catch (error) {
+            if (currentGeneration !== generation) return;
+            priceState = 'error'; priceError = error.message;
+        }
+        queueRender();
+    }
+
+    async function loadProfile(id, currentGeneration) {
+        profileError = '';
+        try {
+            const data = await request('fetchProfile', id);
+            if (currentGeneration !== generation) return;
+            const value = data?.totalValueCents;
+            if (value === null || value === undefined || value === '' || !Number.isFinite(Number(value)) || Number(value) < 0) {
+                throw new Error('Steamprice не повернув totalValueCents.');
+            }
+            totalCents = Math.round(Number(value));
+        } catch (error) {
+            if (currentGeneration !== generation) return;
+            profileError = error.message;
+        }
+        queueRender();
+    }
+
+    function setOwner(id) {
+        if (steamId === id) return;
+        steamId = id; generation++;
+        totalCents = null; priceState = 'loading';
+        priceError = profileError = sortStatus = ''; sortOrder = 'original'; busy = false;
+        assetPrices.clear(); namePrices.clear(); inventoryItems.clear();
+        for (const pending of pendingSorts.values()) clearTimeout(pending.timer);
+        pendingSorts.clear();
+        profileLoad = loadProfile(id, generation);
+        loadPrices(id, generation);
+    }
+
+    function sortInventory(order) {
+        if (!activeDota || busy || (order !== 'original' && priceState !== 'ready')) return;
+        busy = true; sortStatus = 'Завантажуємо всі предмети інвентарю…';
+        const requestId = `${Date.now()}-${++requestNumber}`;
+        const timer = setTimeout(() => {
+            pendingSorts.delete(requestId); busy = false;
+            sortStatus = 'Steam не завершив завантаження. Спробуйте ще раз.'; queueRender();
+        }, 125000);
+        pendingSorts.set(requestId, { timer, order, generation });
+        window.postMessage({source: 'SIH_LITE_CONTENT', type: 'SORT', requestId, steamId, order,
+            prices: {assetPrices: Array.from(assetPrices), namePrices: Array.from(namePrices)}}, window.location.origin);
+        queueRender();
+    }
+
+    function installStyles() {
+        if (document.getElementById('sih-lite-styles')) return;
+        const style = document.createElement('style'); style.id = 'sih-lite-styles';
+        style.textContent = `
+            #sih-lite-ui-container { display:flex; flex-wrap:wrap; align-items:center; gap:8px;
+                margin:8px 0; padding:10px; box-sizing:border-box; background:rgba(0,0,0,.4); border-radius:4px; }
+            #sih-lite-ui-container[hidden] { display:none; }
+            .sih-lite-total { color:#66c0f4; font-weight:bold; margin-right:auto; }
+            .sih-lite-sort-btn { background:#39516a; color:#fff; border:1px solid #536b83;
+                padding:5px 9px; border-radius:3px; cursor:pointer; }
+            .sih-lite-sort-btn:disabled { opacity:.5; cursor:default; }
+            .sih-lite-sort-btn[aria-pressed="true"] { border-color:#5cff5c; }
+            #sih-lite-status { width:100%; color:#b8b9ba; font-size:12px; overflow-wrap:anywhere; }
+            .sih-lite-badge { position:absolute!important; bottom:2px!important; right:2px!important;
+                font-size:11px!important; font-weight:bold; padding:2px 5px; border-radius:3px;
+                pointer-events:none; user-select:none; line-height:1.2; z-index:3; }
+            .sih-lite-price { background:rgba(0,0,0,.9); color:#5cff5c; border:1px solid #5cff5c; }
+            .sih-lite-cache { background:#2d0a3c; color:#d070ff; border:1px solid #d070ff; }
+        `;
+        (document.head || document.documentElement).appendChild(style);
+    }
+
+    function ensurePanel() {
+        let panel = document.getElementById('sih-lite-ui-container');
+        if (panel) return panel;
+        const target = document.querySelector('#inventories, #inventory_items, .inventory_pagecontrols, .inventory_header');
+        if (!target?.parentNode) return null;
+        panel = document.createElement('div'); panel.id = 'sih-lite-ui-container';
+        const total = document.createElement('span'); total.id = 'sih-lite-total-text'; total.className = 'sih-lite-total';
+        panel.appendChild(total);
+        for (const [order, label] of [['desc', 'Ціна ↓'], ['asc', 'Ціна ↑'], ['original', 'Порядок Steam']]) {
+            const button = document.createElement('button'); button.type = 'button'; button.className = 'sih-lite-sort-btn';
+            button.dataset.order = order; button.textContent = label;
+            button.addEventListener('click', () => sortInventory(order)); panel.appendChild(button);
+        }
+        const retry = document.createElement('button'); retry.type = 'button'; retry.id = 'sih-lite-retry';
+        retry.className = 'sih-lite-sort-btn'; retry.textContent = 'Повторити';
+        retry.addEventListener('click', () => {
+            if (!steamId) return;
+            if (priceState === 'error') loadPrices(steamId, generation);
+            if (profileError) loadProfile(steamId, generation);
+        });
+        panel.appendChild(retry);
+        const status = document.createElement('div'); status.id = 'sih-lite-status';
+        status.setAttribute('role', 'status'); status.setAttribute('aria-live', 'polite'); panel.appendChild(status);
+        target.parentNode.insertBefore(panel, target);
+        return panel;
+    }
+
+    function setText(element, text) { if (element && element.textContent !== text) element.textContent = text; }
+
+    function render() {
+        installStyles();
+        const panel = ensurePanel();
+        if (panel) {
+            panel.hidden = !activeDota;
+            setText(panel.querySelector('#sih-lite-total-text'), totalCents !== null
+                ? `Вартість Dota 2: ${money(totalCents)}` : profileError ? 'Вартість недоступна' : 'Завантажуємо вартість…');
+            panel.querySelector('#sih-lite-total-text').title = 'Повна оцінка інвентарю від Steamprice; дані можуть оновлюватися із затримкою.';
+            for (const button of panel.querySelectorAll('[data-order]')) {
+                button.disabled = busy || (button.dataset.order !== 'original' && priceState !== 'ready');
+                button.setAttribute('aria-pressed', String(button.dataset.order === sortOrder));
+            }
+            panel.querySelector('#sih-lite-retry').hidden = !profileError && priceState !== 'error';
+            setText(panel.querySelector('#sih-lite-status'), [priceState === 'loading' ? 'Завантажуємо ціни Steamprice…' : priceError,
+                profileError, sortStatus].filter(Boolean).join(' '));
+        }
+        for (const slot of document.querySelectorAll('.itemHolder .item, div.item')) {
+            const match = (slot.id || slot.querySelector('a.inventory_item_link')?.href || '').match(/(?:item)?570_2_(\d+)/);
+            let badge = slot.querySelector('.sih-lite-badge');
+            if (!activeDota || !match) { if (badge) badge.remove(); continue; }
+            const assetId = match[1], info = inventoryItems.get(assetId), image = slot.querySelector('img');
+            const name = info?.name || image?.alt || image?.title || '';
+            const cents = getPrice(assetId, name), isCache = info?.isCache || /collector'?s cache/i.test(name);
+            if (cents === null && !isCache) { if (badge) badge.remove(); continue; }
+            if (!badge) { badge = document.createElement('div'); slot.appendChild(badge); }
+            const className = `sih-lite-badge sih-lite-${cents === null ? 'cache' : 'price'}`;
+            if (badge.className !== className) badge.className = className;
+            setText(badge, cents === null ? 'Cache' : money(cents));
+        }
+    }
+
+    function queueRender() {
+        if (renderQueued) return;
+        renderQueued = true;
+        requestAnimationFrame(() => {renderQueued = false; render();});
+    }
+
+    window.addEventListener('message', event => {
+        if (event.source !== window || event.origin !== window.location.origin || event.data?.source !== 'SIH_LITE_PAGE') return;
+        const message = event.data;
+        if (message.type === 'STATE') {
+            const wasActive = activeDota;
+            activeDota = String(message.appId) === '570' && String(message.contextId) === '2' && /^\d{17}$/.test(String(message.steamId));
+            if (activeDota && /^\d{17}$/.test(String(message.steamId))) setOwner(String(message.steamId));
+            if (activeDota && !busy && ['asc', 'desc', 'original'].includes(message.order)) {
+                if (sortOrder !== message.order) sortStatus = '';
+                sortOrder = message.order;
+            }
+            if (wasActive !== activeDota || activeDota) queueRender();
+        } else if (message.type === 'INVENTORY' && String(message.steamId) === steamId && String(message.appId) === '570' && String(message.contextId) === '2' && Array.isArray(message.items)) {
+            inventoryItems.clear();
+            for (const item of message.items) if (item && /^\d+$/.test(String(item.assetId))) inventoryItems.set(String(item.assetId), item);
+            queueRender();
+        } else if (message.type === 'SORT_RESULT' || message.type === 'SORT_PROGRESS') {
+            const pending = pendingSorts.get(message.requestId);
+            if (!pending || pending.generation !== generation) return;
+            if (message.type === 'SORT_PROGRESS') sortStatus = message.message ||
+                (Number.isSafeInteger(message.loaded) && Number.isSafeInteger(message.total)
+                    ? `Завантажуємо предмети: ${message.loaded} / ${message.total}…` : 'Завантажуємо всі предмети…');
+            else {
+                clearTimeout(pending.timer); pendingSorts.delete(message.requestId); busy = false;
+                if (message.success) {
+                    sortOrder = pending.order;
+                    sortStatus = pending.order === 'original' ? 'Відновлено порядок Steam.'
+                        : `Відсортовано ${message.count} предметів. Предмети без ціни — в кінці.`;
+                } else sortStatus = message.error || 'Не вдалося відсортувати інвентар.';
+            }
+            queueRender();
+        }
+    });
+    new MutationObserver(queueRender).observe(document.documentElement, {subtree: true, childList: true});
+    window.postMessage({source: 'SIH_LITE_CONTENT', type: 'STATE_REQUEST'}, window.location.origin);
+    queueRender();
 })();

@@ -1,26 +1,23 @@
 {
   "manifest_version": 3,
-  "name": "SIH Lite",
-  "version": "1.0",
-  "description": "A lightweight extension to fetch Steam inventory prices.",
-  "permissions": [
-    "activeTab",
-    "tabs"
-  ],
-  "host_permissions": [
-    "https://steamprice.com/*",
-    "*://*.steamcommunity.com/*"
-  ],
-  "background": {
-    "service_worker": "background.js"
-  },
+  "name": "SIH Beta",
+  "version": "1.1.0",
+  "description": "Dota 2 inventory prices, full Steamprice valuation, and native price sorting.",
+  "permissions": ["tabs"],
+  "host_permissions": ["https://steamprice.com/*", "*://steamcommunity.com/*"],
+  "background": {"service_worker": "background.js"},
   "content_scripts": [
     {
-      "matches": [
-        "*://steamcommunity.com/profiles/*/inventory*", 
-        "*://steamcommunity.com/id/*/inventory*"
-      ],
-      "js": ["content.js"]
+      "matches": ["*://steamcommunity.com/profiles/*/inventory*", "*://steamcommunity.com/id/*/inventory*"],
+      "js": ["inject.js"],
+      "world": "MAIN",
+      "run_at": "document_start"
+    },
+    {
+      "matches": ["*://steamcommunity.com/profiles/*/inventory*", "*://steamcommunity.com/id/*/inventory*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
     }
-  ]
+  ],
+  "minimum_chrome_version": "111"
 }
