@@ -1,21 +1,21 @@
 {
   "manifest_version": 3,
   "name": "SIH Beta",
-  "version": "1.1.1",
-  "description": "Dota 2 inventory prices, full Steamprice valuation, and native price sorting.",
+  "version": "1.2.0",
+  "description": "Dota 2 inventory prices, gem color previews, and native price sorting and gem filtering.",
   "permissions": ["tabs"],
   "host_permissions": ["https://steamprice.com/*", "*://steamcommunity.com/*"],
   "background": {"service_worker": "background.js"},
   "content_scripts": [
     {
       "matches": ["*://steamcommunity.com/profiles/*/inventory*", "*://steamcommunity.com/id/*/inventory*"],
-      "js": ["inject.js"],
+      "js": ["gems.js", "inject.js"],
       "world": "MAIN",
       "run_at": "document_start"
     },
     {
       "matches": ["*://steamcommunity.com/profiles/*/inventory*", "*://steamcommunity.com/id/*/inventory*"],
-      "js": ["content.js"],
+      "js": ["gems.js", "content.js"],
       "run_at": "document_idle"
     }
   ],

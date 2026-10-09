@@ -30,7 +30,15 @@ const assert = require('node:assert/strict');
       window.ImageURL = () => 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg"/>';
       window.UpdateReactItemInfo = () => {};
       window.fixtureItems = Array(200).fill(null).map((_, index) => ({ assetid: String(1000 + index), classid: String(2000 + index), instanceid: '0', appid: '570', contextid: '2', amount: '1' }));
-      window.fixtureDescriptions = fixtureItems.map((asset, index) => ({ classid: asset.classid, instanceid: '0', name: `Item ${index}`, market_hash_name: `Item ${index}`, tags: [] }));
+      window.fixtureDescriptions = fixtureItems.map((asset, index) => ({
+        classid: asset.classid, instanceid: '0', name: index === 0 ? 'Unusual Platinum Baby Roshan' : `Item ${index}`,
+        market_hash_name: index === 0 ? 'Unusual Platinum Baby Roshan' : `Item ${index}`,
+        type: 'Rare Wearable',
+        tags: index % 4 === 0 ? [{ category: 'rarity', internal_name: 'rare', localized_tag_name: 'Rare', localized_category_name: 'Rarity' }] : [],
+        descriptions: index % 3 === 0 ? [{ type: 'html', value:
+          `<div style="white-space: nowrap; margin: 9px"><div style="white-space: nowrap; padding: 3px"><div style="background-image: url(https://cdn.steamstatic.com/apps/570/icons/econ/sockets/${index % 6 === 0 ? 'gem_color' : 'gem_kinetic'}.png)"></div><div><span style="font-size: 18px; color: rgb(161,255,89)">${index % 6 === 0 ? 'Bright Green' : 'Fireborn Assault'}</span><br><span style="font-size: 12px">${index % 6 === 0 ? 'Prismatic Gem' : 'Kinetic Gem'}</span></div></div></div>`
+        }] : []
+      }));
       const owner = { GetSteamId: () => '76561198000000000', ShowLoadingIndicator() {}, HideLoadingIndicator() {} };
       window.g_ActiveInventory = new CInventory(owner, 570, '2', { asset_count: 200 });
       window.fixtureInventory = g_ActiveInventory;
@@ -57,12 +65,31 @@ const assert = require('node:assert/strict');
       window.fixtureMessages = [];
       addEventListener('message', event => { if (event.data?.source === 'SIH_LITE_PAGE') fixtureMessages.push(event.data); });
     });
+    await page.addScriptTag({ path: path.join(__dirname, '..', 'gems.js') });
     await page.addScriptTag({ path: path.join(__dirname, '..', 'inject.js') });
     async function sort(order, id) {
       await page.evaluate(({ order, id }) => postMessage({ source: 'SIH_LITE_CONTENT', type: 'SORT', requestId: id, steamId: '76561198000000000', order, prices: { assetPrices: fixtureItems.map((asset, index) => [asset.assetid, index]), namePrices: [] } }, location.origin), { order, id });
       await page.waitForFunction(id => fixtureMessages.some(message => message.type === 'SORT_RESULT' && message.requestId === id), id);
       return page.evaluate(id => fixtureMessages.find(message => message.type === 'SORT_RESULT' && message.requestId === id), id);
     }
+    async function gemFilter(mode, id, coloredAssetIds = []) {
+      await page.evaluate(({ mode, id, coloredAssetIds }) => postMessage({ source: 'SIH_LITE_CONTENT', type: 'FILTER_GEMS', requestId: id, steamId: '76561198000000000', mode, gemAssetIds: [], coloredAssetIds }, location.origin), { mode, id, coloredAssetIds });
+      await page.waitForFunction(id => fixtureMessages.some(message => message.type === 'FILTER_RESULT' && message.requestId === id), id);
+      return page.evaluate(id => fixtureMessages.find(message => message.type === 'FILTER_RESULT' && message.requestId === id), id);
+    }
+    async function visibleIds() {
+      return page.evaluate(() => g_ActiveInventory.m_$Inventory.find('.itemHolder').filter(function () { return !this.filtered && this.rgItem; }).map(function () { return this.rgItem.assetid; }).get());
+    }
+    const initialGems = await gemFilter('colored', 'load-colored', ['1199']);
+    assert.equal(initialGems.success, true);
+    assert.equal(initialGems.count, 35, 'Colored sockets plus explicit Steamprice evidence; kinetic gems excluded');
+    assert.equal(await page.evaluate(() => fixtureRequests.length), 5);
+    assert.equal(await page.evaluate(() => g_ActiveInventory.m_bFullyLoaded), true);
+    assert.equal(await page.evaluate(() => g_ActiveInventory.m_cPages), 2);
+    assert.ok((await visibleIds()).includes('1199'), 'Matching items on initially unloaded pages are included');
+    assert.equal(await page.evaluate(() => $J(g_ActiveInventory.m_rgAssets['1199'].homeElement).data('iPage')), 1, 'Gem filter updates native item page metadata before any sort');
+    assert.equal((await gemFilter('all', 'restore-all')).success, true);
+    assert.equal(await page.evaluate(() => g_ActiveInventory.m_cPages), 8);
     assert.equal((await sort('desc', 'first')).success, true);
     assert.deepEqual(await page.evaluate(() => g_ActiveInventory.m_rgItemElements.map(holder => holder[0].rgItem.assetid)), Array.from({ length: 200 }, (_, i) => String(1199 - i)));
     assert.equal(await page.evaluate(() => fixtureRequests.length), 5);
@@ -72,6 +99,25 @@ const assert = require('node:assert/strict');
     assert.equal(await page.evaluate(() => fixtureSelections.at(-1)), '1199');
     await page.evaluate(() => { g_ActiveInventory.SetActivePage(7); });
     assert.equal(await page.evaluate(() => g_ActiveInventory.m_rgPages[7].GetElement().find('.item').first()[0].rgItem.assetid), '1024');
+    assert.equal((await gemFilter('colored', 'sorted-colored', ['1199'])).success, true);
+    assert.deepEqual(await visibleIds(), ['1199', ...Array.from({ length: 34 }, (_, index) => String(1198 - index * 6))]);
+    assert.equal((await gemFilter('colored', 'repeated-colored', ['1199'])).count, 35);
+    assert.equal((await sort('asc', 'colored-asc')).success, true);
+    assert.deepEqual(await visibleIds(), [...Array.from({ length: 34 }, (_, index) => String(1000 + index * 6)), '1199']);
+    assert.equal((await sort('desc', 'colored-desc')).success, true);
+    assert.equal(await page.evaluate(() => Filter.elFilter.value), '');
+    assert.deepEqual(await page.evaluate(() => Filter.rgCurrentTags), {}, 'The synthetic gem category does not leak into native tags');
+    await page.evaluate(() => { Filter.elFilter.value = 'Item 10'; Filter.OnFilterChange(); });
+    assert.deepEqual(await visibleIds(), ['1108', '1102']);
+    await page.evaluate(() => Filter.UpdateTagFiltering({ Rarity: ['rare'] }));
+    assert.deepEqual(await visibleIds(), ['1108']);
+    await page.evaluate(() => Filter.ClearTextFilter());
+    assert.equal((await visibleIds()).length, 17, 'Clearing text keeps native tags and gem predicate');
+    assert.equal((await gemFilter('all', 'remove-gems-preserve-tags')).success, true);
+    assert.equal((await visibleIds()).length, 50, 'Turning off gem filter preserves native tags');
+    await page.evaluate(() => Filter.UpdateTagFiltering({}));
+    assert.equal((await visibleIds()).length, 200);
+    assert.deepEqual(await page.evaluate(() => g_ActiveInventory.m_rgItemElements.map(holder => holder[0].rgItem.assetid)), Array.from({ length: 200 }, (_, i) => String(1199 - i)), 'Gem filtering preserves the current price order');
     await page.evaluate(() => {
       Filter.elFilter.value = 'Item 10';
       Filter.OnFilterChange();
@@ -92,7 +138,70 @@ const assert = require('node:assert/strict');
     await page.evaluate(() => { Filter.elFilter.value = 'Item 10'; Filter.OnFilterChange(); Filter.ClearTextFilter(); });
     await page.evaluate(() => $J(g_ActiveInventory.m_rgItemElements[0][0]).find('.inventory_item_link').trigger('click'));
     assert.equal(await page.evaluate(() => fixtureSelections.at(-1)), '1000', 'Native click handlers survive responsive filter clearing');
+    assert.equal((await gemFilter('colored', 'responsive-colored')).success, true);
+    await page.evaluate(() => { Filter.elFilter.value = 'Item 10'; Filter.OnFilterChange(); Filter.ClearTextFilter(); });
+    assert.equal((await visibleIds()).length, 34);
+    await page.evaluate(() => $J(g_ActiveInventory.m_rgItemElements[0][0]).find('.inventory_item_link').trigger('click'));
+    assert.equal(await page.evaluate(() => fixtureSelections.at(-1)), '1000', 'Native clicks survive responsive gem-filter and text-filter clearing');
+    assert.equal((await gemFilter('all', 'responsive-all')).success, true);
+    assert.equal(await page.evaluate(() => g_ActiveInventory.m_rgItemElements.filter(holder => !holder[0].filtered).length), 200, 'Responsive mode preserves native lazy DOM creation while restoring all items');
+
+    // Exercise the actual deployment worlds: MAIN owns Steam and the bridge;
+    // content runs in a distinct isolated world with only chrome.runtime mocked.
+    await page.evaluate(() => { window.g_bEnableDynamicSizing = false; });
+    assert.equal((await sort('original', 'isolated-world-reset')).success, true);
+    const cdp = await page.context().newCDPSession(page);
+    const { frameTree } = await cdp.send('Page.getFrameTree');
+    const { executionContextId } = await cdp.send('Page.createIsolatedWorld', {
+      frameId: frameTree.frame.id, worldName: 'SIH extension smoke world'
+    });
+    const evaluateIsolated = async expression => {
+      const result = await cdp.send('Runtime.evaluate', { expression, contextId: executionContextId, returnByValue: true });
+      if (result.exceptionDetails) throw new Error(result.exceptionDetails.text);
+      return result.result.value;
+    };
+    assert.equal(await evaluateIsolated('typeof window.g_ActiveInventory'), 'undefined', 'Content cannot directly read MAIN-world Steam objects');
+    const apiItems = Array.from({ length: 200 }, (_, index) => ({
+      assetid: String(1000 + index), priceCents: index,
+      marketHashName: index === 0 ? 'Unusual Platinum Baby Roshan' : `Item ${index}`
+    }));
+    await evaluateIsolated(`window.chrome = { runtime: {
+      lastError: undefined,
+      sendMessage(request, callback) {
+        const data = request.action === 'fetchPrices' ? { items: ${JSON.stringify(apiItems)} } : { totalValueCents: 19900 };
+        setTimeout(() => callback({ success: true, data }), 0);
+      }
+    }};`);
+    await evaluateIsolated(fs.readFileSync(path.join(__dirname, '..', 'gems.js'), 'utf8'));
+    await evaluateIsolated(fs.readFileSync(path.join(__dirname, '..', 'content.js'), 'utf8'));
+    await page.waitForFunction(() => document.querySelector('#sih-lite-gem-filter')?.disabled === false && document.querySelector('#sih-lite-total-text')?.textContent === 'Dota 2 value: $199.00');
+    await page.locator('#sih-lite-gem-filter').click();
+    await page.waitForFunction(() => document.querySelector('#sih-lite-gem-filter')?.getAttribute('aria-pressed') === 'true' && document.querySelector('#sih-lite-gem-filter')?.disabled === false);
+    assert.equal(await page.evaluate(() => g_ActiveInventory.m_rgItemElements.filter(holder => !holder[0].filtered).length), 34, 'Isolated content button filters real native pages through MAIN bridge');
+    const colorLink = page.locator('[id="570_2_1000"] .sih-lite-color-link');
+    await colorLink.waitFor({ state: 'attached' });
+    const colorUrl = new URL(await colorLink.getAttribute('href'));
+    assert.equal(colorUrl.origin, 'https://steamprice.com');
+    assert.equal(colorUrl.pathname, '/dota2/legacy');
+    assert.equal(colorUrl.searchParams.get('model'), 'PBR');
+    assert.equal(colorUrl.searchParams.get('r'), '161');
+    assert.equal(colorUrl.searchParams.get('g'), '255');
+    assert.equal(colorUrl.searchParams.get('b'), '89');
+    const selectionsBeforeLink = await page.evaluate(() => fixtureSelections.length);
+    await page.evaluate(() => {
+      const link = document.querySelector('[id="570_2_1000"] .sih-lite-color-link');
+      link.addEventListener('click', event => event.preventDefault(), { once: true });
+      link.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+    });
+    assert.equal(await page.evaluate(() => fixtureSelections.length), selectionsBeforeLink, 'Isolated-world color link click does not select native item');
+    await page.locator('#sih-lite-gem-filter').click();
+    await page.waitForFunction(() => document.querySelector('#sih-lite-gem-filter')?.getAttribute('aria-pressed') === 'false' && document.querySelector('#sih-lite-gem-filter')?.disabled === false);
+    assert.equal(await page.evaluate(() => g_ActiveInventory.m_rgItemElements.filter(holder => !holder[0].filtered).length), 200);
+    await page.locator('[data-order="desc"]').click();
+    await page.waitForFunction(() => document.querySelector('[data-order="desc"]')?.getAttribute('aria-pressed') === 'true' && document.querySelector('[data-order="desc"]')?.disabled === false);
+    assert.deepEqual(await page.evaluate(() => g_ActiveInventory.m_rgItemElements.map(holder => holder[0].rgItem.assetid)), Array.from({ length: 200 }, (_, index) => String(1199 - index)), 'Isolated-world price sort still uses native inventory');
+    await cdp.detach();
     assert.deepEqual(errors, []);
-    console.log('PASS: authoritative Steam economy_v2.js + Prototype + jQuery in Chromium: 200 items, 5 lazy batches, native pagination, filtering, responsive sorting/restoration and click-handler preservation.');
+    console.log('PASS: official Steam scripts in Chromium: complete paginated loading, colored-gem filtering, native sorting/filtering/responsive clicks, plus actual MAIN/isolated-world bridge and exact-RGB color link.');
   } finally { await browser.close(); }
 })().catch(error => { console.error(error); process.exitCode = 1; });

@@ -5,6 +5,8 @@ A Chromium extension that shows prices for your **Dota 2** inventory on Steam.
 - Shows individual item prices and the total inventory valuation from Steamprice. The total comes from `/api/dota2/profile/{steamId}` (`totalValueCents`).
 - Sorts the entire inventory by price in ascending or descending order, including items on unopened pages. Items with unknown prices stay at the end; zero prices are included.
 - The **Steam order** button restores the original item order.
+- **View color** opens Steamprice's viewer with the selected item's prismatic RGB color.
+- **Colored gems only** shows items with attached Prismatic or Ethereal gems across all native inventory pages.
 - Keeps Steam's native pages, appearance, filters, and item elements.
 
 ## Installation
@@ -27,16 +29,25 @@ Steamprice valuations may be outdated or differ from Steam Market prices. The to
 
 Sorting relies on Steam's internal methods (`LoadCompleteInventory`, `LayoutPages`, and the array of native item holders). Changes to these internals may require an extension update. The safety limits are 100,000 items and 1,000 price pages; exceeding either limit produces an explicit error.
 
+## Gem colors
+
+**View color** appears on an item only when its prismatic RGB color is valid and Steamprice supports its model: Terrorblade's Fractal Horns of Inner Abysm, Platinum Baby Roshan, Golden Baby Roshan, Jumo, Ice Baby Roshan, or Lava Baby Roshan. The link opens `https://steamprice.com/dota2/legacy` with the viewer, model, and exact RGB selected. Other courier models do not receive a viewer button.
+
+Steamprice's viewer offers a limited set of effects. If an item's Ethereal effect is unsupported or it has several Ethereal gems, the preview effect may differ from the actual item. The selected RGB remains the item's color.
+
+Enable **Colored gems only** to show items with attached Prismatic or Ethereal gems. The filter loads the whole native inventory, including unopened pages, and uses Steam's item descriptions together with Steamprice's asset-specific gem metadata. It ignores empty sockets, loose gem items, and items whose only gems are Inscribed or Kinetic. Steam's text and tag filters and price sorting continue to work. Disable the toggle to show the other items again.
+
+The total valuation always describes the full inventory; filtering does not change that grand total.
+
 ## Development checks
 
-No build step or server is required. The extension consists of `manifest.json`, `background.js`, `content.js`, and `inject.js`.
+No build step or server is required. The extension consists of `manifest.json`, `background.js`, `content.js`, `inject.js`, and the shared gem metadata helper `gems.js`.
 
 ```sh
-node --test tests/background.test.cjs tests/native-inventory.test.cjs
-node --test tests/content-browser.test.cjs
+node --test tests/*.test.cjs
 ```
 
-The second command requires Playwright and Chromium, which are already available in the configured cloud environment. The tests cover API pagination, prices in cents and zero prices, request failures, sorting and order restoration, and panel behavior in the browser. Network responses are mocked, so these tests do not verify current prices for a real inventory.
+The browser tests require Playwright and Chromium, which are already available in the configured cloud environment. Tests use native inventory and API fixtures to cover gem metadata, exact color links, attached-gem filtering, API pagination, prices in cents and zero prices, request failures, sorting and order restoration, and panel behavior in the browser. Network responses are mocked, so these tests do not verify current prices for a real inventory.
 
 Additional checks using Steam's official scripts covered 200 items, sequential loading in five batches, native pagination, filters, and clicks on a narrow screen. To rerun that scenario:
 

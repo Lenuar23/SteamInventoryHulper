@@ -6,7 +6,9 @@
     const PAGE_SOURCE = 'SIH_LITE_PAGE';
     const MAX_ITEMS = 100000;
     const LOAD_TIMEOUT_MS = 120000;
+    const GEM_TAG = '__SIH_LITE_INSERTED_GEMS__';
     const originalOrders = new WeakMap();
+    const gemFilters = new WeakMap();
     const preservedResponsivePages = new WeakSet();
     let busy = false;
     let previousInventory = null;
@@ -63,7 +65,8 @@
             loaded: countLoaded(items),
             total: items && Number.isSafeInteger(items.m_cItems) ? items.m_cItems : 0,
             fullyLoaded: Boolean(items?.m_bFullyLoaded),
-            order: items ? originalOrders.get(items)?.order || 'original' : 'original'
+            order: items ? originalOrders.get(items)?.order || 'original' : 'original',
+            gemFilter: items ? gemFilters.get(items)?.mode || 'all' : 'all'
         };
     }
 
@@ -72,6 +75,23 @@
             ...(Array.isArray(description.descriptions)
                 ? description.descriptions.map(entry => entry?.value || '') : [])].join(' ');
         return /collector(?:['’]s|s)\s+cache/i.test(text);
+    }
+
+    function gemDetails(asset) {
+        const detector = globalThis.SIHLiteGems || window.SIHLiteGems;
+        return detector?.analyzeSteamAsset(asset) || {
+            hasGems: false, hasColoredGem: false, gems: [], prismaticGems: [],
+            etherealGems: [], kineticGems: [], legacyRgb: null, isLegacy: false
+        };
+    }
+
+    function matchesGemFilter(asset, config) {
+        if (!config || config.mode === 'all') return true;
+        const id = String(asset?.assetid || '');
+        const details = gemDetails(asset);
+        return config.mode === 'colored'
+            ? details.hasColoredGem || config.coloredAssetIds.has(id)
+            : details.hasGems || config.gemAssetIds.has(id) || config.coloredAssetIds.has(id);
     }
 
     function emitInventory(active) {
@@ -85,7 +105,8 @@
             items.push({
                 assetId: String(asset.assetid),
                 name: String(description.market_hash_name || description.name || description.market_name || '').slice(0, 512),
-                isCache: isCollectorsCache(description)
+                isCache: isCollectorsCache(description),
+                ...gemDetails(asset)
             });
             if (items.length >= MAX_ITEMS) break;
         }
@@ -214,10 +235,41 @@
         const filter = window.Filter;
         if (!filter || hookedFilter === filter || typeof filter.ApplyFilter !== 'function') return;
         const apply = filter.ApplyFilter;
+        const match = filter.MatchItem;
+        if (typeof match === 'function') {
+            filter.MatchItem = function (element, terms, categories) {
+                let nativeCategories = categories;
+                if (categories && Object.prototype.hasOwnProperty.call(categories, GEM_TAG)) {
+                    nativeCategories = { ...categories };
+                    delete nativeCategories[GEM_TAG];
+                    if (!Object.keys(nativeCategories).length) nativeCategories = null;
+                }
+                return match.call(this, element, terms, nativeCategories) &&
+                    matchesGemFilter(element?.rgItem, gemFilters.get(getItemInventory(getActiveInventory())));
+            };
+        }
         filter.ApplyFilter = function (...args) {
-            const result = apply.apply(this, args);
-            updatePageMetadata(getActiveInventory());
-            return result;
+            const config = gemFilters.get(getItemInventory(getActiveInventory()));
+            const nativeTags = this.rgCurrentTags;
+            // Native ApplyFilter otherwise treats an empty search/tag selection
+            // as "display all", bypassing both predicates and page recounting.
+            // This private tag exists only during the call, never in Steam UI.
+            if (config && config.mode !== 'all') {
+                this.rgCurrentTags = { ...nativeTags, [GEM_TAG]: ['inserted_gem'] };
+                // Steam's text-only loosening optimization can skip visible
+                // holders after relayout reset their filter markers. Equal
+                // previous/current text forces it to evaluate both hidden and
+                // visible holders against the additive gem predicate.
+                this.strLastFilter = typeof window.v_trim === 'function'
+                    ? window.v_trim(args[0]) : String(args[0] ?? '').trim();
+            }
+            try {
+                const result = apply.apply(this, args);
+                updatePageMetadata(getActiveInventory());
+                return result;
+            } finally {
+                this.rgCurrentTags = nativeTags;
+            }
         };
         hookedFilter = filter;
     }
@@ -264,10 +316,89 @@
         active.LayoutPages();
         preserveFilterPageMetadata();
         if (window.Filter && typeof window.Filter.ReApplyFilter === 'function' && window.Filter.elFilter) {
+            // Fresh pages contain visible holders. With existing tag filters,
+            // Steam's empty-search loosening shortcut would skip matching them.
+            if (String(window.Filter.elFilter.value || '').trim() ||
+                Object.keys(window.Filter.rgCurrentTags || {}).length) {
+                active.bFilterApplied = false;
+            }
             window.Filter.ReApplyFilter();
         }
         updatePageMetadata(active);
         if (typeof active.ShowPageControlsIfNeeded === 'function') active.ShowPageControlsIfNeeded();
+    }
+
+    function validateGemFilter(message) {
+        if (!['all', 'gems', 'colored'].includes(message.mode)) throw new Error('Invalid gem filter.');
+        const readIds = ids => {
+            if (ids === undefined) return new Set();
+            if (!Array.isArray(ids) || ids.length > MAX_ITEMS ||
+                ids.some(id => typeof id !== 'string' || !/^\d{1,20}$/.test(id))) {
+                throw new Error('Invalid gem item identifiers.');
+            }
+            return new Set(ids);
+        };
+        return { mode: message.mode, gemAssetIds: readIds(message.gemAssetIds), coloredAssetIds: readIds(message.coloredAssetIds) };
+    }
+
+    async function filterGems(message) {
+        const requestId = message.requestId;
+        if (typeof requestId !== 'string' || requestId.length > 100 || !requestId) return;
+        if (busy) {
+            reply('FILTER_RESULT', { requestId, success: false, error: 'Inventory loading is already in progress.' });
+            return;
+        }
+        let acquired = false;
+        try {
+            if (!/^\d{17}$/.test(String(message.steamId))) throw new Error('Invalid inventory owner.');
+            const config = validateGemFilter(message);
+            const detector = globalThis.SIHLiteGems || window.SIHLiteGems;
+            if (!detector || typeof detector.analyzeSteamAsset !== 'function') {
+                throw new Error('Gem detection is unavailable. Reload the page.');
+            }
+            const steamId = String(message.steamId);
+            const active = getActiveInventory();
+            const items = getItemInventory(active);
+            if (!items || typeof active.LayoutPages !== 'function' || !Array.isArray(items.m_rgItemElements) ||
+                !window.$J || !window.Filter?.elFilter || typeof window.Filter.MatchItem !== 'function') {
+                throw new Error('Select the Dota 2 inventory before filtering.');
+            }
+            ensureCurrent(active, steamId, items);
+            if (items.m_cItems > MAX_ITEMS) throw new Error('This inventory is too large to filter safely.');
+            busy = acquired = true;
+            const progress = () => {
+                if (getActiveInventory() !== active || getItemInventory(active) !== items) return;
+                reply('FILTER_PROGRESS', { requestId, phase: 'loading', loaded: countLoaded(items), total: items.m_cItems });
+                emitState(false);
+            };
+            progress();
+            await loadComplete(active, items, progress);
+            ensureCurrent(active, steamId, items);
+            if (!items.m_bFullyLoaded || items.m_rgItemElements.length > MAX_ITEMS ||
+                items.m_rgItemElements.some(holder => !holder?.[0]?.rgItem)) {
+                throw new Error('Steam has not loaded every inventory item. Try again later.');
+            }
+            if (active.m_$Inventory?.hasClass('paging_transition')) {
+                throw new Error('Wait for the page transition to finish, then try again.');
+            }
+            if (!originalOrders.has(items)) originalOrders.set(items, { holders: items.m_rgItemElements.slice(), order: 'original' });
+            const previous = gemFilters.get(items);
+            gemFilters.set(items, config);
+            try {
+                relayout(active, items);
+            } catch (error) {
+                if (previous) gemFilters.set(items, previous); else gemFilters.delete(items);
+                try { relayout(active, items); } catch (_) { /* Keep the original failure. */ }
+                throw error;
+            }
+            const count = items.m_rgItemElements.filter(holder => matchesGemFilter(holder[0].rgItem, config)).length;
+            emitState(true);
+            reply('FILTER_RESULT', { requestId, success: true, count, total: items.m_rgItemElements.length, mode: config.mode, steamId });
+        } catch (error) {
+            reply('FILTER_RESULT', { requestId, success: false, error: error?.message || 'Could not filter the inventory.' });
+        } finally {
+            if (acquired) busy = false;
+        }
     }
 
     async function sortInventory(message) {
@@ -345,6 +476,7 @@
             event.data.source !== CONTENT_SOURCE) return;
         if (event.data.type === 'STATE_REQUEST') emitState(true);
         else if (event.data.type === 'SORT') void sortInventory(event.data);
+        else if (event.data.type === 'FILTER_GEMS') void filterGems(event.data);
     });
     window.setInterval(() => emitState(false), 500);
     emitState(true);

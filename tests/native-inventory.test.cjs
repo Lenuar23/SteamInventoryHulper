@@ -5,6 +5,7 @@ const test = require('node:test');
 const vm = require('node:vm');
 
 const source = fs.readFileSync(path.join(__dirname, '..', 'inject.js'), 'utf8');
+const gemSource = () => fs.readFileSync(path.join(__dirname, '..', 'gems.js'), 'utf8');
 const STEAM_ID = '76561198000000000';
 
 function deferred() {
@@ -21,7 +22,7 @@ function deferred() {
 }
 
 function holder(id, name) {
-    const node = { rgItem: { assetid: String(id), description: { market_hash_name: name } }, filtered: false };
+    const node = { rgItem: { assetid: String(id), appid: 570, description: { market_hash_name: name, type: 'Rare Wearable' } }, filtered: false };
     const metadata = new Map();
     const result = {
         0: node,
@@ -85,6 +86,51 @@ function deferredResolved() {
     return result;
 }
 
+function gemHolder(id, name, type = 'Prismatic Gem') {
+    const result = holder(id, name);
+    result[0].rgItem.description.descriptions = [{ type: 'html', value:
+        `<div><div style="background-image: url(https://cdn.steamstatic.com/apps/570/icons/econ/sockets/gem_color.png)"></div><div><span style="font-size: 18px; color: rgb(161,255,89)">Bright Green</span><br><span style="font-size: 12px">${type}</span></div></div>`
+    }];
+    return result;
+}
+
+function nativeFilter(window) {
+    return {
+        elFilter: { value: '' }, strLastFilter: '', rgCurrentTags: {}, rgLastTags: {},
+        MatchItem(element, terms, categories) {
+            const description = element?.rgItem?.description;
+            if (!description) return false;
+            if (terms && !terms.every(term => `${description.market_hash_name} ${description.name || ''}`.toLowerCase().includes(term))) return false;
+            return !categories || Object.values(categories).every(tags =>
+                tags.some(tag => (description.tags || []).some(item => item.internal_name === tag)));
+        },
+        ApplyFilter(value) {
+            this.strLastFilter = value;
+            const active = window.g_ActiveInventory;
+            const items = active.m_rgChildInventories ? active.m_rgChildInventories['2'] : active;
+            const terms = value.trim() ? value.toLowerCase().trim().split(/\s+/) : false;
+            const categories = Object.keys(this.rgCurrentTags).length ? this.rgCurrentTags : null;
+            const all = !terms && !categories;
+            active.visible = [];
+            for (const item of items.m_rgItemElements) {
+                item[0].filtered = !(all || this.MatchItem(item[0], terms, categories));
+                if (!item[0].filtered) active.visible.push(item);
+            }
+            active.bFilterApplied = !all;
+            active.m_cPages = Math.max(1, Math.ceil(active.visible.length / 25));
+            active.m_rgPages = Array.from({ length: active.m_cPages }, (_, index) => ({ m_iPage: index,
+                m_$Page: { children: () => ({ each(callback) {
+                    active.visible.slice(index * 25, (index + 1) * 25).forEach(item => callback.call(item[0]));
+                } }) }
+            }));
+        },
+        ReApplyFilter() { this.ApplyFilter(this.elFilter.value); },
+        OnFilterChange() { this.ApplyFilter(this.elFilter.value); },
+        ClearTextFilter() { this.elFilter.value = ''; this.OnFilterChange(); },
+        UpdateTagFiltering(tags) { this.rgLastTags = this.rgCurrentTags; this.rgCurrentTags = tags; this.OnFilterChange(); }
+    };
+}
+
 function harness(active) {
     const messages = [];
     const listeners = [];
@@ -101,7 +147,11 @@ function harness(active) {
         setTimeout(callback, delay) { const id = setTimeout(callback, delay); timers.add(id); return id; },
         clearTimeout(id) { clearTimeout(id); timers.delete(id); }
     };
-    vm.runInNewContext(source, { window, console });
+    window.Filter = nativeFilter(window);
+    const context = vm.createContext({ window, console });
+    vm.runInContext(gemSource(), context);
+    window.SIHLiteGems = context.SIHLiteGems;
+    vm.runInContext(source, context);
     let nextId = 0;
     return {
         window, messages,
@@ -119,6 +169,16 @@ function harness(active) {
                 if (response) return response;
             }
             throw new Error('Sort did not reply');
+        },
+        async filter(mode, coloredAssetIds = [], gemAssetIds = [], overrides = {}) {
+            const requestId = `request-${++nextId}`;
+            this.post({ type: 'FILTER_GEMS', requestId, steamId: STEAM_ID, mode, coloredAssetIds, gemAssetIds, ...overrides });
+            for (let i = 0; i < 10; i++) {
+                await new Promise(resolve => setImmediate(resolve));
+                const response = messages.find(message => message.type === 'FILTER_RESULT' && message.requestId === requestId);
+                if (response) return response;
+            }
+            throw new Error('Gem filter did not reply');
         },
         tick() { intervals.forEach(callback => callback()); },
         dispose() { timers.forEach(clearTimeout); }
@@ -270,5 +330,128 @@ test('INVENTORY cache classification requires a collector cache phrase', () => {
     const snapshot = app.messages.find(message => message.type === 'INVENTORY');
     assert.equal(snapshot.items[0].isCache, false);
     assert.equal(snapshot.items[1].isCache, true);
+    app.dispose();
+});
+
+test('colored gem filter includes prismatic and ethereal sockets but excludes kinetic and loose gems', async () => {
+    const prismatic = gemHolder(1, 'Courier');
+    const ethereal = gemHolder(2, 'Other Courier', 'Ethereal Gem');
+    const kinetic = gemHolder(3, 'Weapon', 'Kinetic Gem');
+    const loose = holder(4, 'Prismatic: Bright Green');
+    loose[0].rgItem.description.type = 'Prismatic Gem';
+    const ordinary = holder(5, 'No Gem');
+    const active = inventory([prismatic, ethereal, kinetic, loose, ordinary]);
+    const app = harness(active);
+    const reply = await app.filter('colored');
+    assert.equal(reply.success, true);
+    assert.equal(reply.count, 2);
+    assert.deepEqual(active.visible.map(item => item[0].rgItem.assetid), ['1', '2']);
+    assert.deepEqual(app.window.Filter.rgCurrentTags, {}, 'Hidden category must not leak to Steam');
+    assert.equal(app.messages.findLast(message => message.type === 'STATE').gemFilter, 'colored');
+    const snapshot = app.messages.findLast(message => message.type === 'INVENTORY');
+    assert.equal(snapshot.items[0].hasGems, true);
+    assert.equal(snapshot.items[0].hasColoredGem, true);
+    assert.equal(snapshot.items[2].hasGems, true);
+    assert.equal(snapshot.items[2].hasColoredGem, false);
+    assert.equal(snapshot.items[3].hasColoredGem, false);
+    app.dispose();
+});
+
+test('gem toggle waits for all pages before committing filter or reporting its count', async () => {
+    const active = inventory([holder(1, 'Ordinary')], { loaded: false, total: 2 });
+    const app = harness(active);
+    app.post({ type: 'FILTER_GEMS', requestId: 'late-gem', steamId: STEAM_ID, mode: 'colored' });
+    assert.equal(active.layouts, 0);
+    assert.equal(app.messages.findLast(message => message.type === 'STATE').gemFilter, 'all');
+    active.finish([gemHolder(2, 'Later Page Courier')]);
+    await new Promise(resolve => setImmediate(resolve));
+    const reply = app.messages.find(message => message.type === 'FILTER_RESULT');
+    assert.equal(reply.success, true);
+    assert.equal(reply.count, 1);
+    assert.equal(reply.total, 2);
+    assert.deepEqual(active.visible.map(item => item[0].rgItem.assetid), ['2']);
+    assert.ok(app.messages.some(message => message.type === 'FILTER_PROGRESS' && message.loaded === 2));
+    app.dispose();
+});
+
+test('gem filtering composes with native text and tag filters and preserves price sort', async () => {
+    const all = [gemHolder(1, 'Red Courier'), holder(2, 'Red Weapon'), gemHolder(3, 'Blue Courier'), gemHolder(4, 'Red Courier')];
+    all[0][0].rgItem.description.tags = [{ internal_name: 'rare' }];
+    all[2][0].rgItem.description.tags = [{ internal_name: 'rare' }];
+    const active = inventory(all);
+    const app = harness(active);
+    assert.equal((await app.sort('desc', [['1', 10], ['2', 20], ['3', 30], ['4', 40]])).success, true);
+    assert.equal((await app.filter('colored')).success, true);
+    assert.deepEqual(ids(active), ['4', '3', '2', '1']);
+    assert.deepEqual(active.visible.map(item => item[0].rgItem.assetid), ['4', '3', '1']);
+    app.window.Filter.elFilter.value = 'Red';
+    app.window.Filter.OnFilterChange();
+    app.window.Filter.UpdateTagFiltering({ Rarity: ['rare'] });
+    assert.deepEqual(active.visible.map(item => item[0].rgItem.assetid), ['1']);
+    app.window.Filter.ClearTextFilter();
+    assert.deepEqual(active.visible.map(item => item[0].rgItem.assetid), ['3', '1']);
+    assert.equal((await app.filter('all')).success, true);
+    assert.deepEqual(active.visible.map(item => item[0].rgItem.assetid), ['3', '1'], 'Native rarity tag survives gem toggle');
+    app.window.Filter.UpdateTagFiltering({});
+    assert.deepEqual(active.visible.map(item => item[0].rgItem.assetid), ['4', '3', '2', '1']);
+    assert.equal((await app.sort('original')).success, true);
+    assert.deepEqual(ids(active), ['1', '2', '3', '4']);
+    assert.equal(active.m_rgItemElements[0].clickHandler(), '1');
+    app.dispose();
+});
+
+test('explicit Steamprice colored identifiers are additive and gem-only mode remains separate', async () => {
+    const active = inventory([gemHolder(1, 'Colored'), gemHolder(2, 'Kinetic', 'Kinetic Gem'), holder(3, 'API Colored')]);
+    const app = harness(active);
+    assert.equal((await app.filter('colored', ['3'])).count, 2);
+    assert.deepEqual(active.visible.map(item => item[0].rgItem.assetid), ['1', '3']);
+    assert.equal((await app.filter('gems', ['3'])).count, 3);
+    app.dispose();
+});
+
+test('empty gem results use one native page and disabling restores all item holders', async () => {
+    const active = inventory([holder(1, 'Ordinary'), holder(2, 'Ordinary 2')]);
+    const app = harness(active);
+    assert.equal((await app.filter('colored')).count, 0);
+    assert.equal(active.m_cPages, 1);
+    assert.deepEqual(active.visible, []);
+    assert.equal((await app.filter('all')).count, 2);
+    assert.deepEqual(active.visible.map(item => item[0].rgItem.assetid), ['1', '2']);
+    assert.equal(active.m_rgItemElements[1].clickHandler(), '2');
+    app.dispose();
+});
+
+test('failed gem load preserves current mode and malformed gem requests cannot load inventory', async () => {
+    const active = inventory([holder(1, 'Ordinary')], { loaded: false, total: 2 });
+    const app = harness(active);
+    assert.equal((await app.filter('invalid')).success, false);
+    assert.equal((await app.filter('colored', ['invalid-id'])).success, false);
+    assert.equal((await app.filter('colored', [], [], { steamId: '76561198000000001' })).success, false);
+    assert.equal(active.loadCalls, 0);
+    app.post({ type: 'FILTER_GEMS', requestId: 'failed-gems', steamId: STEAM_ID, mode: 'colored' });
+    active.fail();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(app.messages.find(message => message.type === 'FILTER_RESULT' && message.requestId === 'failed-gems').success, false);
+    assert.equal(app.messages.findLast(message => message.type === 'STATE').gemFilter, 'all');
+    assert.equal(active.layouts, 0);
+    app.dispose();
+});
+
+test('gem mode stays with its native inventory and never leaks to another owner or game', async () => {
+    const active = inventory([gemHolder(1, 'Gem'), holder(2, 'Ordinary')]);
+    const app = harness(active);
+    assert.equal((await app.filter('colored')).success, true);
+    const other = inventory([holder(9, 'Other')]);
+    other.m_steamid = '76561198000000001';
+    app.window.g_ActiveInventory = other;
+    app.tick();
+    assert.equal(app.messages.findLast(message => message.type === 'STATE').gemFilter, 'all');
+    app.window.Filter.ReApplyFilter();
+    assert.deepEqual(other.visible.map(item => item[0].rgItem.assetid), ['9']);
+    app.window.g_ActiveInventory = active;
+    app.tick();
+    app.window.Filter.ReApplyFilter();
+    assert.equal(app.messages.findLast(message => message.type === 'STATE').gemFilter, 'colored');
+    assert.deepEqual(active.visible.map(item => item[0].rgItem.assetid), ['1']);
     app.dispose();
 });
