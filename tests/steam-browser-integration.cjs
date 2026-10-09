@@ -39,6 +39,16 @@ const assert = require('node:assert/strict');
           `<div style="white-space: nowrap; margin: 9px"><div style="white-space: nowrap; padding: 3px"><div style="background-image: url(https://cdn.steamstatic.com/apps/570/icons/econ/sockets/${index % 6 === 0 ? 'gem_color' : 'gem_kinetic'}.png)"></div><div><span style="font-size: 18px; color: rgb(161,255,89)">${index % 6 === 0 ? 'Bright Green' : 'Fireborn Assault'}</span><br><span style="font-size: 12px">${index % 6 === 0 ? 'Prismatic Gem' : 'Kinetic Gem'}</span></div></div></div>`
         }] : []
       }));
+      // Actual Russian socket shape and RGB verified from Steam market SSR:
+      // /market/listings/570/Unusual%20Baby%20Roshan?l=russian (Deep Blue).
+      // Renamed items retain canonical market_hash_name despite custom name.
+      fixtureDescriptions[6].name = '«Мои переименованные рога»';
+      fixtureDescriptions[6].market_name = 'Fractal Horns of Inner Abysm';
+      fixtureDescriptions[6].market_hash_name = 'Fractal Horns of Inner Abysm';
+      fixtureDescriptions[6].type = 'Демонические рога, Arcana';
+      fixtureDescriptions[6].descriptions = [{ type: 'html', value:
+        '<div style="white-space: nowrap; margin: 9px"><div style="white-space: nowrap; padding: 3px"><div style="border: 2px solid rgb(61, 104, 196)"><div style="background-image: url(https://cdn.steamstatic.com/apps/570/icons/econ/sockets/gem_color.991870a920f3defab3c5a1b4c77fb747e8dfca1d.png)"></div><div style="background-image: url(https://cdn.steamstatic.com/apps/570/icons/econ/sockets/gem_color_mask.d6a50dcfd6ef4220c0935872ab03b1b0f464fefa.png)"></div></div><div><span style="font-size: 18px; white-space: normal; color: rgb(61, 104, 196)">Глубокий синий</span><br><span style="font-size: 12px">Призматический самоцвет</span></div></div></div>'
+      }];
       const owner = { GetSteamId: () => '76561198000000000', ShowLoadingIndicator() {}, HideLoadingIndicator() {} };
       window.g_ActiveInventory = new CInventory(owner, 570, '2', { asset_count: 200 });
       window.fixtureInventory = g_ActiveInventory;
@@ -187,6 +197,16 @@ const assert = require('node:assert/strict');
     assert.equal(colorUrl.searchParams.get('r'), '161');
     assert.equal(colorUrl.searchParams.get('g'), '255');
     assert.equal(colorUrl.searchParams.get('b'), '89');
+    const russianColorLink = page.locator('[id="570_2_1006"] .sih-lite-color-link');
+    await russianColorLink.waitFor({ state: 'attached' });
+    const russianColorUrl = new URL(await russianColorLink.getAttribute('href'));
+    assert.equal(russianColorUrl.origin, 'https://steamprice.com');
+    assert.equal(russianColorUrl.searchParams.get('model'), 'TB', 'Renamed Russian item resolves the viewer model from canonical market hash');
+    assert.equal(russianColorUrl.searchParams.get('r'), '61');
+    assert.equal(russianColorUrl.searchParams.get('g'), '104');
+    assert.equal(russianColorUrl.searchParams.get('b'), '196');
+    assert.equal(russianColorUrl.searchParams.get('kind'), 'regular', 'Native regular color produces a regular viewer URL');
+    assert.equal(await page.evaluate(() => g_ActiveInventory.m_rgAssets['1006'].homeElement.filtered), false, 'Russian regular gem survives native colored-gem filtering');
     const selectionsBeforeLink = await page.evaluate(() => fixtureSelections.length);
     await page.evaluate(() => {
       const link = document.querySelector('[id="570_2_1000"] .sih-lite-color-link');
@@ -202,6 +222,6 @@ const assert = require('node:assert/strict');
     assert.deepEqual(await page.evaluate(() => g_ActiveInventory.m_rgItemElements.map(holder => holder[0].rgItem.assetid)), Array.from({ length: 200 }, (_, index) => String(1199 - index)), 'Isolated-world price sort still uses native inventory');
     await cdp.detach();
     assert.deepEqual(errors, []);
-    console.log('PASS: official Steam scripts in Chromium: complete paginated loading, colored-gem filtering, native sorting/filtering/responsive clicks, plus actual MAIN/isolated-world bridge and exact-RGB color link.');
+    console.log('PASS: official Steam scripts in Chromium: complete loading, native filtering/sorting/responsive clicks, MAIN/isolated bridge, exact RGB and Russian regular-gem renamed-TB viewer.');
   } finally { await browser.close(); }
 })().catch(error => { console.error(error); process.exitCode = 1; });

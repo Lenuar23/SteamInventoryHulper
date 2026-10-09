@@ -641,3 +641,43 @@ test('new API gem metadata during a failed sort refreshes a confirmed active fil
     assert.equal(await gemButton(page).isEnabled(), true);
     assert.equal(await page.locator('#sih-lite-total-text').textContent(), 'Dota 2 value: $123.45');
 });
+
+test('Russian socket descriptions keep a renamed TB regular native color over cached legacy RGB', async t => {
+    // MAIN-world parsing normally produces this snapshot before content.js sees it.
+    // Socket icon paths and CSS RGB stay stable while Steam translates gem labels.
+    const asset = {
+        assetid: '100',
+        description: {
+            market_hash_name: 'Fractal Horns of Inner Abysm',
+            name: '«Мій синій Terrorblade»',
+            descriptions: [{ type: 'html', value:
+                '<div style="white-space: nowrap; padding: 3px;"><div><div style="border: 2px solid rgb(61, 104, 196)">' +
+                '<div style="background-image: url(https://cdn.steamstatic.com/apps/570/icons/econ/sockets/gem_color.hash.png)"></div>' +
+                '<div style="background-image: url(https://cdn.steamstatic.com/apps/570/icons/econ/sockets/gem_color_mask.hash.png)"></div>' +
+                '</div></div><div><span style="font-size: 18px; color: rgb(61, 104, 196)">Глубокий синий</span><br>' +
+                '<span style="font-size: 12px">Призматический самоцвет</span></div></div>' }]
+        }
+    };
+    const metadata = require('../gems.js').analyzeSteamAsset(asset);
+    const page = await openFixture(t, {
+        inventory: [{ assetId: asset.assetid, name: asset.description.market_hash_name, ...metadata }],
+        items: [{
+            assetid: '100', marketHashName: 'Fractal Horns of Inner Abysm', priceCents: 100,
+            prismaticGems: ['Legacy (230, 155, 253)'], legacyRgb: { r: 230, g: 155, b: 253 }, isLegacy: true
+        }]
+    });
+    await page.evaluate(displayName => {
+        document.querySelector('#item570_2_100 img').alt = displayName;
+        // Simulate a native redraw; the content script observes child changes.
+        document.querySelector('#item570_2_100').appendChild(document.createElement('span'));
+    }, asset.description.name);
+    await page.waitForFunction(() => !document.querySelector('[data-order="desc"]').disabled);
+    await settleRender(page);
+    assert.equal(await colorLink(page).count(), 1);
+    const url = new URL(await colorLink(page).getAttribute('href'));
+    assert.equal(url.searchParams.get('model'), 'TB');
+    assert.equal(url.searchParams.get('kind'), 'regular');
+    assert.deepEqual(['r', 'g', 'b'].map(key => url.searchParams.get(key)), ['61', '104', '196']);
+    assert.equal(await page.locator('#item570_2_100 img').getAttribute('alt'), asset.description.name);
+    assert.equal(await colorLink(page).textContent(), 'View color');
+});

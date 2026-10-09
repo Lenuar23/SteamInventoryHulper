@@ -33,6 +33,71 @@ test('native socket rows distinguish effect and color gems without double-counti
     assert.equal(info.legacyRgb, null);
 });
 
+test('Russian regular Deep Blue sockets retain exact RGB and produce a regular viewer link', () => {
+    const html = PRISMATIC_ROW.replaceAll('161, 255, 89', '61, 104, 196')
+        .replace('Bright Green', 'Глубокий синий').replace('Prismatic Gem', 'Призматический самоцвет');
+    const info = analyzeSteamAsset(steamAsset(html, {
+        market_hash_name: 'Exalted Fractal Horns of Inner Abysm', type: 'Демонические рога, Arcana'
+    }));
+    assert.equal(info.hasColoredGem, true);
+    assert.equal(info.isLegacy, false);
+    assert.deepEqual(info.prismaticGems, [{ name: 'Глубокий синий', type: 'Prismatic Gem', color: { r: 61, g: 104, b: 196 } }]);
+    const url = new URL(makeViewerUrl('Exalted Fractal Horns of Inner Abysm', info));
+    assert.equal(url.searchParams.get('kind'), 'regular');
+    assert.equal(url.searchParams.get('model'), 'TB');
+    assert.deepEqual(['r', 'g', 'b'].map(key => Number(url.searchParams.get(key))), [61, 104, 196]);
+});
+
+test('socket icons classify localized Prismatic and Ethereal gems without relying on translated labels', () => {
+    for (const [prismatic, ethereal] of [
+        ['Призматический самоцвет', 'Потусторонний самоцвет'],
+        ['Prismatischer Edelstein', 'Ätherischer Edelstein'],
+        ['棱彩宝石', '虚灵宝石']
+    ]) {
+        const html = PRISMATIC_ROW.replace('Prismatic Gem', prismatic) + ETHEREAL_ROW.replace('Ethereal Gem', ethereal);
+        const info = analyzeSteamAsset(steamAsset(html));
+        assert.equal(info.gems.length, 2);
+        assert.equal(info.prismaticGems[0].type, 'Prismatic Gem');
+        assert.equal(info.etherealGems[0].type, 'Ethereal Gem');
+        assert.equal(info.etherealGems[0].color, null, 'effect gem white text is not a Prismatic color');
+    }
+});
+
+test('localized ordinary sockets count without becoming colored, while localized empty and loose gems remain excluded', () => {
+    const inscribed = INSCRIBED_ROW.replace('Inscribed Gem', 'Надпись').replace('Flesh Heap Total: 6102', 'Заряды Flesh Heap: 6102');
+    const kinetic = INSCRIBED_ROW.replaceAll('gem_stat', 'gem_kinetic').replace('Inscribed Gem', 'Кинетический самоцвет');
+    const spectator = SPECTATOR_ROW.replace('Games Watched: 1', 'Просмотрено игр: 1');
+    const empty = EMPTY_ROW.replace('Empty Socket', 'Пустое гнездо').replace('General', 'Общий');
+    const info = analyzeSteamAsset(steamAsset(inscribed + kinetic + spectator + empty));
+    assert.equal(info.hasGems, true);
+    assert.equal(info.hasColoredGem, false);
+    assert.equal(info.gems.length, 3);
+    assert.equal(info.kineticGems[0].type, 'Kinetic Gem');
+    assert.equal(analyzeSteamAsset(steamAsset(empty)).hasGems, false);
+    assert.equal(analyzeSteamAsset(steamAsset(PRISMATIC_ROW, {
+        market_hash_name: 'Необычное локализованное название', type: 'Самоцвет / Руна',
+        rawTags: [], tags: [{ category: 'Тип', internal_name: 'socket_gem', localized_tag_name: 'Самоцвет / Руна' }]
+    })).hasGems, false, 'internal socket_gem tag excludes loose gems independently of language');
+    assert.equal(analyzeSteamAsset(steamAsset(PRISMATIC_ROW.replaceAll('gem_color.hash', 'gem_color_mask.hash'))).hasGems, false,
+        'a decorative color mask alone does not establish an occupied socket');
+});
+
+test('unknown and noncolored socket icons cannot become colored gems through their labels', () => {
+    for (const html of [
+        PRISMATIC_ROW.replace('gem_color.hash', 'gem_unrecognized.hash'),
+        PRISMATIC_ROW.replace('gem_color.hash', 'gem_stat.hash'),
+        ETHEREAL_ROW.replace('gem_effect.hash', 'gem_stat.hash')
+    ]) {
+        const info = analyzeSteamAsset(steamAsset(html));
+        assert.equal(info.hasGems, true);
+        assert.equal(info.hasColoredGem, false);
+        assert.deepEqual(info.prismaticGems, []);
+        assert.deepEqual(info.etherealGems, []);
+        assert.equal(info.gems[0].color, null);
+        assert.equal(makeViewerUrl('Platinum Baby Roshan', info), null);
+    }
+});
+
 test('empty sockets never count, including when placed after an occupied socket', () => {
     for (const html of [EMPTY_ROW, ETHEREAL_ROW + EMPTY_ROW, EMPTY_ROW + ETHEREAL_ROW]) {
         const info = analyzeSteamAsset(steamAsset(html));

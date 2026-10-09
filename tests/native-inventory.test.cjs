@@ -88,8 +88,9 @@ function deferredResolved() {
 
 function gemHolder(id, name, type = 'Prismatic Gem') {
     const result = holder(id, name);
+    const icon = type === 'Ethereal Gem' ? 'gem_effect' : type === 'Kinetic Gem' ? 'gem_kinetic' : 'gem_color';
     result[0].rgItem.description.descriptions = [{ type: 'html', value:
-        `<div><div style="background-image: url(https://cdn.steamstatic.com/apps/570/icons/econ/sockets/gem_color.png)"></div><div><span style="font-size: 18px; color: rgb(161,255,89)">Bright Green</span><br><span style="font-size: 12px">${type}</span></div></div>`
+        `<div><div style="background-image: url(https://cdn.steamstatic.com/apps/570/icons/econ/sockets/${icon}.png)"></div><div><span style="font-size: 18px; color: rgb(161,255,89)">Bright Green</span><br><span style="font-size: 12px">${type}</span></div></div>`
     }];
     return result;
 }

@@ -37,6 +37,8 @@ Steamprice's viewer offers a limited set of effects. If an item's Ethereal effec
 
 Enable **Colored gems only** to show items with attached Prismatic or Ethereal gems. The filter loads the whole native inventory, including unopened pages, and uses Steam's item descriptions together with Steamprice's asset-specific gem metadata. It ignores empty sockets, loose gem items, and items whose only gems are Inscribed or Kinetic. Steam's text and tag filters and price sorting continue to work. Disable the toggle to show the other items again.
 
+Colored socket detection works regardless of Steam's display language, including Russian. The viewer uses the item's canonical market name and native socket RGB even when its displayed name is customized or cached Steamprice color metadata differs.
+
 The total valuation always describes the full inventory; filtering does not change that grand total.
 
 ## Development checks

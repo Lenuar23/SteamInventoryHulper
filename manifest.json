@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "SIH Beta",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Dota 2 inventory prices, gem color previews, and native price sorting and gem filtering.",
   "permissions": ["tabs"],
   "host_permissions": ["https://steamprice.com/*", "*://steamcommunity.com/*"],

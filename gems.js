@@ -56,10 +56,14 @@
         if (GEM_PREFIX.test(itemName(item))) return true;
         const type = cleanText(item.itemType || item.type || '');
         if (/\b(?:gem|rune)\b/i.test(type)) return true;
-        const tags = Array.isArray(item.rawTags) ? item.rawTags : Array.isArray(item.tags) ? item.tags : [];
-        return tags.some(tag => tag && /^type$/i.test(String(tag.category || '')) &&
-            (String(tag.internal_name || '').toLowerCase() === 'socket_gem' ||
-                /\b(?:gem|rune)\b/i.test(String(tag.localized_tag_name || ''))));
+        for (const tags of [item.rawTags, item.tags]) {
+            if (!Array.isArray(tags)) continue;
+            if (tags.some(tag => tag &&
+                (String(tag.internal_name || '').toLowerCase() === 'socket_gem' ||
+                    (/^type$/i.test(String(tag.category || '')) &&
+                        /\b(?:gem|rune)\b/i.test(String(tag.localized_tag_name || '')))))) return true;
+        }
+        return false;
     }
 
     function summarize(gems, legacyHint = false, colorHint = null) {
@@ -109,11 +113,17 @@
                 let icon;
                 while ((icon = iconPattern.exec(preceding))) icons.push(icon[1].toLowerCase());
                 const name = cleanText(pair[2]);
-                const type = cleanText(pair[3]);
+                const label = cleanText(pair[3]);
                 if (!icons.length || icons.some(icon => /(?:^|_)empty(?:_|$)/.test(icon)) ||
-                    !name || EMPTY_SOCKET.test(name) || !type) continue;
-                const spectator = icons.includes('gem_spectator') && /^games\s+watched\s*:/i.test(type);
-                if (!/\b(?:gem|rune)\b/i.test(type) && !spectator) continue;
+                    !name || EMPTY_SOCKET.test(name) || !label ||
+                    icons.every(icon => icon === 'gem_color_mask')) continue;
+                // The socket label is localized; its sprite identifier is not.
+                // Canonical colored types keep filtering and RGB extraction
+                // identical on English, Russian, and other Steam languages.
+                const type = icons.includes('gem_color') ? 'Prismatic Gem'
+                    : icons.includes('gem_effect') ? 'Ethereal Gem'
+                    : icons.includes('gem_kinetic') ? 'Kinetic Gem'
+                    : /^(?:prismatic|ethereal)\s+gem$/i.test(label) ? 'Socketed Gem' : label;
                 let color = null;
                 if (/^prismatic\s+gem$/i.test(type)) {
                     // Read the name span's text color, never the socket border
