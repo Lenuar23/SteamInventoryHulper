@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "SIH Beta",
-  "version": "1.2.1",
-  "description": "Dota 2 inventory prices, gem color previews, and native price sorting and gem filtering.",
+  "version": "1.3.0",
+  "description": "Dota 2 inventory and trade prices, trade totals, Fast accept, gem previews, and native price sorting.",
   "permissions": ["tabs"],
   "host_permissions": ["https://steamprice.com/*", "*://steamcommunity.com/*"],
   "background": {"service_worker": "background.js"},
@@ -16,6 +16,27 @@
     {
       "matches": ["*://steamcommunity.com/profiles/*/inventory*", "*://steamcommunity.com/id/*/inventory*"],
       "js": ["gems.js", "content.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["*://steamcommunity.com/tradeoffer/*"],
+      "js": ["gems.js", "trade-inject.js"],
+      "world": "MAIN",
+      "run_at": "document_start"
+    },
+    {
+      "matches": ["*://steamcommunity.com/profiles/*/tradeoffers*", "*://steamcommunity.com/id/*/tradeoffers*"],
+      "js": ["gems.js", "trade-offers.js", "trade-list-inject.js"],
+      "world": "MAIN",
+      "run_at": "document_start"
+    },
+    {
+      "matches": [
+        "*://steamcommunity.com/tradeoffer/*",
+        "*://steamcommunity.com/profiles/*/tradeoffers*",
+        "*://steamcommunity.com/id/*/tradeoffers*"
+      ],
+      "js": ["gems.js", "trade-prices.js", "trade-offers.js", "trade-accept.js", "trade-content.js"],
       "run_at": "document_idle"
     }
   ],
