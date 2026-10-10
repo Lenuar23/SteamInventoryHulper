@@ -21,10 +21,11 @@ function item(ownerSteamId, assetId, name, amount = '1', extra = {}) {
     return { ownerSteamId, assetId, name, market_hash_name: name, appId: '570', contextId: '2', amount, ...extra };
 }
 
-function slot(record, side, location) {
-    return `<div class="${location === 'inventory' ? 'itemHolder' : 'trade_slot'}"><div class="slot_inner"><div class="item"
+function slot(record, side, location, visible = true) {
+    return `<div class="${location === 'inventory' ? 'itemHolder' : 'trade_slot'}" ${record.fixtureHidden ? 'style="display:none"' : ''}><div class="slot_inner"><div class="item"
         data-sih-trade-owner="${record.ownerSteamId}" data-sih-trade-asset="${record.assetId}"
         data-sih-trade-app="${record.appId}" data-sih-trade-context="${record.contextId}" data-sih-trade-side="${side}"
+        ${location === 'inventory' && visible && !record.fixtureHidden ? 'data-sih-trade-visible="true"' : ''}
         id="${location}_${side}_${record.assetId}"><img alt="${record.name}"></div></div></div>`;
 }
 
@@ -34,8 +35,8 @@ function editorSnapshot({ partner = PARTNER, me = [], them = [], mine = [], thei
         active: { side: active, ownerSteamId: active === 'me' ? OWNER : partner,
             appId, contextId: '2', supported: appId === '570', order: 'original', loading: false },
         inventories: [
-            { side: 'me', ownerSteamId: OWNER, appId: '570', contextId: '2', items: mine },
-            { side: 'them', ownerSteamId: partner, appId: '570', contextId: '2', items: theirs }
+            { side: 'me', ownerSteamId: OWNER, appId: '570', contextId: '2', scope: 'visible', items: mine },
+            { side: 'them', ownerSteamId: partner, appId: '570', contextId: '2', scope: 'visible', items: theirs }
         ],
         offers: { me, them }
     };
@@ -48,7 +49,7 @@ function editorHtml(snapshot) {
         </style></head><body><div id="trade_area"><div id="inventory_box"><div id="inventory_select">
         <a id="inventory_select_your_inventory">Your inventory</a><a id="inventory_select_their_inventory">Their inventory</a>
         </div><div id="inventories">${snapshot.inventories.map(inventory =>
-            `<div id="inventory_${inventory.side}">${inventory.items.map(record => slot(record, inventory.side, 'inventory')).join('')}</div>`).join('')}
+            `<div id="inventory_${inventory.side}" ${snapshot.active.side !== inventory.side ? 'style="display:none"' : ''}>${inventory.items.map(record => slot(record, inventory.side, 'inventory', snapshot.active.side === inventory.side)).join('')}</div>`).join('')}
         </div><div id="inventory_pagecontrols"></div></div><div id="trade_box">
         <div id="your_items"><div id="your_slots">${snapshot.offers.me.map(record => slot(record, 'me', 'offer')).join('')}</div></div>
         <div id="their_items"><div id="their_slots">${snapshot.offers.them.map(record => slot(record, 'them', 'offer')).join('')}</div></div>
@@ -56,6 +57,9 @@ function editorHtml(snapshot) {
 }
 
 async function frames(page) {
+    // The extension intentionally batches native page updates at 200 ms. Give
+    // that batch time to commit before checking unchanged or absent elements.
+    await page.waitForTimeout(250);
     await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
 }
 
@@ -92,6 +96,29 @@ async function openFixture(t, options = {}) {
     await context.route('**/*', route => route.fulfill({ status: 200, contentType: 'text/html', body: options.html || editorHtml(snapshot) }));
     await page.goto(options.url || 'https://steamcommunity.com/tradeoffer/new/?partner=123456');
     await page.evaluate(config => {
+        if (config.monitorWork) {
+            window.__sihWork = { styleReads: 0, badgeWrites: 0, pulses: 0, maxPulseGap: 0 };
+            const nativeStyle = window.getComputedStyle;
+            window.getComputedStyle = function (element, ...args) {
+                if (element?.classList?.contains('item')) window.__sihWork.styleReads++;
+                return nativeStyle.call(this, element, ...args);
+            };
+            new MutationObserver(records => {
+                for (const record of records) {
+                    if (record.target.parentElement?.closest('.sih-lite-trade-price')) window.__sihWork.badgeWrites++;
+                    for (const node of record.addedNodes) if (node.nodeType === 1 && node.classList.contains('sih-lite-trade-price')) {
+                        window.__sihWork.badgeWrites++;
+                    }
+                }
+            }).observe(document.body, { subtree: true, childList: true });
+            let previous = performance.now();
+            setInterval(() => {
+                const now = performance.now();
+                window.__sihWork.maxPulseGap = Math.max(window.__sihWork.maxPulseGap, now - previous);
+                window.__sihWork.pulses++;
+                previous = now;
+            }, 20);
+        }
         window.__chromeRequests = [];
         window.__pendingResponses = [];
         window.__tradeRequests = [];
@@ -158,7 +185,8 @@ async function openFixture(t, options = {}) {
         snapshot, prices: options.prices || DEFAULT_PRICES,
         totals: options.totals || { [OWNER]: '12345', [PARTNER]: '67890', [THIRD_OWNER]: '54321' },
         plans: options.plans, sortReply: options.sortReply,
-        fetchPlans: options.fetchPlans, sessionId: options.sessionId === undefined ? 'fixture_session_123' : options.sessionId
+        fetchPlans: options.fetchPlans, sessionId: options.sessionId === undefined ? 'fixture_session_123' : options.sessionId,
+        monitorWork: options.monitorWork === true
     });
     for (const file of ['gems.js', 'trade-prices.js', 'trade-offers.js', 'trade-accept.js', 'trade-content.js']) {
         await page.addScriptTag({ path: path.join(__dirname, '..', file) });
@@ -171,6 +199,16 @@ async function sendSnapshot(page, snapshot, { replaceHtml = false } = {}) {
     await page.evaluate(({ next, html }) => {
         window.__tradeSnapshot = next;
         if (html) document.body.innerHTML = html;
+        for (const side of ['me', 'them']) {
+            const inventory = document.getElementById('inventory_' + side);
+            if (!inventory) continue;
+            inventory.style.display = next.active?.side === side ? '' : 'none';
+            const visibleAssets = new Set((next.inventories?.find(entry => entry.side === side)?.items || []).map(record => String(record.assetId)));
+            for (const element of inventory.querySelectorAll('.item')) {
+                if (next.active?.side === side && visibleAssets.has(element.dataset.sihTradeAsset)) element.dataset.sihTradeVisible = 'true';
+                else element.removeAttribute('data-sih-trade-visible');
+            }
+        }
         window.postMessage(next, location.origin);
     }, { next: snapshot, html: replaceHtml ? editorHtml(snapshot).split('<body>')[1].split('</body>')[0] : null });
     await frames(page);
@@ -191,13 +229,17 @@ test('trade editor scopes item prices to each owner and totals stacks separately
     assert.match(await role(page, 'net').textContent(), /Net gain.*\+\$4\.00/);
     assert.match(await badge(page, 'me', '100').textContent(), /\$2\.50|\$5\.00/);
     await waitText(badge(page, 'me', '101', 'inventory'), '$0.00');
-    await waitText(badge(page, 'them', '103', 'inventory'), '$2.00');
+    assert.equal(await badge(page, 'them', '103', 'inventory').count(), 0, 'hidden partner cards should not be decorated');
     assert.match(await panel(page).locator('[data-role="inventory-me"]').textContent(), /\$123\.45/);
     assert.match(await panel(page).locator('[data-role="inventory-them"]').textContent(), /\$678\.90/);
     const calls = await page.evaluate(() => window.__chromeRequests);
     assert.ok(calls.some(request => request.steamId === OWNER && request.action === 'fetchPrices'));
     assert.ok(calls.some(request => request.steamId === PARTNER && request.action === 'fetchPrices'));
     assert.deepEqual(await page.evaluate(() => window.__fetchRequests), []);
+    const switched = await page.evaluate(() => ({ ...window.__tradeSnapshot,
+        active: { ...window.__tradeSnapshot.active, side: 'them', ownerSteamId: window.__tradeSnapshot.owners.them.steamId } }));
+    await sendSnapshot(page, switched);
+    await waitText(badge(page, 'them', '103', 'inventory'), '$2.00');
 });
 
 test('zero-priced items count as known and an empty receiving side produces an exact loss', async t => {
@@ -274,6 +316,52 @@ test('partner inventory sorting uses the partner price map and preserves both in
     assert.deepEqual(request.prices.assetPrices, [['100', 900], ['103', 200]]);
     assert.match(await panel(page).locator('[data-role="inventory-me"]').textContent(), /\$123\.45/);
     assert.match(await panel(page).locator('[data-role="inventory-them"]').textContent(), /\$678\.90/);
+});
+
+test('large trade inventories decorate only the visible page and load each owner when their tab is selected', async t => {
+    const mine = Array.from({ length: 6000 }, (_, index) => item(OWNER, String(2000 + index), 'My item ' + index));
+    const theirs = Array.from({ length: 6000 }, (_, index) => item(PARTNER, String(12000 + index), 'Partner item ' + index));
+    const visibleSnapshot = editorSnapshot({ mine: mine.slice(0, 16), theirs: theirs.slice(0, 16) });
+    const html = editorHtml(editorSnapshot({
+        mine: mine.map((record, index) => ({ ...record, fixtureHidden: index >= 16 })),
+        theirs: theirs.map((record, index) => ({ ...record, fixtureHidden: index >= 16 }))
+    }));
+    const page = await openFixture(t, { snapshot: visibleSnapshot, html, monitorWork: true, prices: {
+        [OWNER]: mine.map(record => ({ assetid: record.assetId, marketHashName: record.market_hash_name, priceCents: 125 })),
+        [PARTNER]: theirs.map(record => ({ assetid: record.assetId, marketHashName: record.market_hash_name, priceCents: 200 }))
+    } });
+    let navigations = 0;
+    page.on('framenavigated', frame => { if (frame === page.mainFrame()) navigations++; });
+    await waitText(badge(page, 'me', '2015', 'inventory'), '$1.25');
+    await page.waitForFunction(() => document.querySelector('[data-role="inventory-them"]')?.textContent.includes('$678.90'));
+    assert.equal(await page.locator('#inventory_me .item').count(), 6000);
+    assert.equal(await page.locator('#inventory_them .item').count(), 6000);
+    assert.equal(await page.locator('#inventories .sih-lite-trade-price').count(), 16);
+    const calls = await page.evaluate(() => window.__chromeRequests);
+    assert.equal(calls.filter(call => call.action === 'fetchPrices' && call.steamId === OWNER).length, 1);
+    assert.equal(calls.filter(call => call.action === 'fetchPrices' && call.steamId === PARTNER).length, 0,
+        'an unopened partner tab must not fetch a full price inventory');
+    assert.ok(calls.some(call => call.action === 'fetchProfile' && call.steamId === PARTNER), 'a lightweight partner total remains available');
+    await page.waitForTimeout(500);
+    const settled = await page.evaluate(() => ({ ...window.__sihWork }));
+    await page.waitForTimeout(800);
+    const idle = await page.evaluate(() => ({ ...window.__sihWork }));
+    assert.ok(idle.styleReads < 200, `visible item style checks should stay bounded, observed ${idle.styleReads}`);
+    assert.equal(idle.badgeWrites, settled.badgeWrites, 'own badge mutations must not start another render cycle');
+    assert.ok(idle.pulses - settled.pulses >= 20, 'the browser event loop stays responsive while the panel is idle');
+    assert.ok(idle.maxPulseGap < 750, `cooperative batches should leave room for UI work; longest pulse gap ${idle.maxPulseGap} ms`);
+    const partnerSnapshot = editorSnapshot({ active: 'them', mine: mine.slice(0, 16), theirs: theirs.slice(0, 16) });
+    await sendSnapshot(page, partnerSnapshot);
+    await waitText(badge(page, 'them', '12015', 'inventory'), '$2.00');
+    assert.equal(await page.locator('#inventories .sih-lite-trade-price').count(), 16,
+        'changing owner removes hidden badges instead of pricing all 12,000 nodes');
+    await sendSnapshot(page, visibleSnapshot);
+    await waitText(badge(page, 'me', '2015', 'inventory'), '$1.25');
+    const finalCalls = await page.evaluate(() => window.__chromeRequests);
+    for (const owner of [OWNER, PARTNER]) assert.equal(finalCalls.filter(call => call.action === 'fetchPrices' && call.steamId === owner).length, 1,
+        'returning to a loaded owner should reuse its price index');
+    assert.equal(navigations, 0, 'loading or selecting a price inventory must never reload the trade page');
+    assert.deepEqual(await page.evaluate(() => window.__fetchRequests), [], 'price loading does not accept or reload a trade');
 });
 
 test('sorting keeps gem asset prices separate and excludes their shared name from native fallback aliases', async t => {
@@ -802,4 +890,62 @@ test('sent offers without native asset status use exact public class description
     assert.equal(calls.length, 4);
     assert.equal(calls.filter(call => call.url.includes('/economy/itemclasshover/')).length, 3);
     assert.ok(calls.every(call => call.method === 'GET'));
+});
+
+test('historical offers read public class hovers without opening a trade and label verified regular gem variant prices as current estimates', async t => {
+    const gemName = 'Fractal Horns of Inner Abysm';
+    const snapshot = listSnapshot([listOffer('503', { incoming: false, active: false,
+        give: [item(OWNER, null, '', '1', { classId: '3000', instanceId: '0' }),
+            item(OWNER, null, '', '2', { classId: '1000', instanceId: '0' })],
+        receive: [item(PARTNER, null, '', '1', { classId: '2000', instanceId: '0' })]
+    })]);
+    const hover = description => `<script>BuildHover('economy_item_fixture', ${JSON.stringify(description)});</script>`;
+    const gemHtml = '<div style="background-image:url(https://cdn.steamstatic.com/apps/570/icons/econ/sockets/gem_color.hash.png)">' +
+        '<span style="color:rgb(61,104,196)">Deep Blue</span><br><span>Prismatic Gem</span></div>';
+    // The complete API flags identify an ordinary tradable Standard TB with
+    // one regular gem. Exceptional or unspecified variants stay unpriced.
+    const regularGemRow = {
+        assetid: '123', marketHashName: gemName, quality: 'Standard', assetQuality: 'Standard',
+        rawTags: [{ category: 'Quality', internal_name: 'unique' }], priceCents: 11767,
+        prismaticGems: ['Deep Blue'], etherealGems: [], kineticGems: [], unusualEffectGems: [],
+        emptySockets: 0, spectatorGames: 0, tradable: true, marketable: true,
+        isLegacy: false, legacyRgb: null, legacyPricing: null,
+        allStylesUnlocked: false, mayBeGiftedOnce: false, favored: false, unusualQuality: false,
+        isBuggedEthereal: false, isOtherBug: false, isGolden: false, isCrimson: false,
+        emptyEthereal: false, emptyPrismatic: false, isUnusualCourier: false, hasAllStyleCourier: false,
+        hasUnusualEffect: false, isCollectorBundle: false, canGiftCollectorBundle: false,
+        unpackGiftCollectorBundle: false, pbrCycled: false,
+        styleTotal: null, styleUnlocked: null, gem: null, paintSeed: null, wearRating: null,
+        stickers: null, infuser: null, roshanCycle: null, expirationDate: null, greevil: null, collectorSetPiece: null
+    };
+    const page = await openList(t, { snapshot, sent: true, prices: {
+        [OWNER]: [regularGemRow, { assetid: '102', marketHashName: 'Ordinary Item', priceCents: 125 }],
+        [PARTNER]: [{ assetid: '103', marketHashName: 'Partner Item', priceCents: 200 }]
+    }, fetchPlans: {
+        'https://steamcommunity.com/economy/itemclasshover/570/3000/0?content_only=1&l=english': [{ text: hover({
+            appid: 570, classid: '3000', instanceid: '0', market_hash_name: gemName, name_color: 'D2D2D2',
+            tags: [], tradable: true, marketable: true, descriptions: [{ type: 'html', value: gemHtml }]
+        }) }],
+        'https://steamcommunity.com/economy/itemclasshover/570/1000/0?content_only=1&l=english': [{ text: hover({
+            appid: 570, classid: '1000', instanceid: '0', market_hash_name: 'Ordinary Item'
+        }) }],
+        'https://steamcommunity.com/economy/itemclasshover/570/2000/0?content_only=1&l=english': [{ text: hover({
+            appid: 570, classid: '2000', instanceid: '0', market_hash_name: 'Partner Item'
+        }) }]
+    } });
+    await waitText(listBadge(page, 'give', 0, '503'), '$117.67');
+    await waitText(listBadge(page, 'give', 1, '503'), '$2.50');
+    await waitText(listBadge(page, 'receive', 0, '503'), '$2.00');
+    assert.match(await listBadge(page, 'give', 0, '503').getAttribute('title'), /Current estimate/i);
+    assert.match(await offerSummary(page, '503').locator('[data-role="status"]').textContent(), /current.*estimate|estimated/i);
+    assert.match(await offerSummary(page, '503').locator('[data-role="give"]').textContent(), /\$120\.17/);
+    assert.match(await offerSummary(page, '503').locator('[data-role="receive"]').textContent(), /\$2\.00/);
+    assert.match(await offerSummary(page, '503').locator('[data-role="net"]').textContent(), /[−-]\$118\.17/);
+    assert.equal(await fastAccept(page, '503').count(), 0);
+    const calls = await page.evaluate(() => window.__fetchRequests);
+    assert.equal(calls.length, 3);
+    assert.ok(calls.every(call => call.method === 'GET' && call.url.includes('/economy/itemclasshover/')),
+        'historical valuations need class metadata, never a separate editable trade or a trade acceptance request');
+    const pricingRequests = await page.evaluate(() => window.__chromeRequests.filter(request => request.action === 'fetchPrices'));
+    assert.ok(pricingRequests.every(request => request.scan === false), 'trade pages never launch automatic inventory-scanning tabs');
 });

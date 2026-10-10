@@ -196,8 +196,8 @@ test('fetching uses the final response URL without weakening the signed-in owner
   await assert.rejects(Offers.fetchDetails('500', owner, async () => ({ ok: true, url: 'https://steamcommunity.com/login/home/', text: async () => '<html>Sign in</html>' })), /Sign in to Steam/);
 });
 
-function classHoverHtml({ appId = '570', classId = '82001', instanceId = '0', name = 'Ordinary item', descriptions = [] } = {}) {
-  return `<script>var ignored = true; BuildHover( 'economy_item_random', ${JSON.stringify({ appid: appId, classid: classId, instanceid: instanceId, market_hash_name: name, descriptions })} );</script>`;
+function classHoverHtml({ appId = '570', classId = '82001', instanceId = '0', name = 'Ordinary item', descriptions = [], extra = {} } = {}) {
+  return `<script>var ignored = true; BuildHover( 'economy_item_random', ${JSON.stringify({ appid: appId, classid: classId, instanceid: instanceId, market_hash_name: name, descriptions, ...extra })} );</script>`;
 }
 
 test('native BuildHover metadata supplies only verified class names and gem flags', async () => {
@@ -234,6 +234,28 @@ test('class hover names attach to exact native classes and preserve unknown asse
   assert.equal(result.receive[0].hasColoredGem, true);
   assert.equal(result.receive[0].assetId, null);
   assert.equal(result.slots[0].market_hash_name, 'Fractal Horns of Inner Abysm');
+});
+
+test('verified hover variant fingerprints survive class-only hydration without invented asset IDs', async () => {
+  const gemHtml = '<div style="background-image:url(https://cdn.steamstatic.com/apps/570/icons/econ/sockets/gem_color.hash.png)"><span style="color:rgb(61,104,196)">Глубокий синий</span><br><span>Призматический самоцвет</span></div>';
+  const offer = { offerId: '500', meSteamId: ME, partnerSteamId: PARTNER,
+    give: [{ ownerSteamId: ME, appId: '570', classId: '85001', instanceId: '0', assetId: null, amount: 1 }], receive: [] };
+  const details = await Offers.fetchClassDescriptions(offer, ME, async (href, options) => {
+    assert.equal(options.credentials, 'include');
+    assert.ok(href.endsWith('?content_only=1&l=english'));
+    return { ok: true, text: async () => classHoverHtml({ classId: '85001', name: 'Fractal Horns of Inner Abysm',
+      descriptions: [{ type: 'html', value: gemHtml }], extra: { tags: [], name_color: 'D2D2D2', tradable: true, marketable: true } }) };
+  });
+  assert.equal(details.classItems[0].variantFingerprint, '["tb-v1","standard","regular",61,104,196]');
+  assert.equal(Offers.normalizeItem(details.classItems[0], ME).variantFingerprint, details.classItems[0].variantFingerprint);
+  const metadata = { ...details, classItems: [{ ...details.classItems[0], classId: '701' }] };
+  const result = await inDocument(fixture({ historical: true, classOnly: true }), ({ me, metadata }) => {
+    const [offer] = SIHLiteTradeOffers.read(document, { meSteamId: me }, { '500': metadata });
+    return { item: offer.give[0], active: offer.active };
+  }, { metadata });
+  assert.equal(result.active, false);
+  assert.equal(result.item.assetId, null);
+  assert.equal(result.item.variantFingerprint, details.classItems[0].variantFingerprint);
 });
 
 test('detail fetching makes only an authenticated GET and reports HTTP failures', async () => {
@@ -300,6 +322,70 @@ test('overlapping offer requests reuse owner-specific class inventory loads', as
   const results = await Promise.all([Offers.fetchDetails('600', owner, fetchMock), Offers.fetchDetails('601', owner, fetchMock)]);
   assert.equal(inventoryRequests, 2);
   assert.ok(results.every(result => result.give[0].classId === '701' && result.receive[0].instanceId === '99'));
+});
+
+test('all Steam metadata GETs share one paced queue including response body decoding', async () => {
+  const owner = '76561198000000017';
+  const partner = '76561198000000018';
+  const started = [];
+  let active = 0, maximumActive = 0;
+  const pause = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
+  const fetchMock = async (href, options) => {
+    started.push({ href, at: Date.now() });
+    active++;
+    maximumActive = Math.max(maximumActive, active);
+    assert.equal(options.credentials, 'include');
+    assert.equal(options.method, undefined);
+    await pause(8);
+    const finish = async value => { await pause(8); active--; return value; };
+    if (href.endsWith('/tradeoffer/875/')) return { ok: true, text: () => finish(detailsHtml({ owner, partner, offerId: '875' })) };
+    const classId = href.match(/\/itemclasshover\/570\/(\d+)\/0\?/)?.[1];
+    if (classId) return { ok: true, text: () => finish(classHoverHtml({ classId })) };
+    const own = href.includes(owner);
+    return { ok: true, json: () => finish({ success: 1, assets: [{ appid: 570, contextid: '2',
+      assetid: own ? '900' : '901', classid: own ? '90001' : '90002', instanceid: '0' }], descriptions: [], more_items: false }) };
+  };
+  const offer = { offerId: '876', meSteamId: owner, partnerSteamId: partner,
+    give: [{ ownerSteamId: owner, appId: '570', classId: '86001', instanceId: '0', amount: 1 }],
+    receive: [{ ownerSteamId: partner, appId: '570', classId: '86002', instanceId: '0', amount: 1 }] };
+  const [details, classes] = await Promise.all([
+    Offers.fetchDetails('875', owner, fetchMock), Offers.fetchClassDescriptions(offer, owner, fetchMock)
+  ]);
+  assert.equal(maximumActive, 1, 'fetch headers and body consumption never overlap another request');
+  assert.equal(active, 0);
+  assert.equal(started.length, 5);
+  for (let index = 1; index < started.length; index++) {
+    assert.ok(started[index].at - started[index - 1].at >= 290, 'there is a delay between requests rather than parallel bursts');
+  }
+  assert.equal(details.receive[0].classId, '90002');
+  assert.equal(classes.classItems.length, 2);
+});
+
+test('later offers rescan discarded inventory pages for newly requested assets and retain offered quantities', async () => {
+  const owner = '76561198000000019';
+  const partner = '76561198000000020';
+  const inventoryPages = [];
+  const fetchMock = async href => {
+    const offerId = href.match(/\/tradeoffer\/(\d+)\/$/)?.[1];
+    if (offerId) {
+      const asset = offerId === '880' ? '900' : '899';
+      return { ok: true, text: async () => detailsHtml({ owner, partner, offerId,
+        status: { me: { assets: [{ appid: 570, contextid: '2', assetid: asset, amount: '2' }] }, them: { assets: [] } } }) };
+    }
+    const url = new URL(href);
+    const cursor = url.searchParams.get('start_assetid');
+    inventoryPages.push(cursor);
+    return { ok: true, json: async () => ({ success: 1,
+      assets: [{ appid: 570, contextid: '2', assetid: cursor ? '900' : '899', classid: cursor ? '87001' : '87002', instanceid: '9', amount: '99' }],
+      descriptions: [], more_items: !cursor, last_assetid: cursor ? undefined : '899' }) };
+  };
+  const first = await Offers.fetchDetails('880', owner, fetchMock);
+  const later = await Offers.fetchDetails('881', owner, fetchMock);
+  assert.deepEqual(inventoryPages, [null, '899', null]);
+  assert.equal(first.give[0].assetId, '900');
+  assert.equal(later.give[0].assetId, '899');
+  assert.equal(later.give[0].classId, '87002');
+  assert.equal(later.give[0].amount, 2);
 });
 
 test('native offer currencies stay unpriced and cannot collide with asset IDs', () => {

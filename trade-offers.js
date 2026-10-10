@@ -5,6 +5,9 @@
   const NUMBER_ID = /^[1-9]\d{0,19}$/;
   const STEAM_ID_BASE = 76561197960265728n;
   const Gems = globalThis.SIHLiteGems || (typeof require === 'function' ? require('./gems.js') : null);
+  const Prices = globalThis.SIHLiteTradePrices || (typeof require === 'function' ? require('./trade-prices.js') : null);
+  const STEAM_GET_SPACING_MS = 300;
+  const MAX_CLASS_CACHE_ITEMS = 512;
 
   function steamId(value) {
     if (typeof value === 'number') return null;
@@ -74,6 +77,9 @@
     for (const field of ['hasGems', 'hasColoredGem']) {
       if (value[field] === true) item[field] = true;
     }
+    if (typeof value.variantFingerprint === 'string' && value.variantFingerprint.length <= 160) {
+      item.variantFingerprint = value.variantFingerprint;
+    }
     const currencyId = numericId(value.currencyId ?? value.currencyid);
     if (value.isCurrency === true || value.is_currency === true || currencyId) {
       item.isCurrency = true;
@@ -130,7 +136,8 @@
         const metadata = details.classItems.find(item => item.ownerSteamId === old.ownerSteamId && item.appId === old.appId && item.classId === old.classId && item.instanceId === old.instanceId);
         if (!metadata) continue;
         const item = normalizeItem({ ...old, market_hash_name: metadata.market_hash_name,
-          hasGems: old.hasGems || metadata.hasGems, hasColoredGem: old.hasColoredGem || metadata.hasColoredGem }, old.ownerSteamId);
+          hasGems: old.hasGems || metadata.hasGems, hasColoredGem: old.hasColoredGem || metadata.hasColoredGem,
+          variantFingerprint: metadata.variantFingerprint }, old.ownerSteamId);
         if (!item) continue;
         // Class hovers do not carry a context. Leave it unknown rather than
         // representing a verified Dota class as an explicit invalid context.
@@ -384,18 +391,37 @@
   }
 
   const classDescriptions = new Map();
-  const classRequestQueue = [];
-  let runningClassRequests = 0;
+  const steamRequestQueue = [];
+  let runningSteamRequest = false;
+  let nextSteamRequestAt = 0;
 
-  function scheduleClassRequest(operation) {
+  function aborted() {
+    const error = new Error('Steam request was cancelled.');
+    error.name = 'AbortError';
+    return error;
+  }
+
+  // Gate the whole response read, so several large inventories cannot be
+  // downloaded and decoded together when many offer cards appear at once.
+  function scheduleSteamRequest(operation, signal) {
     return new Promise((resolve, reject) => {
-      classRequestQueue.push({ operation, resolve, reject });
+      if (signal?.aborted) { reject(aborted()); return; }
+      steamRequestQueue.push({ operation, resolve, reject, signal });
       function pump() {
-        while (runningClassRequests < 3 && classRequestQueue.length) {
-          const task = classRequestQueue.shift();
-          runningClassRequests++;
-          Promise.resolve().then(task.operation).then(task.resolve, task.reject).finally(() => { runningClassRequests--; pump(); });
-        }
+        if (runningSteamRequest || !steamRequestQueue.length) return;
+        const task = steamRequestQueue.shift();
+        if (task.signal?.aborted) { task.reject(aborted()); pump(); return; }
+        runningSteamRequest = true;
+        const pause = Math.max(0, nextSteamRequestAt - Date.now());
+        const wait = pause ? new Promise(done => setTimeout(done, pause)) : Promise.resolve();
+        wait.then(() => {
+          if (task.signal?.aborted) throw aborted();
+          return task.operation();
+        }).then(task.resolve, task.reject).finally(() => {
+          runningSteamRequest = false;
+          nextSteamRequestAt = Date.now() + STEAM_GET_SPACING_MS;
+          pump();
+        });
       }
       pump();
     });
@@ -417,7 +443,7 @@
         const key = `${item.appId}:${item.classId}:${item.instanceId}`;
         let pending = classDescriptions.get(key);
         if (!pending) {
-          pending = scheduleClassRequest(async () => {
+          pending = scheduleSteamRequest(async () => {
             const controller = new AbortController();
             const timer = setTimeout(() => controller.abort(), 20000);
             try {
@@ -428,6 +454,7 @@
             } finally { clearTimeout(timer); }
           });
           classDescriptions.set(key, pending);
+          while (classDescriptions.size > MAX_CLASS_CACHE_ITEMS) classDescriptions.delete(classDescriptions.keys().next().value);
           pending.catch(() => { if (classDescriptions.get(key) === pending) classDescriptions.delete(key); });
         }
         try {
@@ -437,11 +464,12 @@
           // keeps ownership and asset IDs from its already verified native DOM.
           metadata.push({ ownerSteamId: item.ownerSteamId, appId: item.appId, classId: item.classId, instanceId: item.instanceId,
             market_hash_name: typeof description.market_hash_name === 'string' ? description.market_hash_name.slice(0, 512) : '',
-            hasGems: Boolean(gems?.hasGems), hasColoredGem: Boolean(gems?.hasColoredGem) });
+            hasGems: Boolean(gems?.hasGems), hasColoredGem: Boolean(gems?.hasColoredGem),
+            variantFingerprint: Prices?.variantFingerprint(description) || null });
         } catch (_) { failed = true; }
       }
     }
-    await Promise.all([worker(), worker(), worker()]);
+    await worker();
     const result = { offerId, meSteamId, partnerSteamId, classItems: metadata };
     if (failed) result.classError = 'Some item descriptions are unavailable. Only known item prices can be shown.';
     return result;
@@ -491,7 +519,12 @@
       for (const [key, description] of Object.entries(body.rgDescriptions || {})) descriptions.set(key, description);
     }
     const assets = modern ? (body.assets || []).map(asset => [String(asset.assetid), asset]) : Object.entries(body.rgInventory || {});
+    cache.scannedCount += assets.length;
+    if (cache.scannedCount > 100000) throw new Error('Steam inventory description limit exceeded.');
     for (const [key, asset] of assets) {
+      // A large partner inventory is scanned page by page, but only requested
+      // trade assets are retained. Unrelated descriptions are released here.
+      if (!cache.targets.has(key)) continue;
       if (!asset || !numericId(key) || String(asset.assetid ?? asset.id ?? key) !== key) continue;
       if (asset.appid != null && String(asset.appid) !== appId) continue;
       if (asset.contextid != null && String(asset.contextid) !== contextId) continue;
@@ -502,7 +535,7 @@
       if (gemInfo?.hasColoredGem) value.hasColoredGem = true;
       const item = normalizeItem(value, owner);
       if (item?.classId && item.instanceId != null) cache.items.set(key, item);
-      if (cache.items.size > 100000) throw new Error('Steam inventory description limit exceeded.');
+      if (cache.items.size > 10000) throw new Error('Too many trade item descriptions are requested.');
     }
     const more = Boolean(modern ? body.more_items : body.more);
     const cursor = more ? numericId(modern ? body.last_assetid : body.more_start) : null;
@@ -522,9 +555,23 @@
     for (const [key, wanted] of grouped) {
       const { appId, contextId } = wanted[0];
       let cache = classInventories.get(key);
-      if (!cache) { cache = { items: new Map(), complete: false, cursor: null, pages: 0, pending: null }; classInventories.set(key, cache); }
+      if (!cache) {
+        cache = { items: new Map(), targets: new Set(), scannedTargets: new Set(), scannedCount: 0, complete: false, cursor: null, pages: 0, pending: null };
+        classInventories.set(key, cache);
+        while (classInventories.size > 32) classInventories.delete(classInventories.keys().next().value);
+      }
       const missing = () => wanted.some(item => !cache.items.has(item.assetId));
       if (cache.pending) await cache.pending;
+      // Later offers may refer to an asset on an earlier discarded page. Start
+      // a fresh paced scan for new targets rather than declaring them absent.
+      const newTargets = wanted.filter(item => !cache.scannedTargets.has(item.assetId));
+      if (newTargets.some(item => !cache.items.has(item.assetId)) && cache.pages) {
+        cache.complete = false;
+        cache.cursor = null;
+        cache.pages = 0;
+        cache.scannedCount = 0;
+      }
+      for (const item of wanted) { cache.targets.add(item.assetId); cache.scannedTargets.add(item.assetId); }
       if (missing() && !cache.complete) {
         const endpoint = inventoryEndpoint(html, details, owner, appId, contextId);
         cache.pending = (async () => {
@@ -532,9 +579,11 @@
             if (++cache.pages > 100) throw new Error('Steam inventory description page limit exceeded.');
             const url = new URL(endpoint.url);
             if (cache.cursor) url.searchParams.set(endpoint.modern ? 'start_assetid' : 'start', cache.cursor);
-            const response = await fetchImpl(url.href, { credentials: 'include', signal });
-            if (!response.ok) throw new Error(`Steam inventory descriptions returned HTTP ${response.status}.`);
-            mergeInventoryPage(cache, await response.json(), owner, appId, contextId, endpoint.modern);
+            await scheduleSteamRequest(async () => {
+              const response = await fetchImpl(url.href, { credentials: 'include', signal });
+              if (!response.ok) throw new Error(`Steam inventory descriptions returned HTTP ${response.status}.`);
+              mergeInventoryPage(cache, await response.json(), owner, appId, contextId, endpoint.modern);
+            }, signal);
           }
         })();
         try { await cache.pending; } finally { cache.pending = null; }
@@ -596,16 +645,18 @@
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 120000);
     try {
-      const response = await fetchImpl(`https://steamcommunity.com/tradeoffer/${offerId}/`, { credentials: 'include', signal: controller.signal });
-      if (!response.ok) throw new Error(`Steam returned HTTP ${response.status} for this trade offer.`);
-      const html = await response.text();
-      const details = parseDetails(html, String(offerId), String(meSteamId), response.url || null);
-      const descriptions = await Promise.allSettled([
-        describeAssets(html, details, details.give, details.meSteamId, fetchImpl, controller.signal),
-        describeAssets(html, details, details.receive, details.partnerSteamId, fetchImpl, controller.signal)
-      ]);
-      const failures = descriptions.filter(result => result.status === 'rejected');
-      if (failures.length) details.classError = 'Some item prices are unavailable because Steam could not load their descriptions.';
+      const page = await scheduleSteamRequest(async () => {
+        const response = await fetchImpl(`https://steamcommunity.com/tradeoffer/${offerId}/`, { credentials: 'include', signal: controller.signal });
+        if (!response.ok) throw new Error(`Steam returned HTTP ${response.status} for this trade offer.`);
+        return { html: await response.text(), url: response.url || null };
+      }, controller.signal);
+      const details = parseDetails(page.html, String(offerId), String(meSteamId), page.url);
+      let failed = false;
+      for (const [assets, owner] of [[details.give, details.meSteamId], [details.receive, details.partnerSteamId]]) {
+        try { await describeAssets(page.html, details, assets, owner, fetchImpl, controller.signal); }
+        catch (_) { failed = true; }
+      }
+      if (failed) details.classError = 'Some item prices are unavailable because Steam could not load their descriptions.';
       return details;
     } catch (error) {
       if (error.name === 'AbortError') throw new Error('Loading trade offer details timed out.');

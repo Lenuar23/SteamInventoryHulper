@@ -1,22 +1,74 @@
 const STEAMPRICE_ROOT = 'https://steamprice.com';
 const REQUEST_TIMEOUT_MS = 15000;
-const OPERATION_TIMEOUT_MS = 120000;
+const OPERATION_TIMEOUT_MS = 180000;
 const PRICE_PAGE_SIZE = 200;
 const MAX_PRICE_PAGES = 1000;
 const FRESH_CACHE_MS = 90000;
 const STALE_CACHE_MS = 24 * 60 * 60 * 1000;
 const CACHE_STORAGE_KEY = 'sih-lite-steamprice-cache-v1';
 const MAX_CACHE_OWNERS = 6;
-const MAX_GETS = 2;
+const MAX_GETS = 1;
+const GET_START_INTERVAL_MS = 350;
 const pendingRequests = new Map();
 const pendingNetwork = new Map();
 const cache = new Map();
 let cacheReady;
 let storageWrites = Promise.resolve();
+let cacheWritePending = false;
+let cacheWriteRunning = false;
 let profileEpoch = 0;
 let activeGets = 0;
+let nextGetAt = 0;
+let getQueueTimer = null;
 const getQueue = [];
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+const PRICE_RECORD_FIELDS = [
+    'assetid', 'assetId', 'asset_id', 'id', 'ownerSteamId', 'appId', 'appid', 'contextId', 'contextid', 'context_id',
+    'classid', 'classId', 'instanceid', 'instanceId', 'quantity', 'amount',
+    'marketHashName', 'market_hash_name', 'hash_name', 'name', 'marketName', 'market_name', 'title', 'item_name',
+    'collectorAvgSaleCents', 'collectorLowestAskCents', 'priceCents', 'price_cents', 'scmPriceCents', 'basePriceCents',
+    'price', 'lowest_price', 'cost', 'value',
+    'itemType', 'type', 'quality', 'assetQuality', 'hasGems', 'hasColoredGem', 'gems',
+    'prismaticGems', 'etherealGems', 'kineticGems', 'unusualEffectGems', 'isLegacy', 'legacyRgb', 'emptySockets',
+    'allStylesUnlocked', 'styleTotal', 'styleUnlocked', 'gem', 'paintSeed', 'wearRating', 'stickers', 'infuser',
+    'roshanCycle', 'expirationDate', 'greevil', 'spectatorGames', 'unusualQuality', 'mayBeGiftedOnce', 'favored',
+    'isBuggedEthereal', 'isOtherBug', 'isGolden', 'isCrimson', 'emptyEthereal', 'emptyPrismatic',
+    'isUnusualCourier', 'hasAllStyleCourier', 'hasUnusualEffect', 'collectorSetPiece', 'isCollectorBundle',
+    'canGiftCollectorBundle', 'unpackGiftCollectorBundle', 'gift', 'tradable', 'marketable', 'pbrCycled'
+];
+
+function compactPriceRecord(item) {
+    // Images, translated notices and price breakdowns are unnecessary for prices
+    // and can multiply a large inventory's runtime messages and cache size.
+    const result = {};
+    for (const field of PRICE_RECORD_FIELDS) {
+        if (Object.prototype.hasOwnProperty.call(item, field)) result[field] = item[field];
+    }
+    for (const field of ['rawTags', 'tags']) {
+        if (!Array.isArray(item[field])) continue;
+        result[field] = item[field].filter(tag => tag && typeof tag === 'object' &&
+            (/^(?:quality|type)$/i.test(String(tag.category || '')) ||
+                String(tag.internal_name || '').toLowerCase() === 'socket_gem'))
+            .map(tag => {
+                const entry = {};
+                for (const key of ['category', 'internal_name']) {
+                    if (Object.prototype.hasOwnProperty.call(tag, key)) entry[key] = tag[key];
+                }
+                if (/^type$/i.test(String(tag.category || '')) &&
+                    Object.prototype.hasOwnProperty.call(tag, 'localized_tag_name')) {
+                    entry.localized_tag_name = tag.localized_tag_name;
+                }
+                return entry;
+            });
+    }
+    if (item.legacyPricing && typeof item.legacyPricing === 'object' && !Array.isArray(item.legacyPricing)) {
+        result.legacyPricing = {};
+        for (const field of ['isDupe', 'dupeCount']) {
+            if (Object.prototype.hasOwnProperty.call(item.legacyPricing, field)) result.legacyPricing[field] = item.legacyPricing[field];
+        }
+    } else if (Object.prototype.hasOwnProperty.call(item, 'legacyPricing')) result.legacyPricing = item.legacyPricing;
+    return result;
+}
 
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     if (!request || !['fetchPrices', 'fetchProfile'].includes(request.action)) return;
@@ -24,10 +76,11 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     try { steamId = validateSteamId(request.steamId); }
     catch (error) { sendResponse({ success: false, error: error.message }); return; }
     const force = request.force === true;
-    const key = `${request.action}:${steamId}:${force}:${request.action === 'fetchProfile' ? profileEpoch : ''}`;
+    const allowScan = request.action !== 'fetchPrices' || request.scan !== false;
+    const key = `${request.action}:${steamId}:${force}:${request.action === 'fetchProfile' ? profileEpoch : allowScan}`;
     let operation = pendingRequests.get(key);
     if (!operation) {
-        operation = loadWithCache(request.action, steamId, force)
+        operation = loadWithCache(request.action, steamId, force, allowScan)
             .finally(() => pendingRequests.delete(key));
         pendingRequests.set(key, operation);
     }
@@ -49,33 +102,46 @@ function temporaryError(message, retryAfter = null) {
     return error;
 }
 
+function drainGetQueue() {
+    if (activeGets >= MAX_GETS || getQueueTimer !== null) return;
+    while (getQueue.length && Date.now() >= getQueue[0].deadline) {
+        const expired = getQueue.shift();
+        clearTimeout(expired.timer);
+        expired.reject(temporaryError('Steamprice inventory loading timed out.'));
+    }
+    if (!getQueue.length) return;
+    const wait = Math.max(0, nextGetAt - Date.now());
+    if (wait > 0) {
+        getQueueTimer = setTimeout(() => {
+            getQueueTimer = null;
+            drainGetQueue();
+        }, wait);
+        return;
+    }
+    const entry = getQueue.shift();
+    clearTimeout(entry.timer);
+    activeGets++;
+    nextGetAt = Date.now() + GET_START_INTERVAL_MS;
+    let released = false;
+    entry.resolve(() => {
+        if (released) return;
+        released = true;
+        activeGets--;
+        drainGetQueue();
+    });
+}
+
 function acquireGet(deadline) {
     return new Promise((resolve, reject) => {
-        const entry = { start: null, timer: null };
-        entry.start = () => {
-            clearTimeout(entry.timer);
-            if (Date.now() >= deadline) {
-                reject(temporaryError('Steamprice inventory loading timed out.'));
-                return;
-            }
-            activeGets++;
-            let released = false;
-            resolve(() => {
-                if (released) return;
-                released = true;
-                activeGets--;
-                while (activeGets < MAX_GETS && getQueue.length) getQueue.shift().start();
-            });
-        };
-        if (activeGets < MAX_GETS) entry.start();
-        else {
-            getQueue.push(entry);
-            entry.timer = setTimeout(() => {
-                const index = getQueue.indexOf(entry);
-                if (index !== -1) getQueue.splice(index, 1);
-                reject(temporaryError('Steamprice inventory loading timed out.'));
-            }, Math.max(0, deadline - Date.now()));
-        }
+        const entry = { deadline, resolve, reject, timer: null };
+        getQueue.push(entry);
+        entry.timer = setTimeout(() => {
+            const index = getQueue.indexOf(entry);
+            if (index !== -1) getQueue.splice(index, 1);
+            reject(temporaryError('Steamprice inventory loading timed out.'));
+            drainGetQueue();
+        }, Math.max(0, deadline - Date.now()));
+        drainGetQueue();
     });
 }
 
@@ -104,7 +170,11 @@ async function fetchJson(url, deadline) {
                 const response = await fetch(url, { signal: controller.signal });
                 if (!response.ok) {
                     const message = `Steamprice returned HTTP ${response.status}.`;
-                    if ([429, 502, 503, 504].includes(response.status)) throw temporaryError(message, retryAfterMs(response));
+                    if ([429, 502, 503, 504].includes(response.status)) {
+                        const retryAfter = retryAfterMs(response);
+                        if (retryAfter !== null) nextGetAt = Math.max(nextGetAt, Date.now() + retryAfter);
+                        throw temporaryError(message, retryAfter);
+                    }
                     throw new Error(message);
                 }
                 const data = await response.json();
@@ -145,11 +215,12 @@ async function fetchProfile(steamId, deadline) {
     return normalizeProfile(await fetchJson(`${STEAMPRICE_ROOT}/api/dota2/profile/${steamId}`, deadline));
 }
 
-async function handleFetchPrices(steamId, deadline) {
+async function handleFetchPrices(steamId, deadline, allowScan) {
     let items = await fetchAllPrices(steamId, deadline);
     let scanned = false;
     // Only a complete, valid empty response can mean an inventory is not cached.
     if (items.length === 0) {
+        if (!allowScan) return { data: { items }, needsScan: true };
         scanned = true;
         invalidateProfile(steamId);
         try { await triggerScanViaTab(steamId); await delay(5000); }
@@ -226,31 +297,32 @@ async function fetchAllPrices(steamId, deadline) {
             if (seenAssets.has(key)) throw new Error('Steamprice returned duplicate inventory pages. Please try again.');
             seenAssets.add(key);
         }
-        allItems.push(...data.items);
+        allItems.push(...data.items.map(compactPriceRecord));
         if (pages !== undefined ? page >= pages : data.items.length < pageSize) return allItems;
     }
     throw new Error(`Steamprice inventory did not finish within ${MAX_PRICE_PAGES} price pages.`);
 }
 
-async function loadWithCache(action, steamId, force) {
+async function loadWithCache(action, steamId, force, allowScan = true) {
     await ensureCache();
     pruneCache();
     const key = `${action}:${steamId}`;
     const previous = cache.get(key);
     if (!force && previous && !previous.invalidated && Date.now() - previous.cachedAt < FRESH_CACHE_MS) {
         previous.usedAt = Date.now();
-        return { success: true, data: previous.data, cached: true, cachedAt: previous.cachedAt };
+        return { success: true, data: previous.data, cached: true, cachedAt: previous.cachedAt,
+            ...(!allowScan && action === 'fetchPrices' && previous.data.items.length === 0 ? { needsScan: true } : {}) };
     }
     const epoch = profileEpoch;
-    const networkKey = `${key}:${action === 'fetchProfile' ? epoch : ''}`;
+    const networkKey = `${key}:${action === 'fetchProfile' ? epoch : allowScan}`;
     let operation = pendingNetwork.get(networkKey);
     if (!operation) {
         operation = (async () => {
             const deadline = Date.now() + OPERATION_TIMEOUT_MS;
             const result = action === 'fetchPrices'
-                ? await handleFetchPrices(steamId, deadline)
+                ? await handleFetchPrices(steamId, deadline, allowScan)
                 : { data: await fetchProfile(steamId, deadline) };
-            if (action !== 'fetchProfile' || epoch === profileEpoch) {
+            if (!result.needsScan && (action !== 'fetchProfile' || epoch === profileEpoch)) {
                 cache.set(key, { action, steamId, cachedAt: Date.now(), usedAt: Date.now(), data: result.data });
                 pruneCache();
                 persistCache();
@@ -264,7 +336,8 @@ async function loadWithCache(action, steamId, force) {
         // A previous complete snapshot is useful only for a temporary service outage.
         const fallback = cache.get(key);
         if (error?.temporary && fallback && Date.now() - fallback.cachedAt <= STALE_CACHE_MS) {
-            return { success: true, data: fallback.data, cached: true, cachedAt: fallback.cachedAt, error: error.message };
+            return { success: true, data: fallback.data, cached: true, cachedAt: fallback.cachedAt, error: error.message,
+                ...(!allowScan && action === 'fetchPrices' && fallback.data.items.length === 0 ? { needsScan: true } : {}) };
         }
         throw error;
     }
@@ -326,6 +399,7 @@ function ensureCache() {
             const now = Date.now();
             for (const [key, entry] of Object.entries(entries || {})) if (validCacheEntry(key, entry, now)) {
                 if (entry.action === 'fetchProfile') entry.data = normalizeProfile(entry.data);
+                else entry.data = { items: entry.data.items.map(compactPriceRecord) };
                 cache.set(key, entry);
             }
             pruneCache();
@@ -335,19 +409,29 @@ function ensureCache() {
 }
 
 function persistCache() {
-    // Serialize writes to our one bucket; storage/quota failures never affect replies.
+    // Coalesce updates while a snapshot is being compressed/written rather than
+    // queueing a full serialization for every profile and inventory response.
+    cacheWritePending = true;
+    if (cacheWriteRunning) return;
+    cacheWriteRunning = true;
     storageWrites = storageWrites.then(async () => {
-        pruneCache();
-        let bucket = { version: 1, entries: Object.fromEntries(cache) };
-        try {
-            const json = JSON.stringify(bucket);
-            if (json.length > 16384 && typeof CompressionStream === 'function') {
-                const compressed = new Uint8Array(await new Response(new Blob([json]).stream().pipeThrough(new CompressionStream('gzip'))).arrayBuffer());
-                let binary = '';
-                for (let index = 0; index < compressed.length; index += 8192) binary += String.fromCharCode(...compressed.subarray(index, index + 8192));
-                bucket = { version: 1, encoding: 'gzip', data: btoa(binary) };
-            }
-            await storageCall('set', { [CACHE_STORAGE_KEY]: bucket });
-        } catch { /* Keep the complete successful snapshot in memory. */ }
-    }).catch(() => {});
+        while (cacheWritePending) {
+            cacheWritePending = false;
+            pruneCache();
+            let bucket = { version: 1, entries: Object.fromEntries(cache) };
+            try {
+                const json = JSON.stringify(bucket);
+                if (json.length > 16384 && typeof CompressionStream === 'function') {
+                    const compressed = new Uint8Array(await new Response(new Blob([json]).stream().pipeThrough(new CompressionStream('gzip'))).arrayBuffer());
+                    let binary = '';
+                    for (let index = 0; index < compressed.length; index += 8192) binary += String.fromCharCode(...compressed.subarray(index, index + 8192));
+                    bucket = { version: 1, encoding: 'gzip', data: btoa(binary) };
+                }
+                await storageCall('set', { [CACHE_STORAGE_KEY]: bucket });
+            } catch { /* Keep the complete successful snapshot in memory. */ }
+        }
+    }).catch(() => {}).finally(() => {
+        cacheWriteRunning = false;
+        if (cacheWritePending) persistCache();
+    });
 }

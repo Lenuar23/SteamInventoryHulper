@@ -174,8 +174,11 @@ const HTML = `<!doctype html><html><head><style>
     assert.equal(initial.active.supported, true);
     assert.deepEqual(initial.offers, { me: [], them: [] }, 'Prototype array methods are not offered records');
     assert.deepEqual(initial.offersComplete, { me: true, them: true });
-    assert.equal(initial.inventories.find(inventory => inventory.side === 'me').items.length, 40);
-    assert.equal(initial.inventories.find(inventory => inventory.side === 'them').items.length, 37);
+    assert.equal(initial.inventories.length, 1, 'Metadata contains only the active native page');
+    assert.equal(initial.inventories[0].side, 'me');
+    assert.equal(initial.inventories[0].scope, 'visible');
+    assert.equal(initial.inventories[0].loadedCount, 40);
+    assert.equal(initial.inventories[0].items.length, 16);
     const firstSort = await sort('me', 'desc', 'me-desc');
     assert.equal(firstSort.success, true, firstSort.error);
     assert.deepEqual(await ids('me'), Array.from({ length: 40 }, (_, i) => String(1039 - i)));
@@ -317,7 +320,8 @@ const HTML = `<!doctype html><html><head><style>
     assert.equal(await page.evaluate(() => fixtureInventories.them === fixturePendingInventory), false);
     const fullyLoaded = await editor();
     assert.equal(fullyLoaded.active.loading, false);
-    assert.equal(fullyLoaded.inventories.find(inventory => inventory.side === 'them').items.length, 35);
+    assert.equal(fullyLoaded.inventories.find(inventory => inventory.side === 'them').loadedCount, 35);
+    assert.equal(fullyLoaded.inventories.find(inventory => inventory.side === 'them').items.length, 16);
     assert.equal((await sort('them', 'desc', 'fully-loaded-desc')).success, true);
     assert.deepEqual(await ids('them'), Array.from({ length: 35 }, (_, i) => String(3034 - i)));
 
@@ -334,9 +338,14 @@ const HTML = `<!doctype html><html><head><style>
     assert.equal(await page.evaluate(() => fixtureMessages.find(message => message.type === 'SORT_RESULT' && message.requestId === 'safe-gem-sort').success), true);
     const gemSnapshot = (await editor()).inventories.find(inventory => inventory.side === 'them');
     assert.equal(gemSnapshot.items.find(item => item.assetId === '3000').hasGems, true);
-    assert.equal(gemSnapshot.items.find(item => item.assetId === '3001').hasGems, true);
+    assert.equal(gemSnapshot.items.some(item => item.assetId === '3001'), false, 'Hidden pages are not cloned into every editor update');
     assert.equal((await ids('them'))[0], '3000');
     assert.equal((await ids('them')).at(-1), '3001', 'Unpriced gem remains last despite a shared name price');
+    await page.evaluate(() => fixtureInventories.them.SetActivePage(fixtureInventories.them.pageTotal - 1));
+    assert.equal((await editor()).inventories[0].items.find(item => item.assetId === '3001').hasGems, true);
+    assert.equal(await page.locator('.item[data-sih-trade-asset="3000"][data-sih-trade-visible="true"]').count(), 0);
+    await page.evaluate(() => fixtureInventories.them.SetActivePage(0));
+    await editor();
 
     // Run the actual isolated content UI against MAIN's real legacy objects.
     // Runtime replies are offline, owner-specific prices/profile fixtures.
@@ -375,7 +384,8 @@ const HTML = `<!doctype html><html><head><style>
     await page.locator('#sih-lite-trade-inventory-panel [data-role="inventory-them"]').filter({ hasText: '$543.21' }).waitFor();
     assert.equal(await page.evaluate(() => document.getElementById('sih-lite-trade-inventory-panel').parentNode.id), 'inventory_box');
     const runtimeRequests = await isolated('fixtureRuntimeRequests');
-    assert.deepEqual(runtimeRequests.filter(request => request.action === 'fetchPrices').map(request => request.steamId).sort(), [ME, THEM]);
+    assert.deepEqual(runtimeRequests.filter(request => request.action === 'fetchPrices').map(request => request.steamId), [THEM],
+      'Only the selected partner inventory downloads prices until the user selects their own inventory');
     for (const owner of [ME, THEM]) assert.ok(runtimeRequests.some(request => request.action === 'fetchProfile' && request.steamId === owner));
     assert.ok(runtimeRequests.every(request => ['fetchPrices', 'fetchProfile'].includes(request.action)), 'Editor smoke performs only pricing/profile reads');
     assert.equal(await page.locator('.item[data-sih-trade-asset="3000"] .sih-lite-trade-price').textContent(), '$30.00');
@@ -393,6 +403,9 @@ const HTML = `<!doctype html><html><head><style>
     assert.equal(await page.locator('#their_slots .item').count(), 0);
     await page.evaluate(() => TradePageSelectInventory(UserYou, 570, '2'));
     await page.locator('#sih-lite-trade-inventory-panel [data-role="active-inventory"]').filter({ hasText: 'Sort your inventory:' }).waitFor();
+    await page.locator('#sih-lite-trade-inventory-panel [data-trade-order="desc"]:enabled').waitFor();
+    assert.deepEqual((await isolated('fixtureRuntimeRequests')).filter(request => request.action === 'fetchPrices')
+      .map(request => request.steamId).sort(), [ME, THEM], 'Switching owners loads only the newly selected inventory prices');
     await page.locator('#sih-lite-trade-inventory-panel [data-trade-order="desc"]').click();
     await page.locator('#sih-lite-trade-inventory-panel [data-role="inventory-status"]').filter({ hasText: 'Sorted 40 items.' }).waitFor();
     assert.deepEqual(await ids('me'), Array.from({ length: 40 }, (_, i) => String(1039 - i)));

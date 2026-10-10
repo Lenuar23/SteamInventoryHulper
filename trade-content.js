@@ -14,6 +14,11 @@
     const acceptStates = new Map();
     const requestQueue = [];
     let runningRequests = 0, renderQueued = false, editor = null, list = null;
+    let lastRenderAt = 0, badgeEpoch = 0;
+    const badgeNodes = new Set();
+    const observedOffers = new WeakSet();
+    const offerObserver = typeof IntersectionObserver === 'function'
+        ? new IntersectionObserver(() => queueRender(), { rootMargin: '200px' }) : null;
     let sortPending = null, sortStatus = '', requestNumber = 0;
     const validOwner = id => typeof id === 'string' && /^\d{17}$/.test(id);
     const money = cents => '$' + (cents / 100).toFixed(2);
@@ -31,6 +36,8 @@
     }
 
     function pumpRequests() {
+        // Network GETs are serialized in their helpers. A spare pending slot
+        // lets a newly selected owner load while old responses are still pending.
         while (runningRequests < 3 && requestQueue.length) {
             const entry = requestQueue.shift();
             runningRequests++;
@@ -43,9 +50,9 @@
 
     function request(action, steamId, force = false) {
         return queueOperation(() => new Promise((resolve, reject) => {
-            const timer = setTimeout(() => reject(new Error('Steamprice request timed out. Please retry.')), 180000);
+            const timer = setTimeout(() => reject(new Error('Steamprice request timed out. Please retry.')), 240000);
             try {
-                chrome.runtime.sendMessage({ action, steamId, force }, response => {
+                chrome.runtime.sendMessage({ action, steamId, force, scan: false }, response => {
                     clearTimeout(timer);
                     if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
                     else if (!response?.success) reject(new Error(response?.error || 'Steamprice data is unavailable.'));
@@ -53,6 +60,7 @@
                         cached: response.cached === true,
                         cachedAt: Number.isSafeInteger(response.cachedAt) ? response.cachedAt : Date.now(),
                         scanned: response.scanned === true,
+                        needsScan: response.needsScan === true,
                         error: response.cached === true && typeof response.error === 'string' ? response.error : ''
                     } });
                 });
@@ -63,16 +71,16 @@
         }));
     }
 
-    function ownerData(id, profile = false) {
+    function ownerData(id, profile = false, prices = true) {
         if (!validOwner(id)) return null;
         let data = owners.get(id);
         if (!data) {
             data = { id, index: Prices.buildIndex([], id), priceState: 'idle', priceError: '',
                 profileState: 'idle', profileError: '', totalCents: null, priceEpoch: 0, profileEpoch: 0,
-                pricesLoaded: false, priceCache: null, profileCache: null };
+                pricesLoaded: false, priceCache: null, profileCache: null, needsScan: false };
             owners.set(id, data);
         }
-        if (data.priceState === 'idle') void loadPrices(data);
+        if (prices && data.priceState === 'idle') void loadPrices(data);
         if (profile && data.profileState === 'idle') void loadProfile(data);
         return data;
     }
@@ -86,9 +94,12 @@
             const response = await request('fetchPrices', data.id, force);
             if (epoch !== data.priceEpoch) return;
             if (!Array.isArray(response?.items)) throw new Error('Steamprice returned invalid price items.');
-            data.index = Prices.buildIndex(response.items, data.id);
+            const index = await buildIndexGradually(response.items, data, epoch);
+            if (!index || epoch !== data.priceEpoch) return;
+            data.index = index;
             data.pricesLoaded = true;
             data.priceCache = response.cacheInfo;
+            data.needsScan = data.priceCache.needsScan;
             data.priceError = data.priceCache.error;
             data.priceState = 'ready';
             queueRender();
@@ -105,6 +116,25 @@
             if (data.pricesLoaded) data.priceCache = { ...data.priceCache, cached: true, error: error.message };
         }
         queueRender();
+    }
+
+    async function buildIndexGradually(items, data, epoch) {
+        if (items.length > 100000) throw new Error('Steamprice inventory exceeds the supported 100000 price items.');
+        const index = Prices.buildIndex([], data.id);
+        for (let start = 0; start < items.length; start += 300) {
+            if (epoch !== data.priceEpoch) return null;
+            const part = Prices.buildIndex(items.slice(start, start + 300), data.id);
+            for (const [name, map] of Object.entries(part)) {
+                if (!(map instanceof Map)) continue;
+                if (!(index[name] instanceof Map)) index[name] = new Map();
+                for (const [key, value] of map) {
+                    if (!index[name].has(key)) index[name].set(key, value);
+                    else if (index[name].get(key) !== value) index[name].set(key, null);
+                }
+            }
+            if (start + 300 < items.length) await new Promise(resolve => setTimeout(resolve, 0));
+        }
+        return index;
     }
 
     function loadProfile(data, force = false) {
@@ -230,12 +260,15 @@
         const unpriced = a.unpricedCount + b.unpricedCount;
         if (unpriced) status.push('Partial valuation: ' + unpriced + ' item' + (unpriced === 1 ? '' : 's') + ' unpriced.');
         if (a.nonDotaCount + b.nonDotaCount) status.push('Only Dota 2 items are priced.');
+        const estimated = (a.estimatedCount || 0) + (b.estimatedCount || 0);
+        if (estimated) status.push('Includes ' + estimated + ' current gem variant estimate' + (estimated === 1 ? '.' : 's.'));
         for (const id of new Set([me, them])) {
             const data = owners.get(id);
             if (data?.priceState === 'loading') status.push('Loading ' + (id === me ? 'your' : 'partner') + ' prices…');
             else if (data?.priceError) status.push((id === me ? 'Your prices: ' : 'Partner prices: ') + data.priceError);
             const cached = cacheNotice(data?.priceCache, 'Cached prices (' + (id === me ? 'your' : 'partner') + ')');
             if (cached) status.push(cached);
+            if (data?.needsScan) status.push((id === me ? 'Your' : 'Partner') + ' inventory has no saved Steamprice prices. Open it on Steamprice, then retry.');
         }
         if (extraStatus) status.push(extraStatus);
         text(role(element, 'status'), status.join(' '));
@@ -256,9 +289,13 @@
         }
         // Native Steam item blocks are normally already positioned. A style
         // fallback also supports the smaller offer-list cards.
-        if (getComputedStyle(element).position === 'static') element.style.position = 'relative';
+        if (!element.dataset.sihTradePositioned) {
+            if (getComputedStyle(element).position === 'static') element.style.position = 'relative';
+            element.dataset.sihTradePositioned = 'true';
+        }
         text(badge, money(value.knownCents));
         badge.title = 'Steamprice: ' + money(price.cents) + ' each, quantity ' + String(item.amount ?? 1) + '.' +
+            (price.source === 'variant' ? ' Current estimate for the matching gem variant; exact asset details are unavailable.' : '') +
             (owners.get(item.ownerSteamId)?.priceCache?.cached
                 ? ' ' + cacheNotice(owners.get(item.ownerSteamId).priceCache, 'Cached prices') : '');
     }
@@ -288,6 +325,7 @@
         const status = document.createElement('span');
         status.dataset.role = 'inventory-status';
         panel.appendChild(status);
+        const scans = document.createElement('span'); scans.dataset.role = 'scan-links'; panel.appendChild(scans);
         const inventory = document.getElementById('inventories');
         if (inventory?.parentElement === inventoryBox) inventoryBox.insertBefore(panel, inventory);
         else inventoryBox.appendChild(panel);
@@ -297,10 +335,11 @@
     function renderEditor() {
         if (!editor) return;
         const me = editor.owners?.me?.steamId, them = editor.owners?.them?.steamId;
-        ownerData(me, true);
-        ownerData(them, true);
         const give = normalizeItems(editor.offers?.me, me);
         const receive = normalizeItems(editor.offers?.them, them);
+        const activeOwner = editor.active?.supported ? editor.active.ownerSteamId : null;
+        ownerData(me, true, activeOwner === me || give.some(item => String(item.appId) === '570'));
+        ownerData(them, true, activeOwner === them || receive.some(item => String(item.appId) === '570'));
         let summary = document.getElementById('sih-lite-trade-editor-summary');
         const target = document.getElementById('trade_box') || document.getElementById('trade_area');
         if (!summary && target) {
@@ -322,6 +361,7 @@
                 const cachedProfile = cacheNotice(data?.profileCache, 'Cached inventory value (' + (side === 'me' ? 'your' : 'partner') + ')');
                 if (cachedPrices) errors.push(cachedPrices);
                 if (cachedProfile) errors.push(cachedProfile);
+                if (data?.needsScan) errors.push(label + ' has no saved Steamprice prices. Open it on Steamprice, then retry.');
             }
             const active = editor.active || {};
             const data = owners.get(active.ownerSteamId);
@@ -337,6 +377,7 @@
             document.getElementById('sih-lite-trade-retry').disabled = [me, them].some(id =>
                 owners.get(id)?.priceState === 'loading' || owners.get(id)?.profileState === 'loading');
             text(role(panel, 'inventory-status'), [sortStatus, ...errors].filter(Boolean).join(' '));
+            renderScanLinks(role(panel, 'scan-links'), me, them);
         }
         const records = new Map();
         for (const inventory of editor.inventories || []) {
@@ -347,13 +388,49 @@
         const offered = new Map([...give, ...receive].map(item => [
             item.ownerSteamId + ':' + item.appId + ':' + item.contextId + ':' + item.assetId, item
         ]));
-        for (const element of document.querySelectorAll('[data-sih-trade-owner][data-sih-trade-asset]')) {
+        const badges = [];
+        const selectors = '[data-sih-trade-visible="true"], #your_slots .item[data-sih-trade-owner], #their_slots .item[data-sih-trade-owner]';
+        for (const element of document.querySelectorAll(selectors)) {
             const key = element.dataset.sihTradeOwner + ':' + element.dataset.sihTradeApp + ':' +
                 element.dataset.sihTradeContext + ':' + element.dataset.sihTradeAsset;
             const item = element.closest('#your_slots, #their_slots') ? offered.get(key) : records.get(key);
-            if (item) renderBadge(element, item);
-            else element.querySelector('.sih-lite-trade-price')?.remove();
+            if (item) badges.push([element, item]);
         }
+        renderBadgesGradually(badges);
+    }
+
+    function renderBadgesGradually(entries) {
+        const epoch = ++badgeEpoch;
+        const current = new Set(entries.map(([element]) => element));
+        for (const element of badgeNodes) if (!current.has(element)) {
+            element.querySelector('.sih-lite-trade-price')?.remove(); badgeNodes.delete(element);
+        }
+        let offset = 0;
+        function batch() {
+            if (epoch !== badgeEpoch) return;
+            const limit = Math.min(entries.length, offset + 24);
+            while (offset < limit) {
+                const [element, item] = entries[offset++];
+                if (element.isConnected) { renderBadge(element, item); badgeNodes.add(element); }
+            }
+            if (offset < entries.length) setTimeout(batch, 16);
+        }
+        batch();
+    }
+
+    function renderScanLinks(container, me, them) {
+        if (!container) return;
+        for (const [id, label] of [[me, 'Open your inventory on Steamprice'], [them, 'Open partner inventory on Steamprice']]) {
+            let link = container.querySelector('[data-scan-owner="' + id + '"]');
+            if (!owners.get(id)?.needsScan || !validOwner(id)) { link?.remove(); continue; }
+            if (!link) {
+                link = document.createElement('a'); link.dataset.scanOwner = id;
+                link.className = 'sih-lite-trade-button'; link.target = '_blank'; link.rel = 'noopener noreferrer';
+                link.href = 'https://steamprice.com/dota2/inventory/' + id; link.textContent = label;
+                container.appendChild(link);
+            }
+        }
+        for (const link of container.querySelectorAll('[data-scan-owner]')) if (![me, them].includes(link.dataset.scanOwner)) link.remove();
     }
 
     function sortInventory(order) {
@@ -383,7 +460,7 @@
             sortStatus = 'Steam did not finish loading the inventory. Try again.';
             post('STATE_REQUEST');
             queueRender();
-        }, 125000);
+        }, 180000);
         sortPending = { requestId, timer, ownerSteamId: active.ownerSteamId };
         sortStatus = 'Loading all inventory items…';
         post('SORT', { requestId, ownerSteamId: active.ownerSteamId, side: active.side,
@@ -408,7 +485,8 @@
         const entry = { state: 'loading', error: '', data: details.get(offer.offerId)?.data || null };
         details.set(offer.offerId, entry);
         const meSteamId = list.meSteamId;
-        queueOperation(() => Offers.fetchDetails(offer.offerId, meSteamId)).then(data => {
+        queueOperation(() => offer.active ? Offers.fetchDetails(offer.offerId, meSteamId)
+            : Offers.fetchClassDescriptions(offer, meSteamId)).then(data => {
             if (details.get(offer.offerId) !== entry) return;
             if (!data || String(data.partnerSteamId) !== offer.partnerSteamId) {
                 throw new Error('Steam returned a different trade partner. Refresh the offers page.');
@@ -437,9 +515,13 @@
     function renderList() {
         if (!list) return;
         const seen = new Set();
+        const badges = [];
         for (const offer of readOffers()) {
             if (!offer.element?.isConnected) continue;
             seen.add(offer.offerId);
+            if (offerObserver && !observedOffers.has(offer.element)) { observedOffers.add(offer.element); offerObserver.observe(offer.element); }
+            const rect = offer.element.getBoundingClientRect();
+            if (rect.bottom < -200 || rect.top > innerHeight + 200) continue;
             const me = list.meSteamId, them = offer.partnerSteamId;
             const give = normalizeItems(offer.give, me), receive = normalizeItems(offer.receive, them);
             if (give.some(item => String(item.appId ?? item.appid) === '570')) ownerData(me);
@@ -456,23 +538,27 @@
                 });
                 retry.classList.add('sih-lite-trade-retry');
                 summary.appendChild(retry);
+                const scans = document.createElement('span'); scans.dataset.role = 'scan-links'; summary.appendChild(scans);
             }
             const detail = details.get(offer.offerId);
             renderSummary(summary, give, receive, me, them, detail?.state === 'loading'
-                ? 'Loading exact trade items…' : detail?.error || '');
+                ? 'Loading trade item descriptions…' : detail?.error || (!offer.active ? 'Historical offers show current estimates, not prices at the time of the trade.' : ''));
+            renderScanLinks(role(summary, 'scan-links'), me, them);
             summary.querySelector('.sih-lite-trade-retry').hidden =
                 !owners.get(me)?.priceError && !owners.get(them)?.priceError && !detail?.error &&
-                !owners.get(me)?.priceCache?.cached && !owners.get(them)?.priceCache?.cached;
+                !owners.get(me)?.priceCache?.cached && !owners.get(them)?.priceCache?.cached &&
+                !owners.get(me)?.needsScan && !owners.get(them)?.needsScan;
             summary.querySelector('.sih-lite-trade-retry').disabled =
                 [me, them].some(id => owners.get(id)?.priceState === 'loading') || detail?.state === 'loading';
             for (const slot of offer.slots || []) if (slot.element) {
-                renderBadge(slot.element, { ...slot.item, ownerSteamId: slot.side === 'give' ? me : them });
+                badges.push([slot.element, { ...slot.item, ownerSteamId: slot.side === 'give' ? me : them }]);
             }
             renderAccept(offer, summary);
         }
         for (const summary of document.querySelectorAll('.sih-lite-trade-summary[data-offer-id]')) {
             if (!seen.has(summary.dataset.offerId)) summary.remove();
         }
+        renderBadgesGradually(badges);
     }
 
     function sessionId() {
@@ -542,12 +628,11 @@
     function queueRender() {
         if (renderQueued) return;
         renderQueued = true;
-        requestAnimationFrame(() => {
-            renderQueued = false;
+        setTimeout(() => requestAnimationFrame(() => {
+            renderQueued = false; lastRenderAt = Date.now();
             addStyles();
-            if (editorPage) renderEditor();
-            else renderList();
-        });
+            if (editorPage) renderEditor(); else renderList();
+        }), Math.max(0, 200 - (Date.now() - lastRenderAt)));
     }
 
     window.addEventListener('message', event => {
@@ -574,7 +659,7 @@
             sortPending?.requestId === message.requestId && sortPending.ownerSteamId === message.ownerSteamId) {
             if (message.type === 'SORT_PROGRESS') {
                 sortStatus = Number.isSafeInteger(message.loaded) && Number.isSafeInteger(message.total)
-                    ? 'Loading inventory: ' + message.loaded + ' / ' + message.total + '…'
+                    ? (message.phase === 'pricing' ? 'Preparing price sort: ' : 'Loading inventory: ') + message.loaded + ' / ' + message.total + '…'
                     : 'Loading all inventory items…';
             } else {
                 clearTimeout(sortPending.timer);
@@ -587,9 +672,17 @@
             queueRender();
         }
     });
-    new MutationObserver(queueRender).observe(document.body, {
+    function extensionNode(node) {
+        const element = node.nodeType === 1 ? node : node.parentElement;
+        return Boolean(element?.closest('.sih-lite-trade-summary, .sih-lite-trade-price, #sih-lite-trade-inventory-panel, #sih-lite-trade-styles'));
+    }
+    new MutationObserver(records => {
+        if (records.some(record => !extensionNode(record.target) &&
+            (record.type !== 'childList' || [...record.addedNodes, ...record.removedNodes].some(node => !extensionNode(node))))) queueRender();
+    }).observe(document.body, {
         childList: true, subtree: true, attributes: true, attributeFilter: ['class', 'data-economy-item']
     });
+    window.addEventListener('scroll', queueRender, { passive: true });
     post('STATE_REQUEST');
     queueRender();
 })();

@@ -69,7 +69,7 @@
 
     function request(action, id, force = false) {
         return new Promise((resolve, reject) => {
-            const timer = setTimeout(() => reject(new Error('Steamprice request timed out. Please try again.')), 180000);
+            const timer = setTimeout(() => reject(new Error('Steamprice request timed out. Please try again.')), 240000);
             try {
                 chrome.runtime.sendMessage({ action, steamId: id, force }, response => {
                     clearTimeout(timer);

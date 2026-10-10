@@ -12,7 +12,8 @@ function asset(id, hash, extra = {}) {
     const attributes = new Map();
     const item = { id: String(id), appid: 570, contextid: '2', market_hash_name: hash, amount: 1, ...extra };
     item.element = { nodeType: 1, rgItem: item,
-        setAttribute: (name, value) => attributes.set(name, value), getAttribute: name => attributes.get(name) };
+        setAttribute: (name, value) => attributes.set(name, value), getAttribute: name => attributes.get(name),
+        removeAttribute: name => attributes.delete(name) };
     item.homeElement = { nodeType: 1, rgItem: item, style: {}, filtered: false };
     return item;
 }
@@ -25,10 +26,11 @@ function inventory(owner, items) {
 }
 
 function harness(items = [asset(1, 'Plain')], options = {}) {
-    const messages = [], listeners = new Map(), timers = [];
+    const messages = [], listeners = new Map(), timers = [], intervals = [];
+    let gemReads = 0;
     const me = { strSteamId: ME, rgContexts: { 570: { 2: {} } } };
     const them = { strSteamId: THEM, rgContexts: { 570: { 2: {} } } };
-    const own = inventory(me, items), other = inventory(them, [asset(1, 'Plain')]);
+    const own = inventory(me, items), other = inventory(them, options.otherItems || [asset(1, 'Plain')]);
     me.rgContexts[570][2].inventory = own;
     them.rgContexts[570][2].inventory = other;
     const slots = { your_slots: [], their_slots: [], your_slots_currency: [], their_slots_currency: [] };
@@ -37,9 +39,9 @@ function harness(items = [asset(1, 'Plain')], options = {}) {
         g_ActiveInventory: own, g_ActiveUser: me,
         g_rgCurrentTradeStatus: { me: { assets: [], currency: [] }, them: { assets: [], currency: [] } },
         postMessage: message => messages.push(JSON.parse(JSON.stringify(message))),
-        addEventListener: (type, listener) => listeners.set(type, listener), setInterval() {},
+        addEventListener: (type, listener) => listeners.set(type, listener), setInterval(callback, delay) { intervals.push({ callback, delay }); },
         setTimeout(callback) { timers.push(callback); return timers.length; }, clearTimeout() {},
-        SIHLiteGems: { analyzeSteamAsset: item => ({ hasGems: Boolean(item.description?.insertedGems) }) } };
+        SIHLiteGems: { analyzeSteamAsset: item => { gemReads++; return { hasGems: Boolean(item.description?.insertedGems) }; } } };
     if (options.prototypeValues) {
         for (const side of ['me', 'them']) for (const kind of ['assets', 'currency']) {
             Object.setPrototypeOf(window.g_rgCurrentTradeStatus[side][kind], Object.assign(Object.create(Array.prototype), {
@@ -51,10 +53,10 @@ function harness(items = [asset(1, 'Plain')], options = {}) {
     vm.runInNewContext(prototype + bridge, { window, document, globalThis: window });
     const send = (data, event = {}) => listeners.get('message')({ source: window, origin: window.location.origin, ...event,
         data: { source: 'SIH_LITE_TRADE_CONTENT', ...data } });
-    return { window, me, them, own, other, slots, messages, timers, send,
+    return { window, me, them, own, other, slots, messages, timers, intervals, send, gemReads: () => gemReads,
         sort(data = {}) { send({ type: 'SORT', requestId: 'sort', ownerSteamId: ME, side: 'me',
             appId: '570', contextId: '2', order: 'desc', prices: { assetPrices: [], namePrices: [] }, ...data }); },
-        state() { send({ type: 'STATE_REQUEST' }); return messages.filter(message => message.type === 'EDITOR').at(-1); } };
+        state() { send({ type: 'STATE_REQUEST' }); timers.pop()?.(); return messages.filter(message => message.type === 'EDITOR').at(-1); } };
 }
 
 const flush = () => new Promise(resolve => setImmediate(resolve));
@@ -179,4 +181,104 @@ test('cross-window and cross-origin messages cannot trigger sorting', () => {
     h.send({ type: 'STATE_REQUEST' }, { source: {} });
     h.send({ type: 'STATE_REQUEST' }, { origin: 'https://example.com' });
     assert.equal(h.messages.length, originalCount);
+});
+
+test('large own and partner inventories emit one bounded native page without scanning hidden asset dictionaries', () => {
+    const ownItems = Array.from({ length: 6000 }, (_, index) => asset(1000 + index, `Own ${index}`));
+    const otherItems = Array.from({ length: 6000 }, (_, index) => asset(20000 + index, `Partner ${index}`));
+    const h = harness(ownItems, { otherItems });
+    assert.equal(h.gemReads(), 16, 'only the active page is analyzed, never the 12000 loaded assets');
+    let snapshot = h.state();
+    assert.equal(snapshot.inventories.length, 1);
+    assert.equal(snapshot.inventories[0].scope, 'visible');
+    assert.equal(snapshot.inventories[0].loadedCount, 6000);
+    assert.equal(snapshot.inventories[0].items.length, 16);
+    assert.equal(JSON.stringify(snapshot).length < 12000, true);
+    // A Proxy makes any accidental whole-dictionary enumeration fail loudly.
+    h.own.rgInventory = new Proxy(h.own.rgInventory, { ownKeys() { throw new Error('Full asset scan'); } });
+    h.other.rgInventory = new Proxy(h.other.rgInventory, { ownKeys() { throw new Error('Hidden owner asset scan'); } });
+    const before = h.messages.length;
+    for (let index = 0; index < 25; index++) h.intervals[0].callback();
+    assert.equal(h.intervals[0].delay, 1000);
+    assert.equal(h.messages.length, before, 'unchanged polls send no duplicate payload');
+    assert.equal(h.gemReads(), 16, 'unchanged polls do not rerun gem analysis');
+    for (let index = 0; index < 30; index++) h.send({ type: 'STATE_REQUEST' });
+    assert.equal(h.timers.length, 1, 'bursts of content requests are coalesced');
+    h.timers.shift()();
+    assert.equal(h.gemReads(), 16, 'forced bounded snapshots reuse metadata');
+    h.own.pageCurrent = 2;
+    snapshot = h.state();
+    assert.deepEqual(snapshot.inventories[0].items.map(item => item.assetId), ownItems.slice(32, 48).map(item => item.id));
+    assert.equal(ownItems[0].element.getAttribute('data-sih-trade-visible'), undefined);
+    assert.equal(ownItems[32].element.getAttribute('data-sih-trade-visible'), 'true');
+    h.window.g_ActiveInventory = h.other;
+    snapshot = h.state();
+    assert.equal(snapshot.inventories[0].side, 'them');
+    assert.equal(snapshot.inventories[0].items.length, 16);
+    assert.equal(ownItems[32].element.getAttribute('data-sih-trade-visible'), undefined);
+    assert.equal(otherItems[0].element.getAttribute('data-sih-trade-visible'), 'true');
+    assert.equal(h.gemReads(), 48);
+});
+
+test('mounted native pages cap metadata at 128 while retaining offered items outside that page', () => {
+    const items = Array.from({ length: 2500 }, (_, index) => asset(1000 + index, `Item ${index}`));
+    const h = harness(items);
+    h.own.pageList = [{ nodeType: 1, querySelectorAll: () => items.map(item => item.element) }];
+    h.window.g_rgCurrentTradeStatus.me.assets = [{ appid: 570, contextid: '2', assetid: '3499', amount: 2 }];
+    h.slots.your_slots.push(items.at(-1).element);
+    const snapshot = h.state();
+    assert.equal(snapshot.inventories[0].items.length, 128);
+    assert.equal(snapshot.offers.me[0].assetId, '3499');
+    assert.equal(snapshot.offers.me[0].amount, 2);
+    assert.equal(snapshot.offersComplete.me, true);
+    assert.equal(items.at(-1).element.getAttribute('data-sih-trade-owner'), ME);
+});
+
+test('large price sorting yields between bounded batches while preserving native order until completion', async () => {
+    const items = Array.from({ length: 6000 }, (_, index) => asset(1000 + index, `Item ${index}`));
+    const h = harness(items);
+    const before = h.own.rgItemElements;
+    h.sort({ prices: { assetPrices: items.map((item, index) => [item.id, index]), namePrices: [] } });
+    await flush();
+    assert.equal(result(h), undefined, 'sorting pauses so the browser can paint before processing all 6000 records');
+    let heartbeats = 0;
+    while (!result(h) && heartbeats < 40) {
+        assert.equal(h.own.rgItemElements, before, 'native holder order remains untouched between batches');
+        assert.deepEqual(h.own.rgItemElements.map(holder => holder.rgItem.id), items.map(item => item.id));
+        h.timers.shift()?.();
+        heartbeats++;
+        await flush();
+    }
+    assert.equal(result(h)?.success, true);
+    assert.equal(heartbeats, 29, '6000 records yield after each 200-record batch except the last');
+    const progress = h.messages.filter(message => message.type === 'SORT_PROGRESS' && message.phase === 'pricing');
+    assert.equal(progress.length, 29);
+    assert.deepEqual(progress.map(message => message.loaded), Array.from({ length: 29 }, (_, index) => (index + 1) * 200));
+    assert.ok(progress.every(message => message.ownerSteamId === ME && message.total === 6000));
+    assert.deepEqual(h.own.rgItemElements.map(holder => holder.rgItem.id), items.map(item => item.id).reverse());
+});
+
+test('switching owners or replacing inventory during price batches aborts without mutating either inventory', async () => {
+    for (const change of ['owner', 'inventory', 'holders']) {
+        const items = Array.from({ length: 501 }, (_, index) => asset(1000 + index, `Item ${index}`));
+        const h = harness(items);
+        const before = h.own.rgItemElements;
+        h.sort({ prices: { assetPrices: items.map((item, index) => [item.id, index]), namePrices: [] } });
+        await flush();
+        assert.equal(h.timers.length, 1);
+        h.sort({ requestId: 'conflicting' });
+        assert.equal(result(h, 'conflicting').success, false, 'busy state persists across yields');
+        if (change === 'owner') h.window.g_ActiveInventory = h.other;
+        else if (change === 'inventory') {
+            const replacement = inventory(h.me, [asset(999, 'Replacement')]);
+            h.me.rgContexts[570][2].inventory = h.window.g_ActiveInventory = replacement;
+        } else h.own.rgItemElements = before.slice();
+        h.timers.shift()();
+        await flush();
+        assert.equal(result(h).success, false);
+        assert.equal(result(h).ownerSteamId, ME);
+        assert.deepEqual(before.map(holder => holder.rgItem.id), items.map(item => item.id));
+        assert.deepEqual(h.other.rgItemElements.map(holder => holder.rgItem.id), ['1']);
+        assert.equal(h.own.layouts, undefined);
+    }
 });

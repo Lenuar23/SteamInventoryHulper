@@ -5,14 +5,21 @@
     const CONTENT_SOURCE = 'SIH_LITE_TRADE_CONTENT';
     const PAGE_SOURCE = 'SIH_LITE_TRADE_PAGE';
     const MAX_ITEMS = 100000;
+    const MAX_VISIBLE_ITEMS = 128;
+    const SNAPSHOT_INTERVAL_MS = 1000;
+    const STATE_REQUEST_DELAY_MS = 150;
+    const SORT_PRICE_BATCH_SIZE = 200;
     const LOAD_TIMEOUT_MS = 120000;
     const originalOrders = new WeakMap();
     const objectIds = new WeakMap();
+    const itemSnapshots = new WeakMap();
     const responsivePages = new WeakSet();
     let nextObjectId = 0;
     let lastSignature = '';
     let busy = false;
     let hookedFilter = null;
+    let stateRequestTimer = null;
+    let visibleElements = new Set();
 
     function reply(type, data) {
         window.postMessage({ source: PAGE_SOURCE, type, ...data }, window.location.origin);
@@ -91,12 +98,22 @@
 
     function itemData(asset, side, user, app = '570', context = '2', amount) {
         const desc = description(asset);
-        return {
-            assetId: assetId(asset), ownerSteamId: steamId(user), side, appId: String(app), contextId: String(context),
+        const ownerSteamId = steamId(user);
+        const count = quantity(amount === undefined ? asset?.amount : amount);
+        const key = [side, ownerSteamId, String(app), String(context), assetId(asset), count,
+            desc.market_hash_name, desc.market_name, desc.name];
+        const cached = asset && typeof asset === 'object' ? itemSnapshots.get(asset) : null;
+        if (cached && cached.description === desc && cached.descriptions === desc.descriptions &&
+            key.every((value, index) => cached.key[index] === value)) return cached.data;
+        const gems = gemDetails(asset);
+        const data = {
+            assetId: assetId(asset), ownerSteamId, side, appId: String(app), contextId: String(context),
             name: String(desc.market_hash_name || desc.market_name || desc.name || '').slice(0, 512),
             market_hash_name: String(desc.market_hash_name || desc.market_name || '').slice(0, 512),
-            amount: quantity(amount === undefined ? asset?.amount : amount), ...gemDetails(asset)
+            amount: count, hasGems: Boolean(gems.hasGems), hasColoredGem: Boolean(gems.hasColoredGem)
         };
+        if (asset && typeof asset === 'object') itemSnapshots.set(asset, { key, description: desc, descriptions: desc.descriptions, data });
+        return data;
     }
 
     function annotate(element, data) {
@@ -194,15 +211,60 @@
         };
     }
 
-    function signature() {
-        const active = activeInventory();
+    function pageNode(active) {
+        const index = active?.m_iCurrentPage ?? active?.pageCurrent ?? 0;
+        // Use Steam's existing page; GetElement/getInventory can create holders
+        // or start requests, so metadata reads never call them.
+        const page = active?.m_rgPages?.[index] || active?.pageList?.[index];
+        return holderNode(page?.m_$Page || page);
+    }
+
+    function visibleInventoryEntries(active) {
+        const inventory = itemInventory(active);
+        if (!inventory || pending(active) || pending(inventory)) return [];
+        const page = pageNode(active);
+        const entries = [];
+        if (typeof page?.querySelectorAll === 'function') {
+            for (const element of page.querySelectorAll('.item')) {
+                const holder = element.closest?.('.itemHolder') || element.parentNode;
+                if (!element.rgItem || holder?.filtered || holder?.style?.display === 'none' || element.style?.display === 'none') continue;
+                entries.push({ element, asset: element.rgItem });
+                if (entries.length >= MAX_VISIBLE_ITEMS) break;
+            }
+            return entries;
+        }
+        // Compatibility with native implementations without a mounted page.
+        // Read one bounded holder slice, never enumerate the asset dictionary.
+        const index = active?.m_iCurrentPage ?? active?.pageCurrent ?? 0;
+        const perPage = Number.isSafeInteger(window.INVENTORY_PAGE_ITEMS) && window.INVENTORY_PAGE_ITEMS > 0
+            ? Math.min(window.INVENTORY_PAGE_ITEMS, MAX_VISIBLE_ITEMS) : 16;
+        for (const holder of holders(inventory).slice(index * perPage, (index + 1) * perPage)) {
+            const node = holderNode(holder), asset = holderAsset(holder);
+            if (!asset || node?.filtered || node?.style?.display === 'none') continue;
+            const element = asset.element || node?.querySelector?.('.item') || node;
+            entries.push({ element, asset });
+        }
+        return entries;
+    }
+
+    function loadedCount(inventory) {
+        const count = inventory?.m_iNextEmptyItemElement ?? holders(inventory).length;
+        return Number.isSafeInteger(count) && count >= 0 ? Math.min(count, MAX_ITEMS) : 0;
+    }
+
+    function signature(active, visible) {
+        const inventory = itemInventory(active);
         return JSON.stringify({
             owners: ['me', 'them'].map(side => steamId(userFor(side))), active: objectId(active),
-            order: originalOrders.get(itemInventory(active))?.order,
-            inventories: ['me', 'them'].map(side => {
-                const inventory = loadedInventory(userFor(side));
-                return [objectId(inventory), pending(inventory), assets(inventory).length];
-            }), offers: ['me', 'them'].map(side => [offerRecords(side), offerRecords(side, 'currency')]),
+            order: originalOrders.get(inventory)?.order,
+            inventory: [objectId(inventory), pending(active), pending(inventory), loadedCount(inventory),
+                active?.m_iCurrentPage ?? active?.pageCurrent ?? 0, objectId(pageNode(active))],
+            visible: visible.map(entry => {
+                const desc = description(entry.asset);
+                return [objectId(entry.element), assetId(entry.asset), entry.asset.amount,
+                    objectId(desc), objectId(desc.descriptions), desc.market_hash_name, desc.market_name, desc.name];
+            }),
+            offers: ['me', 'them'].map(side => [offerRecords(side), offerRecords(side, 'currency')]),
             slots: ['me', 'them'].map(side => [false, true].map(currency => nativeSlotAssets(side, currency)
                 .map(entry => [objectId(entry.element), assetId(entry.asset), entry.asset.amount]))),
             version: window.g_rgCurrentTradeStatus?.version
@@ -210,26 +272,42 @@
     }
 
     function emitEditor(force) {
-        const current = signature();
+        const active = activeInventory();
+        const visible = visibleInventoryEntries(active);
+        const current = signature(active, visible);
         if (!force && current === lastSignature) return;
         lastSignature = current;
         const owners = {}, inventories = [];
         for (const side of ['me', 'them']) {
             const user = userFor(side);
             owners[side] = { steamId: steamId(user) };
-            const inventory = loadedInventory(user);
-            if (!inventory || pending(inventory)) continue;
-            const items = [];
-            for (const asset of assets(inventory)) {
-                if (!/^\d{1,20}$/.test(assetId(asset))) continue;
-                const data = itemData(asset, side, user);
-                items.push(data);
-                annotate(asset.element, data);
-            }
-            inventories.push({ side, ownerSteamId: steamId(user), appId: '570', contextId: '2', items });
         }
+        const state = editorState(active);
+        const nextVisible = new Set();
+        if (state.supported && !state.loading) {
+            const user = userFor(state.side);
+            const items = [];
+            for (const { element, asset } of visible) {
+                if (!/^\d{1,20}$/.test(assetId(asset))) continue;
+                const data = itemData(asset, state.side, user);
+                items.push(data);
+                annotate(element, data);
+                if (typeof element?.setAttribute === 'function') {
+                    if (element.getAttribute('data-sih-trade-visible') !== 'true') element.setAttribute('data-sih-trade-visible', 'true');
+                    nextVisible.add(element);
+                }
+            }
+            inventories.push({ side: state.side, ownerSteamId: state.ownerSteamId, appId: '570', contextId: '2',
+                scope: 'visible', loadedCount: loadedCount(itemInventory(active)), items });
+        }
+        for (const element of visibleElements) {
+            if (nextVisible.has(element)) continue;
+            if (typeof element.removeAttribute === 'function') element.removeAttribute('data-sih-trade-visible');
+            else element.setAttribute('data-sih-trade-visible', 'false');
+        }
+        visibleElements = nextVisible;
         const me = offeredItems('me', userFor('me')), them = offeredItems('them', userFor('them'));
-        reply('EDITOR', { owners, active: editorState(activeInventory()), inventories,
+        reply('EDITOR', { owners, active: state, inventories,
             offers: { me: me.items, them: them.items }, offersComplete: { me: me.complete, them: them.complete } });
     }
 
@@ -403,6 +481,30 @@
         }
     }
 
+    async function prepareSortPrices(before, prices, user, ownerSteamId, active, items, progress) {
+        const itemPrices = new Map();
+        const count = before.length;
+        const checkInventory = () => {
+            if (ensureSelected(user, ownerSteamId) !== active || itemInventory(active) !== items ||
+                pending(active) || pending(items) || holders(items) !== before || before.length !== count) {
+                throw new Error('Inventory changed while preparing the sort. Try again.');
+            }
+        };
+        for (let start = 0; start < count; start += SORT_PRICE_BATCH_SIZE) {
+            checkInventory();
+            const end = Math.min(start + SORT_PRICE_BATCH_SIZE, count);
+            for (let index = start; index < end; index++) itemPrices.set(before[index], priceFor(before[index], prices));
+            if (end < count) {
+                progress(end, count, 'pricing');
+                // Let Steam handle input and paint between metadata batches.
+                // The native holder order stays untouched until every price is ready.
+                await new Promise(resolve => window.setTimeout(resolve, 16));
+                checkInventory();
+            }
+        }
+        return itemPrices;
+    }
+
     async function sortInventory(message) {
         const requestId = message.requestId;
         const ownerSteamId = String(message.ownerSteamId || '');
@@ -418,8 +520,8 @@
             ensureSelected(user, String(message.ownerSteamId));
             const prices = message.order === 'original' ? null : validatePrices(message.prices);
             busy = acquired = true;
-            const progress = (loaded, total) => {
-                reply('SORT_PROGRESS', { requestId, ownerSteamId, loaded, total }); emitEditor(false);
+            const progress = (loaded, total, phase = 'loading') => {
+                reply('SORT_PROGRESS', { requestId, ownerSteamId, loaded, total, phase }); emitEditor(false);
             };
             const { active, items } = await completeInventory(user, String(message.ownerSteamId), progress);
             if (active.bInPagingTransition || active.m_$Inventory?.hasClass('paging_transition')) throw new Error('Wait for the page transition to finish, then try again.');
@@ -428,7 +530,13 @@
             const original = originalOrders.get(items);
             const rank = new Map(original.holders.map((holder, index) => [holder, index]));
             const before = holders(items);
-            const itemPrices = prices ? new Map(before.map(holder => [holder, priceFor(holder, prices)])) : null;
+            const itemPrices = prices ? await prepareSortPrices(before, prices, user, ownerSteamId, active, items, progress) : null;
+            if (ensureSelected(user, ownerSteamId) !== active || itemInventory(active) !== items || holders(items) !== before) {
+                throw new Error('Inventory changed while preparing the sort. Try again.');
+            }
+            if (active.bInPagingTransition || active.m_$Inventory?.hasClass('paging_transition')) {
+                throw new Error('Wait for the page transition to finish, then try again.');
+            }
             const sorted = before.slice().sort((left, right) => {
                 const stable = rank.get(left) - rank.get(right);
                 if (message.order === 'original') return stable;
@@ -454,9 +562,12 @@
 
     window.addEventListener('message', event => {
         if (event.source !== window || event.origin !== window.location.origin || event.data?.source !== CONTENT_SOURCE) return;
-        if (event.data.type === 'STATE_REQUEST') emitEditor(true);
+        if (event.data.type === 'STATE_REQUEST') {
+            if (stateRequestTimer !== null) return;
+            stateRequestTimer = window.setTimeout(() => { stateRequestTimer = null; emitEditor(true); }, STATE_REQUEST_DELAY_MS);
+        }
         else if (event.data.type === 'SORT') void sortInventory(event.data);
     });
-    window.setInterval(() => emitEditor(false), 500);
+    window.setInterval(() => emitEditor(false), SNAPSHOT_INTERVAL_MS);
     emitEditor(true);
 })();

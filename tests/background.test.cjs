@@ -11,6 +11,7 @@ const ok = data => ({ ok: true, status: 200, json: async () => data });
 function setup(fetchImpl, options = {}) {
     let listener;
     const requests = [];
+    const requestTimes = [];
     const tabs = { created: [], removed: [] };
     const runtime = {
         onMessage: { addListener(callback) { listener = callback; } },
@@ -32,12 +33,17 @@ function setup(fetchImpl, options = {}) {
         btoa,
         fetch: async (url, init) => {
             requests.push(url);
+            requestTimes.push(now);
             return fetchImpl(url, init, requests.length);
         },
         setTimeout: (callback, ms) => {
             timers.push(ms);
-            return setTimeout(callback, options.timerDelay?.(ms) ??
-                ([600, 1800, 5000, 7000].includes(ms) || (options.immediateTimeout && ms === 15000) ? 0 : ms));
+            const chosenDelay = options.timerDelay?.(ms);
+            const fastForward = ms <= 7000 || (options.immediateTimeout && ms === 15000);
+            return setTimeout(() => {
+                if (fastForward) now += ms;
+                callback();
+            }, chosenDelay ?? (fastForward ? 0 : ms));
         },
         clearTimeout,
         chrome: {
@@ -72,6 +78,7 @@ function setup(fetchImpl, options = {}) {
     }, { filename: 'background.js' });
     return {
         requests,
+        requestTimes,
         tabs,
         timers,
         storage,
@@ -80,7 +87,10 @@ function setup(fetchImpl, options = {}) {
         send(action, id = steamId, extra = {}) {
             return new Promise(resolve => listener({ action, steamId: id, ...extra }, {}, resolve));
         },
-        async flush() { await new Promise(resolve => setImmediate(resolve)); }
+        async flush() {
+            for (let turn = 0; turn < 3; turn++) await new Promise(resolve => setTimeout(resolve, 0));
+            await new Promise(resolve => setImmediate(resolve));
+        }
     };
 }
 
@@ -501,18 +511,26 @@ test('cache bucket is bounded to six recently used owners and preserves unrelate
     assert.ok(env.storage.sets.every(value => Object.keys(value).length === 1 && value[cacheKey]));
 });
 
-test('large complete snapshots are compressed and restored without losing item metadata', async () => {
+test('large compact snapshots are compressed and restored without losing pricing and gem metadata', async () => {
     const stored = {};
-    const item = { assetid: '1', market_hash_name: 'Fractal Horns of Inner Abysm', descriptions: Array(600).fill({ value: 'Gem metadata and inventory description' }) };
-    const first = setup(async () => ok({ items: [item], totalPages: 1 }), { stored });
+    const items = Array.from({ length: 200 }, (_, index) => ({
+        assetid: String(index + 1), market_hash_name: 'Fractal Horns of Inner Abysm',
+        priceCents: 100 + index, prismaticGems: ['Legacy (4, 90, 175)'],
+        isLegacy: true, legacyRgb: { r: 4, g: 90, b: 175 },
+        descriptions: Array(20).fill({ value: 'Redundant catalog text' })
+    }));
+    const first = setup(async () => ok({ items, totalPages: 1 }), { stored });
     await first.send('fetchPrices');
     for (let attempt = 0; attempt < 30 && stored[cacheKey]?.encoding !== 'gzip'; attempt++) await new Promise(resolve => setTimeout(resolve, 5));
     assert.equal(stored[cacheKey]?.encoding, 'gzip');
     const restarted = setup(async () => { throw new Error('Must load cache'); }, { stored });
     const result = await restarted.send('fetchPrices');
     assert.equal(result.cached, true);
-    assert.equal(result.data.items[0].descriptions.length, 600);
-    assert.equal(result.data.items[0].market_hash_name, item.market_hash_name);
+    assert.equal(result.data.items.length, 200);
+    assert.equal(result.data.items[0].descriptions, undefined);
+    assert.equal(result.data.items[0].market_hash_name, items[0].market_hash_name);
+    assert.deepEqual(Array.from(result.data.items[0].prismaticGems), items[0].prismaticGems);
+    assert.equal(result.data.items[199].priceCents, items[199].priceCents);
     assert.equal(restarted.requests.length, 0);
 });
 
@@ -532,7 +550,7 @@ test('scanning invalidates a pre-scan profile cache and marks the prices reply',
     assert.equal(env.requests.filter(url => url.includes('/profile/')).length, 2);
 });
 
-test('late pre-scan profile responses cannot repopulate the invalidated cache', async () => {
+test('serial loading does not let a pre-scan profile remain fresh after inventory scanning', async () => {
     let release;
     let scanned = false;
     let profiles = 0;
@@ -546,16 +564,19 @@ test('late pre-scan profile responses cannot repopulate the invalidated cache', 
     });
     const initial = env.send('fetchProfile');
     await env.flush();
-    await env.send('fetchPrices');
+    const prices = env.send('fetchPrices');
+    await env.flush();
+    assert.equal(env.requests.length, 1);
     release();
     await initial;
+    await prices;
     const current = await env.send('fetchProfile');
     assert.equal(current.cached, false);
     assert.equal(current.data.totalValueCents, 300);
     assert.equal(profiles, 2);
 });
 
-test('global limiter permits at most two simultaneous GETs across owners and actions', async () => {
+test('global limiter serializes GETs across owners and actions with paced starts', async () => {
     let active = 0;
     let maximum = 0;
     const releases = [];
@@ -567,16 +588,19 @@ test('global limiter permits at most two simultaneous GETs across owners and act
     });
     const operations = Array.from({ length: 6 }, (_, index) => env.send(index % 2 ? 'fetchPrices' : 'fetchProfile', owner(index)));
     await env.flush();
-    assert.equal(env.requests.length, 2);
-    assert.equal(active, 2);
+    assert.equal(env.requests.length, 1);
+    assert.equal(active, 1);
     for (let count = 0; count < 6; count++) {
         assert.ok(releases[count]);
         releases[count]();
         await env.flush();
     }
     assert.ok((await Promise.all(operations)).every(result => result.success));
-    assert.equal(maximum, 2);
+    assert.equal(maximum, 1);
     assert.equal(env.requests.length, 6);
+    for (let index = 1; index < env.requestTimes.length; index++) {
+        assert.ok(env.requestTimes[index] - env.requestTimes[index - 1] >= 350);
+    }
 });
 
 test('retry backoff releases its GET slot so queued owners can load', async () => {
@@ -594,7 +618,8 @@ test('retry backoff releases its GET slot so queued owners can load', async () =
     const second = env.send('fetchProfile', owner(1));
     const third = env.send('fetchProfile', owner(2));
     await env.flush();
-    assert.deepEqual(starts.slice(0, 3), [owner(0), owner(1), owner(2)]);
+    assert.deepEqual(starts.slice(0, 2), [owner(0), owner(1)]);
+    assert.equal(starts.includes(owner(2)), false);
     releaseSecond();
     assert.ok((await Promise.all([first, second, third])).every(result => result.success));
     assert.equal(firstAttempts, 2);
@@ -608,11 +633,13 @@ test('queued GETs start their request timeout only after acquiring a slot', asyn
     });
     const calls = [0, 1, 2].map(index => env.send('fetchProfile', owner(index)));
     await env.flush();
-    assert.equal(env.timers.filter(ms => ms === 15000).length, 2);
+    assert.equal(env.timers.filter(ms => ms === 15000).length, 1);
     releases[0]();
     await env.flush();
-    assert.equal(env.timers.filter(ms => ms === 15000).length, 3);
+    assert.equal(env.timers.filter(ms => ms === 15000).length, 2);
     releases[1]();
+    await env.flush();
+    assert.equal(env.timers.filter(ms => ms === 15000).length, 3);
     releases[2]();
     assert.ok((await Promise.all(calls)).every(result => result.success));
 });
@@ -652,23 +679,160 @@ test('profile invalidation retains the last complete total for labeled outage fa
 
 test('queued operation deadlines fail explicitly and release no phantom slots', async () => {
     const releases = [];
+    let expireQueued = true;
     const env = setup(async () => {
         await new Promise(resolve => releases.push(resolve));
         return ok({ totalValueCents: 1 });
-    }, { timerDelay: ms => ms === 120000 ? 0 : undefined });
+    }, { timerDelay: ms => expireQueued && ms === 180000 ? 0 : undefined });
     const first = env.send('fetchProfile', owner(0));
     const second = env.send('fetchProfile', owner(1));
     const queued = env.send('fetchProfile', owner(2));
     const failed = await queued;
     assert.equal(failed.success, false);
     assert.match(failed.error, /timed out/);
-    assert.equal(env.requests.length, 2);
+    assert.equal(env.requests.length, 1);
     releases[0]();
-    releases[1]();
     await Promise.all([first, second]);
+    expireQueued = false;
     const next = env.send('fetchProfile', owner(3));
     await env.flush();
-    assert.equal(env.requests.length, 3);
-    releases[2]();
+    assert.equal(env.requests.length, 2);
+    releases[1]();
     assert.equal((await next).success, true);
+});
+
+test('price records retain valuation and gem-variant identity while discarding large catalog payloads', async () => {
+    const item = {
+        assetid: '123', appid: 570, contextid: '2', quantity: 2, classid: '456', instanceid: '0',
+        marketHashName: 'Exalted Fractal Horns of Inner Abysm',
+        collectorAvgSaleCents: null, collectorLowestAskCents: '12345', priceCents: 999,
+        price_cents: 888, scmPriceCents: 777, basePriceCents: 666, price: '$12.34', lowest_price: '$11', cost: 1, value: 2,
+        itemType: 'Demonic Horns', assetQuality: 'Exalted', quality: 'Exalted',
+        rawTags: [
+            { category: 'Quality', internal_name: 'exalted', localized_tag_name: 'Localized quality', color: 'ABCDEF' },
+            { category: 'Type', internal_name: 'misc', localized_tag_name: 'Demonic Horns' },
+            { category: 'Rarity', internal_name: 'arcana', color: 'ABCDEF' },
+            { category: 'Other', internal_name: 'socket_gem', localized_tag_name: 'Localized gem' }
+        ],
+        prismaticGems: ['Legacy (4, 90, 175)'], etherealGems: [], kineticGems: [], unusualEffectGems: [],
+        isLegacy: true, legacyRgb: { r: 4, g: 90, b: 175 }, emptySockets: 0,
+        allStylesUnlocked: false, styleTotal: null, styleUnlocked: null, isBuggedEthereal: false,
+        isOtherBug: true, isGolden: false, isCrimson: false, emptyEthereal: false, emptyPrismatic: false,
+        gem: null, paintSeed: null, wearRating: null, stickers: null, infuser: null, spectatorGames: 0,
+        legacyPricing: { isDupe: false, dupeCount: 0, family: 'INDIGO', detail: Array(2000).fill('Redundant pricing analysis') },
+        image: 'x'.repeat(100000), buggedNoticeTexts: { en: 'y'.repeat(100000) },
+        descriptions: Array(100).fill({ value: 'Catalog text' })
+    };
+    const env = setup(async () => ok({ items: [item], totalPages: 1 }));
+    const response = await env.send('fetchPrices');
+    assert.equal(response.success, true);
+    const compact = response.data.items[0];
+    for (const key of ['assetid', 'appid', 'contextid', 'quantity', 'classid', 'instanceid', 'marketHashName',
+        'collectorAvgSaleCents', 'collectorLowestAskCents', 'priceCents', 'price_cents', 'scmPriceCents', 'basePriceCents',
+        'price', 'lowest_price', 'cost', 'value', 'quality', 'assetQuality', 'emptySockets', 'allStylesUnlocked',
+        'styleTotal', 'styleUnlocked', 'isBuggedEthereal', 'isOtherBug', 'isGolden', 'isCrimson',
+        'emptyEthereal', 'emptyPrismatic', 'gem', 'paintSeed', 'wearRating', 'stickers', 'infuser', 'spectatorGames']) {
+        assert.equal(compact[key], item[key], key);
+    }
+    assert.deepEqual(JSON.parse(JSON.stringify(compact.prismaticGems)), item.prismaticGems);
+    assert.deepEqual(JSON.parse(JSON.stringify(compact.legacyRgb)), item.legacyRgb);
+    assert.deepEqual(JSON.parse(JSON.stringify(compact.legacyPricing)), { isDupe: false, dupeCount: 0 });
+    assert.deepEqual(JSON.parse(JSON.stringify(compact.rawTags)), [
+        { category: 'Quality', internal_name: 'exalted' },
+        { category: 'Type', internal_name: 'misc', localized_tag_name: 'Demonic Horns' },
+        { category: 'Other', internal_name: 'socket_gem' }
+    ]);
+    assert.equal(compact.image, undefined);
+    assert.equal(compact.descriptions, undefined);
+    assert.equal(compact.buggedNoticeTexts, undefined);
+    assert.ok(JSON.stringify(compact).length < JSON.stringify(item).length / 20);
+});
+
+test('an older uncompressed cache is compacted before its first runtime reply and retains missing variant fields', async () => {
+    const now = 1800000000000;
+    const raw = { assetid: '123', priceCents: 42, marketHashName: 'Fractal Horns of Inner Abysm',
+        prismaticGems: ['Deep Blue'], image: 'x'.repeat(100000), legacyPricing: null };
+    const stored = { [cacheKey]: { version: 1, entries: {
+        [`fetchPrices:${steamId}`]: { action: 'fetchPrices', steamId, cachedAt: now, data: { items: [raw] } }
+    } } };
+    const env = setup(async () => { throw new Error('Fresh cache should avoid network'); }, { stored, now });
+    const response = await env.send('fetchPrices');
+    assert.equal(response.cached, true);
+    assert.equal(response.data.items[0].assetid, '123');
+    assert.equal(response.data.items[0].priceCents, 42);
+    assert.equal(response.data.items[0].image, undefined);
+    assert.equal(response.data.items[0].legacyPricing, null);
+    assert.equal(Object.hasOwn(response.data.items[0], 'isBuggedEthereal'), false);
+    assert.equal(env.requests.length, 0);
+});
+
+test('trade callers can disable hidden scans for cold empty inventories without caching a false fresh snapshot', async () => {
+    let empty = true;
+    const env = setup(async () => ok(empty ? { items: [], totalPages: 0 }
+        : { items: [{ assetid: '123', priceCents: 42 }], totalPages: 1 }));
+    const first = await env.send('fetchPrices', steamId, { scan: false });
+    assert.equal(first.success, true);
+    assert.equal(first.needsScan, true);
+    assert.equal(first.cached, false);
+    assert.equal(first.scanned, undefined);
+    assert.equal(first.data.items.length, 0);
+    assert.equal(env.requests.length, 1);
+    assert.equal(env.tabs.created.length, 0);
+    assert.equal(env.tabs.removed.length, 0);
+    await env.flush();
+    assert.equal(env.storage.sets.length, 0);
+    empty = false;
+    const next = await env.send('fetchPrices', steamId, { scan: false });
+    assert.equal(next.cached, false);
+    assert.equal(next.needsScan, undefined);
+    assert.equal(next.data.items[0].priceCents, 42);
+    assert.equal(env.requests.length, 2);
+});
+
+test('scan-disabled and inventory callers have separate in-flight operations', async () => {
+    const env = setup(async (_, __, count) => ok(count < 3 ? { items: [], totalPages: 0 }
+        : { items: [{ assetid: '123', priceCents: 42 }], totalPages: 1 }));
+    const noScan = env.send('fetchPrices', steamId, { scan: false });
+    const inventory = env.send('fetchPrices');
+    const [tradeReply, inventoryReply] = await Promise.all([noScan, inventory]);
+    assert.equal(tradeReply.needsScan, true);
+    assert.equal(tradeReply.data.items.length, 0);
+    assert.equal(inventoryReply.scanned, true);
+    assert.equal(inventoryReply.data.items[0].assetid, '123');
+    assert.equal(env.requests.length, 3);
+    assert.equal(env.tabs.created.length, 1);
+});
+
+test('an existing complete empty cache remains labeled for scan-disabled trade callers', async () => {
+    const env = setup(async () => ok({ items: [], totalPages: 0 }));
+    const inventoryReply = await env.send('fetchPrices');
+    assert.equal(inventoryReply.scanned, true);
+    const tradeReply = await env.send('fetchPrices', steamId, { scan: false });
+    assert.equal(tradeReply.cached, true);
+    assert.equal(tradeReply.needsScan, true);
+    assert.equal(env.requests.length, 2);
+    assert.equal(env.tabs.created.length, 1);
+});
+
+test('quick inventory pages are paced instead of producing a burst of GETs', async () => {
+    const env = setup(async url => {
+        const page = Number(new URL(url).searchParams.get('page'));
+        return ok({ items: [{ assetid: String(page) }], total: 5, pageSize: 1, page });
+    });
+    assert.equal((await env.send('fetchPrices')).data.items.length, 5);
+    assert.equal(env.requestTimes.length, 5);
+    for (let index = 1; index < env.requestTimes.length; index++) {
+        assert.ok(env.requestTimes[index] - env.requestTimes[index - 1] >= 350);
+    }
+});
+
+test('a server Retry-After delays other owners too instead of moving a burst to another inventory', async () => {
+    let failed = false;
+    const env = setup(async url => {
+        if (url.endsWith(owner(0)) && !failed) { failed = true; return http(429, '2'); }
+        return ok({ totalValueCents: 1 });
+    });
+    const replies = await Promise.all([env.send('fetchProfile', owner(0)), env.send('fetchProfile', owner(1))]);
+    assert.ok(replies.every(result => result.success));
+    assert.ok(env.requestTimes[1] - env.requestTimes[0] >= 2000);
 });

@@ -3,7 +3,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const test = require('node:test');
 const vm = require('node:vm');
-const { buildIndex, getPrice, summarize, difference } = require('../trade-prices.js');
+const { buildIndex, getPrice, summarize, difference, variantFingerprint } = require('../trade-prices.js');
 
 const OWNER = '76561198012345678';
 const PARTNER = '76561198087654321';
@@ -90,7 +90,7 @@ test('native installed socket HTML blocks unsafe base-price fallback', () => {
 test('stack quantities multiply price while summary counts remain offered item slots', () => {
     const index = buildIndex([{ assetid: '100', priceCents: 250 }, { assetid: '101', priceCents: 0 }], OWNER);
     assert.deepEqual(summarize([item('100', '', { amount: '3' }), item('101', '', { amount: 100 })], index),
-        { knownCents: 750, itemCount: 2, pricedCount: 2, unpricedCount: 0, nonDotaCount: 0, complete: true });
+        { knownCents: 750, itemCount: 2, pricedCount: 2, unpricedCount: 0, nonDotaCount: 0, estimatedCount: 0, complete: true });
     assert.equal(getPrice(index, item('100', '', { amount: 3 })).cents, 250, 'lookup returns a unit price');
     assert.equal(summarize([item('100', '')], index).knownCents, 250, 'missing amount defaults to one slot');
 });
@@ -99,7 +99,7 @@ test('unknown prices and non-Dota items produce a partial known total', () => {
     const index = buildIndex([{ assetid: '100', priceCents: 250 }], OWNER);
     assert.deepEqual(summarize([
         item('100', '', { amount: 2 }), item('999', 'Unknown'), item('100', '', { appId: 730, amount: 5 })
-    ], index), { knownCents: 500, itemCount: 3, pricedCount: 1, unpricedCount: 2, nonDotaCount: 1, complete: false });
+    ], index), { knownCents: 500, itemCount: 3, pricedCount: 1, unpricedCount: 2, nonDotaCount: 1, estimatedCount: 0, complete: false });
     assert.deepEqual(getPrice(index, item('100', '', { appId: 730 })), { cents: null, source: 'non-dota' });
     assert.equal(getPrice(index, item('100', '', { appId: undefined })).cents, null, 'missing application cannot claim a Dota valuation');
 });
@@ -110,7 +110,7 @@ test('offered currency identifiers cannot collide with priced assets and always 
     assert.deepEqual(getPrice(index, currency), { cents: null, source: 'unknown' });
     assert.equal(getPrice(index, item('100', '', { is_currency: true })).cents, null);
     assert.deepEqual(summarize([item('100', ''), currency], index),
-        { knownCents: 250, itemCount: 2, pricedCount: 1, unpricedCount: 1, nonDotaCount: 0, complete: false });
+        { knownCents: 250, itemCount: 2, pricedCount: 1, unpricedCount: 1, nonDotaCount: 0, estimatedCount: 0, complete: false });
     assert.deepEqual(getPrice(index, { ...currency, appId: '730' }), { cents: null, source: 'non-dota' });
 });
 
@@ -178,4 +178,107 @@ test('the browser global exposes the same pure APIs without a CommonJS runtime',
     for (const name of ['buildIndex', 'getPrice', 'summarize', 'difference']) assert.equal(typeof context.SIHLiteTradePrices[name], 'function');
     const index = context.SIHLiteTradePrices.buildIndex([{ assetId: '100', priceCents: 0 }], OWNER);
     assert.equal(context.SIHLiteTradePrices.getPrice(index, item('100', '')).cents, 0);
+});
+
+function basicTbApi(extra = {}) {
+    const row = {
+        assetid: '400', marketHashName: 'Fractal Horns of Inner Abysm', quality: 'Standard', assetQuality: 'Standard',
+        rawTags: [{ category: 'Quality', internal_name: 'unique' }], priceCents: 11767,
+        prismaticGems: ['Deep Blue'], etherealGems: [], kineticGems: [], unusualEffectGems: [],
+        emptySockets: 0, spectatorGames: 0, tradable: true, marketable: true,
+        isLegacy: false, legacyRgb: null, legacyPricing: null
+    };
+    for (const key of ['allStylesUnlocked', 'mayBeGiftedOnce', 'favored', 'unusualQuality', 'isBuggedEthereal',
+        'isOtherBug', 'isGolden', 'isCrimson', 'emptyEthereal', 'emptyPrismatic', 'isUnusualCourier',
+        'hasAllStyleCourier', 'hasUnusualEffect', 'isCollectorBundle', 'canGiftCollectorBundle',
+        'unpackGiftCollectorBundle', 'pbrCycled']) row[key] = false;
+    for (const key of ['styleTotal', 'styleUnlocked', 'gem', 'paintSeed', 'wearRating', 'stickers', 'infuser',
+        'roshanCycle', 'expirationDate', 'greevil', 'collectorSetPiece']) row[key] = null;
+    return { ...row, ...extra };
+}
+
+function tbDescription({ name = 'Deep Blue', rgb = [61, 104, 196], quality = 'unique', tags = true, extraHtml = '' } = {}) {
+    return {
+        appid: 570, classid: '400', instanceid: '0',
+        market_hash_name: quality === 'exalted' ? 'Exalted Fractal Horns of Inner Abysm' : 'Fractal Horns of Inner Abysm',
+        name_color: quality === 'exalted' ? 'CCCCCC' : 'D2D2D2', tradable: true, marketable: true,
+        tags: tags ? [{ category: 'Quality', internal_name: quality }] : [],
+        descriptions: [{ type: 'html', value: '<div style="background-image:url(https://cdn.steamstatic.com/apps/570/icons/econ/sockets/gem_color.hash.png)">' +
+            `<span style="color:rgb(${rgb.join(',')})">${name}</span><br><span>Prismatic Gem</span></div>` + extraHtml }]
+    };
+}
+
+test('verified ordinary TB colors match only the same owner and quality and are explicitly estimates', () => {
+    const index = buildIndex([basicTbApi()], OWNER);
+    const offered = item(null, 'Fractal Horns of Inner Abysm', { description: tbDescription(), amount: 2 });
+    assert.deepEqual(getPrice(index, offered), { cents: 11767, source: 'variant' });
+    assert.deepEqual(summarize([offered], index), { knownCents: 23534, itemCount: 1, pricedCount: 1,
+        unpricedCount: 0, nonDotaCount: 0, estimatedCount: 1, complete: true });
+    assert.equal(getPrice(index, { ...offered, ownerSteamId: PARTNER }).cents, null);
+    assert.equal(getPrice(index, { ...offered, description: tbDescription({ quality: 'exalted' }) }).cents, null);
+    assert.equal(getPrice(index, item('400', '', { description: tbDescription() })).source, 'asset', 'real exact asset identity takes priority');
+});
+
+test('localized socket names and omitted hover tags need the same verified regular RGB', () => {
+    const api = basicTbApi();
+    const native = tbDescription({ name: 'Глубокий синий', tags: false });
+    assert.equal(variantFingerprint(native), variantFingerprint(api, true));
+    assert.equal(getPrice(buildIndex([api], OWNER), item(null, native.market_hash_name, { description: native })).cents, 11767);
+    assert.equal(variantFingerprint(tbDescription({ name: 'Глубокий синий', rgb: [61, 104, 195], tags: false })), null);
+    assert.equal(variantFingerprint({ ...native, name_color: 'A52A2A' }), null);
+    assert.equal(variantFingerprint({ ...native, name_color: '' }), null);
+    assert.equal(variantFingerprint(tbDescription({ name: 'Unknown Color' })), null);
+    assert.equal(variantFingerprint(tbDescription({ name: "Reflection's Shade", rgb: [255, 60, 40] })),
+        '["tb-v1","standard","regular",255,60,40]');
+});
+
+test('Legacy fingerprints require exact RGB and remain distinct from regular colors with the same RGB', () => {
+    const first = basicTbApi({ assetid: '401', prismaticGems: ['Legacy (61, 104, 196)'], isLegacy: true,
+        legacyRgb: { r: 61, g: 104, b: 196 }, legacyPricing: { isDupe: false, dupeCount: 0 }, priceCents: 99999 });
+    const second = basicTbApi({ assetid: '402', prismaticGems: ['Legacy (61, 104, 195)'], isLegacy: true,
+        legacyRgb: { r: 61, g: 104, b: 195 }, legacyPricing: { isDupe: false, dupeCount: 0 }, priceCents: 88888 });
+    const index = buildIndex([first, second, basicTbApi()], OWNER);
+    const description = tbDescription({ name: 'Legacy (61, 104, 196)' });
+    assert.deepEqual(getPrice(index, item(null, description.market_hash_name, { description })), { cents: 99999, source: 'variant' });
+    assert.equal(getPrice(index, item(null, 'Fractal Horns of Inner Abysm', { description: tbDescription() })).cents, 11767);
+    assert.equal(variantFingerprint(tbDescription({ name: 'Legacy (61, 104, 196)', rgb: [61, 104, 195] })), null);
+    assert.equal(variantFingerprint({ ...first, legacyRgb: { r: 61, g: 104, b: 195 } }, true), null);
+    assert.equal(variantFingerprint({ ...first, legacyPricing: { isDupe: true, dupeCount: 2 } }, true), null);
+});
+
+test('ambiguous, exceptional, unpriced or incomplete API variants cannot select another matching candidate', () => {
+    const offered = item(null, 'Fractal Horns of Inner Abysm', { description: tbDescription() });
+    for (const exceptional of [
+        { priceCents: 9000 }, { priceCents: null }, { isOtherBug: true }, { allStylesUnlocked: true },
+        { styleTotal: 2 }, { favored: undefined }, { isLegacy: undefined }, { rawTags: undefined }, { assetQuality: undefined },
+        { etherealGems: ['Ethereal Flame'] },
+        { etherealGems: ['Orbital Decay'] }, { kineticGems: ['Fireborn Assault'] }, { gems: ['Unknown Rune'] }, { unusualEffectGems: undefined },
+        { emptySockets: 1 }, { tradable: false }
+    ]) {
+        const index = buildIndex([basicTbApi(), basicTbApi({ assetid: '401', ...exceptional })], OWNER);
+        assert.equal(getPrice(index, offered).cents, null, JSON.stringify(exceptional));
+    }
+    const samePrice = buildIndex([basicTbApi(), basicTbApi({ assetid: '401' })], OWNER);
+    assert.equal(getPrice(samePrice, offered).cents, 11767);
+    const missing = basicTbApi(); delete missing.favored;
+    assert.equal(variantFingerprint(missing, true), null);
+    assert.equal(variantFingerprint(tbDescription({ quality: 'inscribed' })), null);
+});
+
+test('unknown occupied sockets, ethereal effects, styles and unsupported couriers remain unpriced', () => {
+    const index = buildIndex([basicTbApi()], OWNER);
+    for (const extraHtml of [
+        '<div style="background-image:url(https://cdn.steamstatic.com/apps/570/icons/econ/sockets/gem_effect.hash.png)"><span>Ethereal Flame</span><br><span>Ethereal Gem</span></div>',
+        '<div style="background-image:url(https://cdn.steamstatic.com/apps/570/icons/econ/sockets/gem_rune.hash.png)">Unparsed rune</div>',
+        '<div>Styles unlocked: 2</div>',
+        '<div style="background-image:url(https://cdn.steamstatic.com/apps/570/icons/econ/sockets/gem_empty.hash.png)">Empty socket</div>'
+    ]) {
+        assert.equal(getPrice(index, item(null, 'Fractal Horns of Inner Abysm', { description: tbDescription({ extraHtml }) })).cents, null);
+    }
+    const courier = { ...tbDescription(), market_hash_name: 'Platinum Baby Roshan' };
+    assert.equal(variantFingerprint(courier), null);
+    assert.equal(getPrice(index, item(null, 'Platinum Baby Roshan', { description: courier })).cents, null);
+    assert.equal(getPrice(index, item(null, 'Sword', { variantFingerprint: variantFingerprint(tbDescription()) })).cents, null);
+    assert.equal(getPrice(index, item(null, 'Exalted Fractal Horns of Inner Abysm', { variantFingerprint: variantFingerprint(tbDescription()) })).cents, null);
+    assert.equal(getPrice(index, item(null, 'Fractal Horns of Inner Abysm', { variantFingerprint: '["tb-v1","standard","regular",1,2,3]' })).cents, null);
 });
