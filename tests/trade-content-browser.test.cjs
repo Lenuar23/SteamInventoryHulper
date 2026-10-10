@@ -238,7 +238,7 @@ test('unresolved empty offer details remain incomplete until the native snapshot
     const snapshot = editorSnapshot();
     snapshot.offersComplete = { me: false, them: false };
     const page = await openFixture(t, { snapshot });
-    assert.match(await role(page, 'net').textContent(), /Known difference.*\$0\.00/);
+    assert.equal(await role(page, 'net').textContent(), 'Known difference: Unavailable');
     assert.doesNotMatch(await role(page, 'net').textContent(), /Even|Net gain|Net loss/);
     assert.match(await role(page, 'status').textContent(), /Trade item details are incomplete/);
     await sendSnapshot(page, { ...snapshot, offersComplete: { me: true, them: true } });
@@ -534,8 +534,9 @@ test('a failed class inventory lookup keeps exact trade totals and manual retry 
     assert.equal(calls.filter(call => call.url === ownInventoryUrl).length, 2);
     assert.equal(calls.filter(call => call.url === partnerInventoryUrl).length, 1, 'successful partner classes are cached');
     assert.ok(calls.every(call => call.method === 'GET'));
-    assert.equal(await page.evaluate(() => window.__chromeRequests.filter(request => request.action === 'fetchPrices').length), 2,
-        'retrying native class descriptions must reuse both owners’ valid Steamprice prices');
+    const priceRequests = await page.evaluate(() => window.__chromeRequests.filter(request => request.action === 'fetchPrices'));
+    assert.equal(priceRequests.length, 4, 'the shared Retry button refreshes prices for both owners');
+    assert.ok(priceRequests.slice(2).every(request => request.force === true));
 });
 
 test('Fast accept sends one authenticated request only after a trusted user click', async t => {
@@ -641,4 +642,164 @@ test('Fast accept reports a missing Steam session without sending a request', as
     await waitText(acceptStatus(page), 'The Steam session is unavailable. Reload this page and sign in.');
     assert.equal(await fastAccept(page).isEnabled(), true);
     assert.deepEqual(await page.evaluate(() => window.__fetchRequests), []);
+});
+
+const SAVED_CACHE_AT = Date.UTC(2026, 9, 9, 12, 34);
+const CACHE_HTTP_ERROR = 'Steamprice returned HTTP 502.';
+const cachedReply = data => ({ success: true, data, cached: true, cachedAt: SAVED_CACHE_AT, error: CACHE_HTTP_ERROR });
+
+test('saved prices and inventory totals for both trade owners stay visible and forced retry replaces their cache notices', async t => {
+    const savedMine = cachedReply({ totalValueCents: '12345' });
+    const savedTheirs = cachedReply({ totalValueCents: '67890' });
+    const page = await openFixture(t, { plans: {
+        [`${OWNER}:fetchPrices`]: [cachedReply({ items: DEFAULT_PRICES[OWNER] }),
+            { success: true, data: { items: [{ assetid: '100', marketHashName: 'Shared Item', priceCents: 350 }] } }],
+        [`${PARTNER}:fetchPrices`]: [cachedReply({ items: DEFAULT_PRICES[PARTNER] }),
+            { success: true, data: { items: [{ assetid: '100', marketHashName: 'Shared Item', priceCents: 1000 }] } }],
+        [`${OWNER}:fetchProfile`]: [savedMine, { success: true, data: { totalValueCents: 15000 } }],
+        [`${PARTNER}:fetchProfile`]: [savedTheirs, { success: true, data: { totalValueCents: 70000 } }]
+    } });
+    await waitText(badge(page, 'me', '100'), '$5.00');
+    await waitText(badge(page, 'them', '100'), '$9.00');
+    await page.waitForFunction(() => document.querySelector('[data-role="inventory-me"]')?.textContent.includes('(cached)') &&
+        document.querySelector('[data-role="inventory-them"]')?.textContent.includes('(cached)'));
+    assert.match(await panel(page).locator('[data-role="inventory-me"]').textContent(), /\$123\.45.*\(cached\)/);
+    assert.match(await panel(page).locator('[data-role="inventory-them"]').textContent(), /\$678\.90.*\(cached\)/);
+    assert.match(await role(page, 'status').textContent(), /Cached prices.*2026/);
+    assert.match(await role(page, 'status').textContent(), /HTTP 502/);
+    assert.match(await badge(page, 'me', '100').getAttribute('title'), /Cached/i);
+    assert.equal(await page.locator('#sih-lite-trade-retry').isVisible(), true);
+    const before = await page.evaluate(() => window.__chromeRequests.length);
+    await page.locator('#sih-lite-trade-retry').click();
+    await waitText(badge(page, 'me', '100'), '$7.00');
+    await waitText(badge(page, 'them', '100'), '$10.00');
+    await page.waitForFunction(() => document.querySelector('[data-role="inventory-me"]')?.textContent.includes('$150.00') &&
+        document.querySelector('[data-role="inventory-them"]')?.textContent.includes('$700.00'));
+    assert.equal(await role(page, 'net').textContent(), 'Net gain: +$3.00');
+    const forced = await page.evaluate(start => window.__chromeRequests.slice(start), before);
+    for (const id of [OWNER, PARTNER]) for (const action of ['fetchPrices', 'fetchProfile']) {
+        assert.ok(forced.some(request => request.steamId === id && request.action === action && request.force === true));
+    }
+    assert.doesNotMatch(await role(page, 'status').textContent(), /Cached|HTTP 502/);
+    assert.doesNotMatch(await panel(page).textContent(), /\(cached\)|HTTP 502/);
+    assert.doesNotMatch(await badge(page, 'me', '100').getAttribute('title') || '', /Cached/i);
+});
+
+test('a failed forced trade price refresh retains the saved owner values and never overwrites the partner map', async t => {
+    const savedTotal = cachedReply({ totalValueCents: '12345' });
+    const page = await openFixture(t, { plans: {
+        [`${OWNER}:fetchPrices`]: [cachedReply({ items: DEFAULT_PRICES[OWNER] }), { success: false, error: CACHE_HTTP_ERROR }],
+        [`${OWNER}:fetchProfile`]: [savedTotal, { success: false, error: CACHE_HTTP_ERROR }]
+    } });
+    await waitText(badge(page, 'me', '100'), '$5.00');
+    await waitText(badge(page, 'them', '100'), '$9.00');
+    await page.waitForFunction(() => document.querySelector('[data-role="inventory-me"]')?.textContent.includes('(cached)'));
+    await page.locator('#sih-lite-trade-retry').click();
+    await page.waitForFunction(owner => window.__chromeRequests.some(request => request.steamId === owner && request.action === 'fetchPrices' && request.force), OWNER);
+    await frames(page);
+    assert.equal(await badge(page, 'me', '100').textContent(), '$5.00');
+    assert.equal(await badge(page, 'them', '100').textContent(), '$9.00');
+    assert.equal(await role(page, 'net').textContent(), 'Net gain: +$4.00');
+    assert.match(await role(page, 'status').textContent(), /HTTP 502/);
+    assert.match(await panel(page).locator('[data-role="inventory-me"]').textContent(), /\$123\.45/);
+    assert.match(await panel(page).locator('[data-role="inventory-them"]').textContent(), /\$678\.90/);
+    assert.match(await badge(page, 'me', '100').getAttribute('title'), /Cached/i);
+    assert.equal(await page.locator('#sih-lite-trade-retry').isVisible(), true);
+    const partnerRequests = await page.evaluate(partner => window.__chromeRequests.filter(request => request.steamId === partner && request.action === 'fetchPrices'), PARTNER);
+    assert.equal(partnerRequests.length, 2);
+    assert.equal(partnerRequests[1].force, true);
+});
+
+test('uncached HTTP 502 leaves trade values partial after forced retry and never declares a fictitious gain', async t => {
+    const page = await openFixture(t, { plans: {
+        [`${OWNER}:fetchPrices`]: [{ success: false, error: CACHE_HTTP_ERROR }],
+        [`${OWNER}:fetchProfile`]: [{ success: false, error: CACHE_HTTP_ERROR }]
+    } });
+    await waitText(badge(page, 'them', '100'), '$9.00');
+    await page.waitForFunction(() => document.querySelector('#sih-lite-trade-inventory-panel')?.textContent.includes('HTTP 502'));
+    assert.equal(await badge(page, 'me', '100').count(), 0);
+    assert.match(await panel(page).locator('[data-role="inventory-me"]').textContent(), /Unavailable/);
+    assert.match(await role(page, 'net').textContent(), /Known difference/);
+    assert.doesNotMatch(await role(page, 'net').textContent(), /Net gain|Net loss|Even/);
+    await page.locator('#sih-lite-trade-retry').click();
+    await page.waitForFunction(owner => window.__chromeRequests.filter(request => request.steamId === owner && request.force).length >= 2, OWNER);
+    await frames(page);
+    assert.equal(await badge(page, 'me', '100').count(), 0);
+    assert.equal(await badge(page, 'them', '100').textContent(), '$9.00');
+    assert.match(await role(page, 'status').textContent(), /HTTP 502/);
+    assert.match(await role(page, 'net').textContent(), /Known difference/);
+    assert.doesNotMatch(await role(page, 'net').textContent(), /Net gain|Net loss|Even/);
+    assert.doesNotMatch(await role(page, 'status').textContent(), /Cached/);
+});
+
+test('offer-list cache notices expose retry and refreshing cached owners preserves direction and never accepts a trade', async t => {
+    const page = await openList(t, { plans: {
+        [`${OWNER}:fetchPrices`]: [cachedReply({ items: DEFAULT_PRICES[OWNER] }),
+            { success: true, data: { items: [{ assetid: '100', marketHashName: 'Shared Item', priceCents: 350 }] } }],
+        [`${PARTNER}:fetchPrices`]: [cachedReply({ items: DEFAULT_PRICES[PARTNER] }),
+            { success: true, data: { items: [{ assetid: '100', marketHashName: 'Shared Item', priceCents: 1000 }] } }]
+    } });
+    await waitText(listBadge(page, 'give'), '$5.00');
+    await waitText(listBadge(page, 'receive'), '$9.00');
+    assert.match(await offerSummary(page).locator('[data-role="status"]').textContent(), /Cached prices.*2026/);
+    assert.match(await listBadge(page, 'give').getAttribute('title'), /Cached/i);
+    const retry = offerSummary(page).locator('.sih-lite-trade-retry');
+    assert.equal(await retry.isVisible(), true);
+    await retry.click();
+    await waitText(listBadge(page, 'give'), '$7.00');
+    await waitText(listBadge(page, 'receive'), '$10.00');
+    assert.equal(await offerSummary(page).locator('[data-role="net"]').textContent(), 'Net gain: +$3.00');
+    assert.doesNotMatch(await offerSummary(page).locator('[data-role="status"]').textContent(), /Cached|HTTP 502/);
+    const forced = await page.evaluate(() => window.__chromeRequests.filter(request => request.force));
+    assert.deepEqual(forced.filter(request => request.action === 'fetchPrices').map(request => request.steamId).sort(), [OWNER, PARTNER].sort());
+    assert.deepEqual(await page.evaluate(() => window.__fetchRequests), []);
+});
+
+test('sent offers without native asset status use exact public class descriptions for ordinary prices and leave socketed variants unknown', async t => {
+    const snapshot = listSnapshot([listOffer('501', { incoming: false,
+        give: [
+            item(OWNER, null, '', '2', { classId: '1000', instanceId: '0' }),
+            item(OWNER, null, '', '1', { classId: '1001', instanceId: '0' })
+        ],
+        receive: [item(PARTNER, null, '', '1', { classId: '2000', instanceId: '0' })]
+    })]);
+    const hover = description => `<script>BuildHover('economy_item_fixture', ${JSON.stringify(description)});</script>`;
+    const gemHtml = '<div style="background-image:url(https://cdn.steamstatic.com/apps/570/icons/econ/sockets/gem_color.hash.png)"></div>' +
+        '<span style="color:rgb(61, 104, 196)">Deep Blue</span><br><span>Prismatic Gem</span>';
+    const page = await openList(t, { snapshot, sent: true, prices: {
+        [OWNER]: [
+            { assetid: '102', marketHashName: 'Ordinary Item', priceCents: 125 },
+            // A cached API row without gem metadata must not price a different
+            // socketed variant that shares this ordinary-looking name.
+            { assetid: '999', marketHashName: 'Socketed Hat', priceCents: 60000 }
+        ],
+        [PARTNER]: [{ assetid: '103', marketHashName: 'Partner Item', priceCents: 200 }]
+    }, fetchPlans: {
+        'https://steamcommunity.com/tradeoffer/501/': [{ text: `<script>var g_steamID = '${OWNER}';
+            var g_ulTradePartnerSteamID = '${PARTNER}';</script><div>This offer has no editable native trade status.</div>` }],
+        'https://steamcommunity.com/economy/itemclasshover/570/1000/0?content_only=1&l=english': [{ text: hover({
+            appid: 570, classid: '1000', instanceid: '0', market_hash_name: 'Ordinary Item'
+        }) }],
+        'https://steamcommunity.com/economy/itemclasshover/570/1001/0?content_only=1&l=english': [{ text: hover({
+            appid: 570, classid: '1001', instanceid: '0', market_hash_name: 'Socketed Hat',
+            descriptions: [{ type: 'html', value: gemHtml }]
+        }) }],
+        'https://steamcommunity.com/economy/itemclasshover/570/2000/0?content_only=1&l=english': [{ text: hover({
+            appid: 570, classid: '2000', instanceid: '0', market_hash_name: 'Partner Item'
+        }) }]
+    } });
+    await waitText(listBadge(page, 'give', 0, '501'), '$2.50');
+    await waitText(listBadge(page, 'receive', 0, '501'), '$2.00');
+    assert.equal(await listBadge(page, 'give', 1, '501').count(), 0);
+    assert.equal(await offerSummary(page, '501').locator('[data-role="give"]').textContent(), 'You give: $2.50 (known)');
+    assert.equal(await offerSummary(page, '501').locator('[data-role="net"]').textContent(), 'Known difference: −$0.50');
+    assert.match(await offerSummary(page, '501').locator('[data-role="status"]').textContent(), /Partial valuation/);
+    assert.doesNotMatch(await offerSummary(page, '501').locator('[data-role="net"]').textContent(), /Net gain|Net loss|Even/);
+    assert.equal(await fastAccept(page, '501').count(), 0);
+    const nativeKeys = await page.locator('#tradeofferid_501 .trade_item').evaluateAll(elements => elements.map(element => element.getAttribute('data-economy-item')));
+    assert.ok(nativeKeys.every(key => key.startsWith('classinfo/')), 'class metadata must not invent native asset IDs');
+    const calls = await page.evaluate(() => window.__fetchRequests);
+    assert.equal(calls.length, 4);
+    assert.equal(calls.filter(call => call.url.includes('/economy/itemclasshover/')).length, 3);
+    assert.ok(calls.every(call => call.method === 'GET'));
 });

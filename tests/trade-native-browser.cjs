@@ -172,6 +172,8 @@ const HTML = `<!doctype html><html><head><style>
     assert.equal(initial.owners.them.steamId, THEM);
     assert.equal(initial.active.side, 'me');
     assert.equal(initial.active.supported, true);
+    assert.deepEqual(initial.offers, { me: [], them: [] }, 'Prototype array methods are not offered records');
+    assert.deepEqual(initial.offersComplete, { me: true, them: true });
     assert.equal(initial.inventories.find(inventory => inventory.side === 'me').items.length, 40);
     assert.equal(initial.inventories.find(inventory => inventory.side === 'them').items.length, 37);
     const firstSort = await sort('me', 'desc', 'me-desc');
@@ -385,6 +387,10 @@ const HTML = `<!doctype html><html><head><style>
     await page.evaluate(() => fixtureInventories.them.rgInventory['3000'].element.dispatchEvent(
       new MouseEvent('dblclick', { bubbles: true, cancelable: true })));
     await page.locator('#sih-lite-trade-editor-summary [data-role="receive"]').filter({ hasText: '$0.00' }).waitFor();
+    const removed = await editor();
+    assert.deepEqual(removed.offers, { me: [], them: [] });
+    assert.deepEqual(removed.offersComplete, { me: true, them: true });
+    assert.equal(await page.locator('#their_slots .item').count(), 0);
     await page.evaluate(() => TradePageSelectInventory(UserYou, 570, '2'));
     await page.locator('#sih-lite-trade-inventory-panel [data-role="active-inventory"]').filter({ hasText: 'Sort your inventory:' }).waitFor();
     await page.locator('#sih-lite-trade-inventory-panel [data-trade-order="desc"]').click();

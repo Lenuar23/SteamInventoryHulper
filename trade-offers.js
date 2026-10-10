@@ -4,6 +4,7 @@
   const STEAM_ID = /^7656119\d{10}$/;
   const NUMBER_ID = /^[1-9]\d{0,19}$/;
   const STEAM_ID_BASE = 76561197960265728n;
+  const Gems = globalThis.SIHLiteGems || (typeof require === 'function' ? require('./gems.js') : null);
 
   function steamId(value) {
     if (typeof value === 'number') return null;
@@ -122,6 +123,23 @@
 
   function applyDetails(offer, details, meSteamId) {
     if (!details || details.offerId !== offer.offerId || details.meSteamId !== meSteamId || details.partnerSteamId !== offer.partnerSteamId) return offer;
+    if (Array.isArray(details.classItems)) {
+      for (const slot of offer.slots) {
+        const old = slot.item;
+        if (!old?.classId || old.instanceId == null) continue;
+        const metadata = details.classItems.find(item => item.ownerSteamId === old.ownerSteamId && item.appId === old.appId && item.classId === old.classId && item.instanceId === old.instanceId);
+        if (!metadata) continue;
+        const item = normalizeItem({ ...old, market_hash_name: metadata.market_hash_name,
+          hasGems: old.hasGems || metadata.hasGems, hasColoredGem: old.hasColoredGem || metadata.hasColoredGem }, old.ownerSteamId);
+        if (!item) continue;
+        // Class hovers do not carry a context. Leave it unknown rather than
+        // representing a verified Dota class as an explicit invalid context.
+        if (item.contextId == null) delete item.contextId;
+        slot.item = item;
+        const index = offer[slot.side].indexOf(old);
+        if (index !== -1) offer[slot.side][index] = item;
+      }
+    }
     for (const side of ['give', 'receive']) {
       const owner = side === 'give' ? meSteamId : offer.partnerSteamId;
       const items = (details[side] || []).map(item => normalizeItem(item, owner));
@@ -195,14 +213,83 @@
     return offers;
   }
 
+  function readStringLiteral(source, start) {
+    const quote = source[start];
+    if (quote !== '"' && quote !== "'") return null;
+    let value = '';
+    for (let index = start + 1; index < source.length; index++) {
+      const char = source[index];
+      if (char === quote) return { value, end: index + 1 };
+      if (char === '\n' || char === '\r') return null;
+      if (char !== '\\') { value += char; continue; }
+      const escaped = source[++index];
+      if (escaped == null) return null;
+      const simple = { n: '\n', r: '\r', t: '\t', b: '\b', f: '\f', v: '\v', '0': '\0' };
+      if (Object.hasOwn(simple, escaped)) value += simple[escaped];
+      else if (escaped === 'u' || escaped === 'x') {
+        const count = escaped === 'u' ? 4 : 2;
+        const hex = source.slice(index + 1, index + 1 + count);
+        if (!new RegExp(`^[a-fA-F0-9]{${count}}$`).test(hex)) return null;
+        value += String.fromCharCode(parseInt(hex, 16));
+        index += count;
+      } else if (escaped === '\n') { /* JavaScript line continuation. */ }
+      else if (escaped === '\r') { if (source[index + 1] === '\n') index++; }
+      else if (/[1-9]/.test(escaped)) return null;
+      else value += escaped;
+    }
+    return null;
+  }
+
+  function inlineScripts(html) {
+    const scripts = [];
+    const expression = /<script\b([^>]*)>([\s\S]*?)<\/script\s*>/gi;
+    let match;
+    while ((match = expression.exec(html))) {
+      if (!/\bsrc\s*=/i.test(match[1])) scripts.push(match[2]);
+    }
+    return scripts.join('\n');
+  }
+
+  function codeOffset(source, target) {
+    for (let index = 0; index < target; index++) {
+      const char = source[index];
+      if (char === '"' || char === "'" || char === '`') {
+        const quote = char;
+        while (++index < source.length) {
+          if (source[index] === '\\') index++;
+          else if (source[index] === quote) break;
+        }
+        if (index >= target) return false;
+      } else if (char === '/' && source[index + 1] === '/') {
+        while (++index < source.length && source[index] !== '\n') { /* Skip comment. */ }
+        if (index >= target) return false;
+      } else if (char === '/' && source[index + 1] === '*') {
+        const end = source.indexOf('*/', index + 2);
+        if (end === -1 || end + 1 >= target) return false;
+        index = end + 1;
+      }
+    }
+    return true;
+  }
+
   // Locate JSON assignments without executing any code from the fetched page.
   function readAssignment(html, name) {
     const expression = new RegExp(`(?:\\bvar\\s+|\\blet\\s+|\\bconst\\s+|\\b)${name}\\s*=\\s*`, 'g');
     let match;
     while ((match = expression.exec(html))) {
+      if (!codeOffset(html, match.index)) continue;
       let start = expression.lastIndex;
       const opening = html[start];
-      if (opening !== '{' && opening !== '[') continue;
+      if (opening !== '{' && opening !== '[') {
+        const call = html.slice(start).match(/^(?:JSON\.parse|\$J\.parseJSON|jQuery\.parseJSON)\s*\(\s*/);
+        if (call) {
+          const literal = readStringLiteral(html, start + call[0].length);
+          if (literal && /^\s*\)/.test(html.slice(literal.end))) {
+            try { return JSON.parse(literal.value); } catch (_) { /* Try a later literal assignment. */ }
+          }
+        }
+        continue;
+      }
       const stack = [opening];
       let quoted = false;
       let escaped = false;
@@ -229,18 +316,135 @@
   }
 
   function scalarId(html, name) {
-    const match = html.match(new RegExp(`\\b${name}\\s*=\\s*['\"]?(\\d{1,20})['\"]?\\s*[;,]`));
-    return steamId(match?.[1]);
+    const expression = new RegExp(`\\b${name}\\s*=\\s*['\"]?(\\d{1,20})['\"]?\\s*[;,]`, 'g');
+    let match;
+    while ((match = expression.exec(html))) {
+      if (codeOffset(html, match.index)) return steamId(match[1]);
+    }
+    return null;
+  }
+
+  function nativeUserId(source, user) {
+    const expression = new RegExp(`\\b${user}\\.SetSteamId\\s*\\(\\s*`, 'g');
+    let match;
+    while ((match = expression.exec(source))) {
+      if (!codeOffset(source, match.index)) continue;
+      const literal = readStringLiteral(source, expression.lastIndex);
+      if (literal && /^\s*\)/.test(source.slice(literal.end))) {
+        const id = steamId(literal.value);
+        if (id) return id;
+      }
+    }
+    return null;
+  }
+
+  function beginOfferId(source) {
+    const expression = /\bBeginTradeOffer\s*\(\s*([^,)]+)\s*[,)]/g;
+    let call;
+    while ((call = expression.exec(source))) if (codeOffset(source, call.index)) break;
+    if (!call) return null;
+    const argument = call[1].trim();
+    const literal = readStringLiteral(argument, 0);
+    if (literal && literal.end === argument.length) return numericId(literal.value);
+    if (/^\d+$/.test(argument)) return numericId(argument);
+    if (!/^[a-zA-Z_$][\w$]*$/.test(argument)) return null;
+    const assignments = new RegExp(`\\b${argument.replace(/\$/g, '\\$')}\\s*=\\s*['\"]?(\\d{1,20})['\"]?\\s*[;,]`, 'g');
+    let assignment;
+    while ((assignment = assignments.exec(source))) if (codeOffset(source, assignment.index)) return numericId(assignment[1]);
+    return null;
   }
 
   function stringAssignment(html, name) {
-    const match = html.match(new RegExp(`\\b${name}\\s*=\\s*("(?:[^"\\\\]|\\\\.)*"|'(?:[^'\\\\]|\\\\.)*')\\s*[;,]`));
-    if (!match) return null;
-    if (match[1][0] === '"') {
-      try { return JSON.parse(match[1]); } catch (_) { return null; }
+    const source = inlineScripts(html);
+    const expression = new RegExp(`\\b${name}\\s*=\\s*`, 'g');
+    let match;
+    while ((match = expression.exec(source))) {
+      if (!codeOffset(source, match.index)) continue;
+      const literal = readStringLiteral(source, expression.lastIndex);
+      if (literal && /^\s*[;,]/.test(source.slice(literal.end))) return literal.value;
     }
-    // Native Steam uses plain quoted strings for IDs and legacy URLs.
-    return match[1].slice(1, -1).replace(/\\(['\\/])/g, '$1');
+    return null;
+  }
+
+  function parseClassDescription(html, appId, classId, instanceId) {
+    if (typeof html !== 'string' || html.length > 1_000_000) throw new Error('Steam returned an invalid item description.');
+    const source = inlineScripts(html);
+    const expression = /\bBuildHover\s*\(\s*/g;
+    let match;
+    while ((match = expression.exec(source))) {
+      if (!codeOffset(source, match.index)) continue;
+      const prefix = readStringLiteral(source, expression.lastIndex);
+      if (!prefix) continue;
+      const comma = source.slice(prefix.end).match(/^\s*,\s*/);
+      if (!comma) continue;
+      const value = readAssignment('var sihDescription = ' + source.slice(prefix.end + comma[0].length), 'sihDescription');
+      if (value && String(value.appid) === appId && String(value.classid) === classId && String(value.instanceid) === instanceId) return value;
+    }
+    throw new Error('Steam did not return the requested item description.');
+  }
+
+  const classDescriptions = new Map();
+  const classRequestQueue = [];
+  let runningClassRequests = 0;
+
+  function scheduleClassRequest(operation) {
+    return new Promise((resolve, reject) => {
+      classRequestQueue.push({ operation, resolve, reject });
+      function pump() {
+        while (runningClassRequests < 3 && classRequestQueue.length) {
+          const task = classRequestQueue.shift();
+          runningClassRequests++;
+          Promise.resolve().then(task.operation).then(task.resolve, task.reject).finally(() => { runningClassRequests--; pump(); });
+        }
+      }
+      pump();
+    });
+  }
+
+  async function fetchClassDescriptions(offer, expectedMeSteamId, fetchImpl = globalThis.fetch) {
+    const offerId = numericId(offer?.offerId);
+    const meSteamId = steamId(offer?.meSteamId);
+    const partnerSteamId = steamId(offer?.partnerSteamId);
+    if (!offerId || !meSteamId || meSteamId !== steamId(expectedMeSteamId) || !partnerSteamId || partnerSteamId === meSteamId) throw new Error('Invalid trade offer.');
+    const items = [...(offer.give || []), ...(offer.receive || [])].filter(item => item?.appId === '570' &&
+      [meSteamId, partnerSteamId].includes(item.ownerSteamId) && numericId(item.classId) && /^\d{1,20}$/.test(String(item.instanceId)));
+    const metadata = [];
+    let next = 0;
+    let failed = false;
+    async function worker() {
+      while (next < items.length) {
+        const item = items[next++];
+        const key = `${item.appId}:${item.classId}:${item.instanceId}`;
+        let pending = classDescriptions.get(key);
+        if (!pending) {
+          pending = scheduleClassRequest(async () => {
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), 20000);
+            try {
+              const url = `https://steamcommunity.com/economy/itemclasshover/${item.appId}/${item.classId}/${item.instanceId}?content_only=1&l=english`;
+              const response = await fetchImpl(url, { credentials: 'include', signal: controller.signal });
+              if (!response.ok) throw new Error('Steam item descriptions are unavailable.');
+              return parseClassDescription(await response.text(), item.appId, item.classId, item.instanceId);
+            } finally { clearTimeout(timer); }
+          });
+          classDescriptions.set(key, pending);
+          pending.catch(() => { if (classDescriptions.get(key) === pending) classDescriptions.delete(key); });
+        }
+        try {
+          const description = await pending;
+          const gems = Gems?.analyzeSteamAsset(description);
+          // Class metadata supplies names and variant flags only. The caller
+          // keeps ownership and asset IDs from its already verified native DOM.
+          metadata.push({ ownerSteamId: item.ownerSteamId, appId: item.appId, classId: item.classId, instanceId: item.instanceId,
+            market_hash_name: typeof description.market_hash_name === 'string' ? description.market_hash_name.slice(0, 512) : '',
+            hasGems: Boolean(gems?.hasGems), hasColoredGem: Boolean(gems?.hasColoredGem) });
+        } catch (_) { failed = true; }
+      }
+    }
+    await Promise.all([worker(), worker(), worker()]);
+    const result = { offerId, meSteamId, partnerSteamId, classItems: metadata };
+    if (failed) result.classError = 'Some item descriptions are unavailable. Only known item prices can be shown.';
+    return result;
   }
 
   const classInventories = new Map();
@@ -293,7 +497,7 @@
       if (asset.contextid != null && String(asset.contextid) !== contextId) continue;
       const description = descriptions.get(`${asset.classid}_${asset.instanceid}`);
       const value = { ...asset, ownerSteamId: owner, appId, contextId, assetId: key, description: description || asset };
-      const gemInfo = globalThis.SIHLiteGems?.analyzeSteamAsset(value);
+      const gemInfo = Gems?.analyzeSteamAsset(value);
       if (gemInfo?.hasGems) value.hasGems = true;
       if (gemInfo?.hasColoredGem) value.hasColoredGem = true;
       const item = normalizeItem(value, owner);
@@ -343,16 +547,35 @@
     }
   }
 
-  function parseDetails(html, expectedOfferId, expectedOwner) {
+  function parseDetails(html, expectedOfferId, expectedOwner, responseUrl = null) {
     const offerId = numericId(expectedOfferId);
     const meSteamId = steamId(expectedOwner);
     if (!offerId || !meSteamId || typeof html !== 'string' || html.length > 8_000_000) throw new Error('Invalid trade offer details.');
-    // Require the same authenticated owner and the requested native offer ID.
-    const pageOwner = scalarId(html, 'g_steamID') || scalarId(html, 'g_ulSteamID');
-    const begin = html.match(/\bBeginTradeOffer\s*\(\s*['"]?(\d+)['"]?\s*[,)]/);
-    const partnerSteamId = scalarId(html, 'g_ulTradePartnerSteamID');
-    const status = readAssignment(html, 'g_rgCurrentTradeStatus');
-    if (pageOwner !== meSteamId || begin?.[1] !== offerId || !partnerSteamId || partnerSteamId === meSteamId || !status || !Array.isArray(status.me?.assets) || !Array.isArray(status.them?.assets)) throw new Error('Steam did not return this trade offer for the signed-in account.');
+    let verifiedUrl = false;
+    if (responseUrl) {
+      let url;
+      try { url = new URL(responseUrl); } catch (_) { throw new Error('Steam returned an invalid trade offer address.'); }
+      if (url.origin === 'https://steamcommunity.com' && /^\/login(?:\/|$)/.test(url.pathname)) throw new Error('Sign in to Steam again to load trade item details.');
+      if (url.origin !== 'https://steamcommunity.com' || url.username || url.password || url.hash || !new RegExp(`^/tradeoffer/${offerId}/?$`).test(url.pathname)) throw new Error('Steam redirected to a different page instead of this trade offer.');
+      verifiedUrl = true;
+    }
+    // Steam initializes the native users with SetSteamId even when its global
+    // header identity is omitted from the offer popup's bootstrap.
+    const source = inlineScripts(html);
+    const headerOwner = scalarId(source, 'g_steamID') || scalarId(source, 'g_ulSteamID');
+    const nativeOwner = nativeUserId(source, 'UserYou');
+    const pageOwner = nativeOwner || headerOwner;
+    const globalPartner = scalarId(source, 'g_ulTradePartnerSteamID');
+    const nativePartner = nativeUserId(source, 'UserThem');
+    const partnerSteamId = nativePartner || globalPartner;
+    const begin = beginOfferId(source);
+    const status = readAssignment(source, 'g_rgCurrentTradeStatus');
+    if ((headerOwner && nativeOwner && headerOwner !== nativeOwner) || (globalPartner && nativePartner && globalPartner !== nativePartner)) throw new Error('Steam returned inconsistent account details. Reload the trade offers page.');
+    if (pageOwner && pageOwner !== meSteamId) throw new Error('The Steam account changed. Reload the trade offers page.');
+    if (begin && begin !== offerId) throw new Error('Steam returned a different trade offer. Reload the trade offers page.');
+    if (!pageOwner && /data-featuretarget\s*=\s*['"]login['"]|class\s*=\s*['"][^'"]*login_featuretarget_ctn/i.test(html)) throw new Error('Sign in to Steam again to load trade item details.');
+    if (!status || !Array.isArray(status.me?.assets) || !Array.isArray(status.them?.assets)) throw new Error('Steam did not provide item details for this offer.');
+    if (!pageOwner || !partnerSteamId || partnerSteamId === meSteamId || (!begin && !verifiedUrl)) throw new Error('Steam returned an unsupported trade offer page.');
     const normalize = (assets, owner) => assets.map(value => {
       const item = normalizeItem(value, owner);
       if (!item?.assetId || !item.contextId) throw new Error('Steam returned incomplete trade items.');
@@ -376,7 +599,7 @@
       const response = await fetchImpl(`https://steamcommunity.com/tradeoffer/${offerId}/`, { credentials: 'include', signal: controller.signal });
       if (!response.ok) throw new Error(`Steam returned HTTP ${response.status} for this trade offer.`);
       const html = await response.text();
-      const details = parseDetails(html, String(offerId), String(meSteamId));
+      const details = parseDetails(html, String(offerId), String(meSteamId), response.url || null);
       const descriptions = await Promise.allSettled([
         describeAssets(html, details, details.give, details.meSteamId, fetchImpl, controller.signal),
         describeAssets(html, details, details.receive, details.partnerSteamId, fetchImpl, controller.signal)
@@ -390,7 +613,7 @@
     } finally { clearTimeout(timer); }
   }
 
-  const api = { read, applyDetails, fetchDetails, parseDetails, parseEconomyKey, normalizeItem, steamId, accountSteamId };
+  const api = { read, applyDetails, fetchDetails, fetchClassDescriptions, parseDetails, parseClassDescription, parseEconomyKey, normalizeItem, steamId, accountSteamId };
   globalThis.SIHLiteTradeOffers = api;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
 })();

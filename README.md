@@ -27,7 +27,11 @@ Requires Chrome/Chromium 111+ or a compatible browser with Manifest V3 support. 
 
 Once prices have loaded, click **Price ↓** or **Price ↑**. On the first sort, Steam loads every item through its `LoadCompleteInventory()` method. The panel shows progress, and the buttons remain disabled during loading. Sorting opens the first native inventory page. Subsequent sorts reuse the loaded items.
 
-If Steam fails to load the inventory or limits requests, the extension keeps the previous order and displays an error. Wait a few seconds and click the sort button again. If Steamprice returns an error, **Retry** repeats the failed price or total-value requests. Failed requests produce an error instead of reporting an incomplete inventory as successfully loaded.
+If Steam fails to load the inventory or limits requests, the extension keeps the previous order and displays an error. Wait a few seconds and click the sort button again. **Retry** requests fresh prices and the total value. Failed requests produce an error instead of reporting an incomplete inventory as successfully loaded.
+
+Temporary Steamprice connection failures and HTTP 429, 502, 503, or 504 responses receive up to three GET attempts. At most two Steamprice requests run simultaneously across extension tabs. Successful complete responses are saved locally and reused for 90 seconds to reduce repeated inventory loads. During a temporary outage, a saved response up to 24 hours old can still show prices and sorting, with a **Cached prices** notice and its timestamp. Cached inventory totals are labeled **(cached)**. **Retry** bypasses the fresh cache; a failed refresh keeps the displayed saved values. Saved responses are bounded to six inventory owners and contain no Steam session credentials.
+
+If Steamprice remains unavailable and no valid saved response exists, fresh prices cannot be shown. Trade values appear as **Unavailable** when no offered item has a known price; missing data is not presented as a zero-value trade. These recovery rules apply to inventory pages, trade offers, and both inventories in the trade editor. Acceptance requests are never retried automatically.
 
 Steamprice valuations may be outdated or differ from Steam Market prices. The total value comes directly from the profile API rather than the sum of the displayed items. Item prices are matched by AssetID first, then by name; matching by a cleaned name preserves the previous version's behavior. If Steamprice has no cached inventory, the extension temporarily opens a background tab on the service to trigger a scan, then closes it.
 
@@ -54,6 +58,8 @@ In the trade editor, item prices and both offer totals update as you add or remo
 The panel also shows each owner's full Dota 2 inventory value from Steamprice. These full inventory values are separate from the offered-item totals and do not change when you edit the offer.
 
 Prices are matched to each owner's asset IDs. Ordinary items may use an unambiguous canonical-name fallback; gem-bearing items require their own asset price. Stack quantities multiply the item price. When a price or item identity is unavailable, the extension shows a known subtotal and **Known difference**, with an unpriced-item count. Other games are unpriced and make the overall trade comparison incomplete.
+
+Offer details support Steam's native user initialization and are checked against the signed-in account, offer, and partner. When Steam does not provide exact asset details for a sent or historical offer, verified public class descriptions can still supply ordinary item names. Class descriptions never establish asset IDs or gem premiums; those items stay unpriced until exact details are available.
 
 ### Fast accept
 

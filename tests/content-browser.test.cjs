@@ -681,3 +681,94 @@ test('Russian socket descriptions keep a renamed TB regular native color over ca
     assert.equal(await page.locator('#item570_2_100 img').getAttribute('alt'), asset.description.name);
     assert.equal(await colorLink(page).textContent(), 'View color');
 });
+
+const SAVED_CACHE_AT = Date.UTC(2026, 9, 9, 12, 34);
+const CACHE_HTTP_ERROR = 'Steamprice returned HTTP 502.';
+const cachedReply = data => ({ success: true, data, cached: true, cachedAt: SAVED_CACHE_AT, error: CACHE_HTTP_ERROR });
+
+test('saved inventory prices and total show dated cache notices and a forced retry replaces them with fresh data', async t => {
+    const savedPrices = cachedReply({ items: DEFAULT_ITEMS });
+    const savedTotal = cachedReply({ totalValueCents: '12345' });
+    const freshPrices = { success: true, data: { items: [{ assetid: '100', marketHashName: 'Same Name', priceCents: 300 }] } };
+    const freshTotal = { success: true, data: { totalValueCents: '15000' } };
+    const page = await openFixture(t, { plans: {
+        fetchPrices: [savedPrices, freshPrices],
+        fetchProfile: [savedTotal, freshTotal]
+    } });
+    await waitText(badge(page), '$2.50');
+    await page.waitForFunction(() => document.querySelector('#sih-lite-total-text')?.textContent.includes('(cached)'));
+    assert.match(await page.locator('#sih-lite-total-text').textContent(), /\$123\.45.*\(cached\)/);
+    const status = await page.locator('#sih-lite-status').textContent();
+    assert.match(status, /Cached prices/);
+    assert.match(status, /2026/);
+    assert.equal((status.match(/HTTP 502/g) || []).length, 1, 'the same upstream failure is shown once');
+    assert.match(await badge(page).getAttribute('title'), /Cached/i);
+    assert.equal(await page.locator('#sih-lite-retry').isVisible(), true);
+    const before = await page.evaluate(() => window.__chromeRequests.length);
+    await page.locator('#sih-lite-retry').click();
+    await waitText(badge(page), '$3.00');
+    await waitText(page.locator('#sih-lite-total-text'), 'Dota 2 value: $150.00');
+    const forced = await page.evaluate(start => window.__chromeRequests.slice(start), before);
+    assert.ok(forced.some(request => request.action === 'fetchPrices' && request.force === true));
+    assert.ok(forced.some(request => request.action === 'fetchProfile' && request.force === true));
+    assert.doesNotMatch(await page.locator('#sih-lite-status').textContent(), /Cached|HTTP 502/);
+    assert.doesNotMatch(await badge(page).getAttribute('title') || '', /Cached/i);
+});
+
+test('a failed forced cache refresh retains known item prices and total while keeping retry available', async t => {
+    const savedTotal = cachedReply({ totalValueCents: '12345' });
+    const page = await openFixture(t, { plans: {
+        fetchPrices: [cachedReply({ items: DEFAULT_ITEMS }), { success: false, error: CACHE_HTTP_ERROR }],
+        fetchProfile: [savedTotal, { success: false, error: CACHE_HTTP_ERROR }]
+    } });
+    await waitText(badge(page), '$2.50');
+    await page.waitForFunction(() => document.querySelector('#sih-lite-total-text')?.textContent.includes('(cached)'));
+    await page.locator('#sih-lite-retry').click();
+    await page.waitForFunction(() => window.__chromeRequests.filter(request => request.action === 'fetchPrices' && request.force).length === 1);
+    await settleRender(page);
+    assert.equal(await badge(page).textContent(), '$2.50');
+    assert.match(await page.locator('#sih-lite-total-text').textContent(), /\$123\.45/);
+    assert.match(await page.locator('#sih-lite-status').textContent(), /HTTP 502/);
+    assert.match(await badge(page).getAttribute('title'), /Cached/i);
+    assert.equal(await page.locator('#sih-lite-retry').isVisible(), true);
+});
+
+test('HTTP 502 with no saved inventory data stays unavailable after retry without fabricating zero prices', async t => {
+    const page = await openFixture(t, { plans: {
+        fetchPrices: [{ success: false, error: CACHE_HTTP_ERROR }],
+        fetchProfile: [{ success: false, error: CACHE_HTTP_ERROR }]
+    } });
+    await page.waitForFunction(() => document.querySelector('#sih-lite-status')?.textContent.includes('HTTP 502'));
+    assert.equal(await badge(page).count(), 0);
+    assert.equal(await page.locator('#sih-lite-total-text').textContent(), 'Inventory value unavailable');
+    await page.locator('#sih-lite-retry').click();
+    await page.waitForFunction(() => window.__chromeRequests.filter(request => request.force).length >= 2);
+    await settleRender(page);
+    assert.equal(await badge(page).count(), 0);
+    assert.equal(await page.locator('#sih-lite-total-text').textContent(), 'Inventory value unavailable');
+    assert.match(await page.locator('#sih-lite-status').textContent(), /HTTP 502/);
+    assert.doesNotMatch(await page.locator('#sih-lite-status').textContent(), /Cached/);
+});
+
+test('a late saved profile response cannot overwrite a successful forced refresh for the same inventory owner', async t => {
+    const page = await openFixture(t, { plans: {
+        fetchPrices: [cachedReply({ items: DEFAULT_ITEMS }),
+            { success: true, data: { items: [{ assetid: '100', marketHashName: 'Same Name', priceCents: 300 }] } }],
+        fetchProfile: [{ hold: true }, { success: true, data: { totalValueCents: '15000' } }, { hold: true }]
+    } });
+    await waitText(badge(page), '$2.50');
+    await page.waitForFunction(() => window.__pendingResponses.some(entry => entry.request.action === 'fetchProfile'));
+    await page.locator('#sih-lite-retry').click();
+    await waitText(badge(page), '$3.00');
+    await waitText(page.locator('#sih-lite-total-text'), 'Dota 2 value: $150.00');
+    await page.evaluate(response => {
+        const index = window.__pendingResponses.findIndex(entry => entry.request.action === 'fetchProfile' && !entry.request.force);
+        window.__pendingResponses.splice(index, 1)[0].callback(response);
+    }, cachedReply({ totalValueCents: '12345' }));
+    await settleRender(page);
+    assert.equal(await page.locator('#sih-lite-total-text').textContent(), 'Dota 2 value: $150.00');
+    assert.equal(await badge(page).textContent(), '$3.00');
+    assert.doesNotMatch(await page.locator('#sih-lite-status').textContent(), /Cached|HTTP 502/);
+    assert.equal(await page.evaluate(() => window.__chromeRequests.filter(request => request.action === 'fetchProfile').length), 2,
+        'an older price load must not start another profile request after the forced refresh');
+});

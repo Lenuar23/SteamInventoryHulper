@@ -41,15 +41,20 @@
         }
     }
 
-    function request(action, steamId) {
+    function request(action, steamId, force = false) {
         return queueOperation(() => new Promise((resolve, reject) => {
             const timer = setTimeout(() => reject(new Error('Steamprice request timed out. Please retry.')), 180000);
             try {
-                chrome.runtime.sendMessage({ action, steamId }, response => {
+                chrome.runtime.sendMessage({ action, steamId, force }, response => {
                     clearTimeout(timer);
                     if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
                     else if (!response?.success) reject(new Error(response?.error || 'Steamprice data is unavailable.'));
-                    else resolve(response.data);
+                    else resolve({ ...response.data, cacheInfo: {
+                        cached: response.cached === true,
+                        cachedAt: Number.isSafeInteger(response.cachedAt) ? response.cachedAt : Date.now(),
+                        scanned: response.scanned === true,
+                        error: response.cached === true && typeof response.error === 'string' ? response.error : ''
+                    } });
                 });
             } catch (error) {
                 clearTimeout(timer);
@@ -63,7 +68,8 @@
         let data = owners.get(id);
         if (!data) {
             data = { id, index: Prices.buildIndex([], id), priceState: 'idle', priceError: '',
-                profileState: 'idle', profileError: '', totalCents: null, priceEpoch: 0, profileEpoch: 0 };
+                profileState: 'idle', profileError: '', totalCents: null, priceEpoch: 0, profileEpoch: 0,
+                pricesLoaded: false, priceCache: null, profileCache: null };
             owners.set(id, data);
         }
         if (data.priceState === 'idle') void loadPrices(data);
@@ -71,39 +77,43 @@
         return data;
     }
 
-    async function loadPrices(data) {
+    async function loadPrices(data, force = false) {
         const epoch = ++data.priceEpoch;
         data.priceState = 'loading';
         data.priceError = '';
         queueRender();
         try {
-            const response = await request('fetchPrices', data.id);
+            const response = await request('fetchPrices', data.id, force);
             if (epoch !== data.priceEpoch) return;
             if (!Array.isArray(response?.items)) throw new Error('Steamprice returned invalid price items.');
             data.index = Prices.buildIndex(response.items, data.id);
+            data.pricesLoaded = true;
+            data.priceCache = response.cacheInfo;
+            data.priceError = data.priceCache.error;
             data.priceState = 'ready';
             queueRender();
             // A price request may have populated an empty Steamprice inventory.
             // Refresh the full value after the initial profile request settles.
-            if (data.profileState !== 'idle') {
+            if (((!force && !data.priceCache.cached) || data.priceCache.scanned) && data.profileState !== 'idle') {
                 await data.profilePromise;
-                if (epoch === data.priceEpoch) void loadProfile(data);
+                if (epoch === data.priceEpoch) void loadProfile(data, true);
             }
         } catch (error) {
             if (epoch !== data.priceEpoch) return;
-            data.priceState = 'error';
+            data.priceState = data.pricesLoaded ? 'ready' : 'error';
             data.priceError = error.message;
+            if (data.pricesLoaded) data.priceCache = { ...data.priceCache, cached: true, error: error.message };
         }
         queueRender();
     }
 
-    function loadProfile(data) {
+    function loadProfile(data, force = false) {
         const epoch = ++data.profileEpoch;
         data.profileState = 'loading';
         data.profileError = '';
         data.profilePromise = (async () => {
             try {
-                const response = await request('fetchProfile', data.id);
+                const response = await request('fetchProfile', data.id, force);
                 if (epoch !== data.profileEpoch) return;
                 const value = response?.totalValueCents;
                 if (!['number', 'string'].includes(typeof value) || String(value).trim() === '' ||
@@ -111,11 +121,14 @@
                     throw new Error('Steamprice did not return a valid inventory value.');
                 }
                 data.totalCents = Number(value);
+                data.profileCache = response.cacheInfo;
+                data.profileError = data.profileCache.error;
                 data.profileState = 'ready';
             } catch (error) {
                 if (epoch !== data.profileEpoch) return;
                 data.profileState = 'error';
                 data.profileError = error.message;
+                if (data.totalCents !== null) data.profileCache = { ...data.profileCache, cached: true, error: error.message };
             }
             queueRender();
         })();
@@ -126,13 +139,19 @@
         for (const id of new Set(ids)) {
             const data = owners.get(id);
             if (!data) continue;
-            if (data.priceState === 'error') void loadPrices(data);
-            if (data.profileState === 'error') void loadProfile(data);
+            if (data.priceState !== 'loading') void loadPrices(data, true);
+            if (data.profileState !== 'idle' && data.profileState !== 'loading') void loadProfile(data, true);
         }
     }
 
     function priceIndex(id) {
         return owners.get(id)?.index || null;
+    }
+
+    function cacheNotice(info, label) {
+        if (!info?.cached) return '';
+        return label + (Number.isSafeInteger(info.cachedAt)
+            ? ' from ' + new Date(info.cachedAt).toLocaleString('en-US') : '') + '.';
     }
 
     function normalizeItems(items, owner, defaults = {}) {
@@ -194,10 +213,13 @@
         if (completeness.me === false) a.complete = false;
         if (completeness.them === false) b.complete = false;
         const net = Prices.difference(a, b);
-        text(role(element, 'give'), 'You give: ' + money(a.knownCents) + (a.complete ? '' : ' (known)'));
-        text(role(element, 'receive'), 'You receive: ' + money(b.knownCents) + (b.complete ? '' : ' (known)'));
+        const subtotal = side => !side.complete && side.itemCount > 0 && side.pricedCount === 0
+            ? 'Unavailable' : money(side.knownCents) + (side.complete ? '' : ' (known)');
+        text(role(element, 'give'), 'You give: ' + subtotal(a));
+        text(role(element, 'receive'), 'You receive: ' + subtotal(b));
         const netElement = role(element, 'net');
-        text(netElement, !net.complete ? 'Known difference: ' + signedMoney(net.knownCents || 0)
+        text(netElement, !net.complete ? 'Known difference: ' + (a.pricedCount + b.pricedCount === 0
+            ? 'Unavailable' : signedMoney(net.knownCents || 0))
             : net.cents > 0 ? 'Net gain: ' + signedMoney(net.cents)
                 : net.cents < 0 ? 'Net loss: ' + signedMoney(net.cents) : 'Even: $0.00');
         const className = net.complete && net.cents !== 0
@@ -212,6 +234,8 @@
             const data = owners.get(id);
             if (data?.priceState === 'loading') status.push('Loading ' + (id === me ? 'your' : 'partner') + ' prices…');
             else if (data?.priceError) status.push((id === me ? 'Your prices: ' : 'Partner prices: ') + data.priceError);
+            const cached = cacheNotice(data?.priceCache, 'Cached prices (' + (id === me ? 'your' : 'partner') + ')');
+            if (cached) status.push(cached);
         }
         if (extraStatus) status.push(extraStatus);
         text(role(element, 'status'), status.join(' '));
@@ -234,7 +258,9 @@
         // fallback also supports the smaller offer-list cards.
         if (getComputedStyle(element).position === 'static') element.style.position = 'relative';
         text(badge, money(value.knownCents));
-        badge.title = 'Steamprice: ' + money(price.cents) + ' each, quantity ' + String(item.amount ?? 1) + '.';
+        badge.title = 'Steamprice: ' + money(price.cents) + ' each, quantity ' + String(item.amount ?? 1) + '.' +
+            (owners.get(item.ownerSteamId)?.priceCache?.cached
+                ? ' ' + cacheNotice(owners.get(item.ownerSteamId).priceCache, 'Cached prices') : '');
     }
 
     function inventoryPanel() {
@@ -289,9 +315,13 @@
             for (const [side, id, label] of [['me', me, 'Your Dota 2 inventory'], ['them', them, 'Partner Dota 2 inventory']]) {
                 const data = owners.get(id);
                 text(role(panel, 'inventory-' + side), label + ': ' + (data?.totalCents !== null && data?.totalCents !== undefined
-                    ? money(data.totalCents) : data?.profileError ? 'Unavailable' : 'Loading…'));
+                    ? money(data.totalCents) + (data.profileCache?.cached ? ' (cached)' : '') : data?.profileError ? 'Unavailable' : 'Loading…'));
                 if (data?.profileError) errors.push(label + ': ' + data.profileError);
                 if (data?.priceError) errors.push((side === 'me' ? 'Your prices: ' : 'Partner prices: ') + data.priceError);
+                const cachedPrices = cacheNotice(data?.priceCache, 'Cached prices (' + (side === 'me' ? 'your' : 'partner') + ')');
+                const cachedProfile = cacheNotice(data?.profileCache, 'Cached inventory value (' + (side === 'me' ? 'your' : 'partner') + ')');
+                if (cachedPrices) errors.push(cachedPrices);
+                if (cachedProfile) errors.push(cachedProfile);
             }
             const active = editor.active || {};
             const data = owners.get(active.ownerSteamId);
@@ -304,6 +334,8 @@
                 button.setAttribute('aria-pressed', String(button.dataset.tradeOrder === (active.order || 'original')));
             }
             document.getElementById('sih-lite-trade-retry').hidden = !errors.length;
+            document.getElementById('sih-lite-trade-retry').disabled = [me, them].some(id =>
+                owners.get(id)?.priceState === 'loading' || owners.get(id)?.profileState === 'loading');
             text(role(panel, 'inventory-status'), [sortStatus, ...errors].filter(Boolean).join(' '));
         }
         const records = new Map();
@@ -384,10 +416,20 @@
             entry.data = data;
             entry.state = data.classError ? 'error' : 'ready';
             entry.error = data.classError ? 'Steam could not verify some item cards. Retry to load their prices.' : '';
-        }).catch(error => {
+        }).catch(async error => {
             if (details.get(offer.offerId) === entry) {
                 entry.state = 'error';
                 entry.error = error.message;
+                if (typeof Offers.fetchClassDescriptions === 'function') {
+                    try {
+                        const fallback = await Offers.fetchClassDescriptions(offer, meSteamId);
+                        if (details.get(offer.offerId) === entry && fallback?.partnerSteamId === offer.partnerSteamId &&
+                            fallback.meSteamId === meSteamId && fallback.offerId === offer.offerId) {
+                            entry.data = entry.data ? { ...entry.data, classItems: fallback.classItems } : fallback;
+                            queueRender();
+                        }
+                    } catch (_) { /* Keep the exact-details error and the verified native item cards. */ }
+                }
             }
         }).finally(queueRender);
     }
@@ -419,7 +461,10 @@
             renderSummary(summary, give, receive, me, them, detail?.state === 'loading'
                 ? 'Loading exact trade items…' : detail?.error || '');
             summary.querySelector('.sih-lite-trade-retry').hidden =
-                !owners.get(me)?.priceError && !owners.get(them)?.priceError && !detail?.error;
+                !owners.get(me)?.priceError && !owners.get(them)?.priceError && !detail?.error &&
+                !owners.get(me)?.priceCache?.cached && !owners.get(them)?.priceCache?.cached;
+            summary.querySelector('.sih-lite-trade-retry').disabled =
+                [me, them].some(id => owners.get(id)?.priceState === 'loading') || detail?.state === 'loading';
             for (const slot of offer.slots || []) if (slot.element) {
                 renderBadge(slot.element, { ...slot.item, ownerSteamId: slot.side === 'give' ? me : them });
             }

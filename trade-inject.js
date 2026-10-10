@@ -57,7 +57,15 @@
 
     function assets(inventory) {
         const values = inventory?.m_rgAssets || inventory?.rgInventory;
-        return values && typeof values === 'object' ? Object.values(values).slice(0, MAX_ITEMS) : [];
+        return ownValues(values);
+    }
+
+    function ownValues(object) {
+        if (!object || typeof object !== 'object') return [];
+        // Steam's Prototype replaces Object.values with a for-in loop that
+        // includes enumerable Array.prototype methods. Read own records only.
+        return Object.getOwnPropertyNames(object).filter(key =>
+            Object.prototype.propertyIsEnumerable.call(object, key)).slice(0, MAX_ITEMS).map(key => object[key]);
     }
 
     function description(asset) { return asset?.description || asset || {}; }
@@ -103,7 +111,7 @@
 
     function offerRecords(side, kind = 'assets') {
         const records = window.g_rgCurrentTradeStatus?.[side]?.[kind];
-        return records && typeof records === 'object' ? Object.values(records).slice(0, MAX_ITEMS) : [];
+        return ownValues(records);
     }
 
     function nativeSlotAssets(side, currency = false) {

@@ -140,6 +140,102 @@ test('detail parsing reads safe native JSON and validates the signed-in owner an
   assert.throws(() => Offers.parseDetails(detailsHtml().replace('"assets":', '"assets":globalThis.evil(),'), '500', ME));
 });
 
+test('native UserYou and UserThem bootstrap IDs validate the account without a global header identity', () => {
+  const html = detailsHtml().replace(`var g_steamID = "${ME}";`, `var g_rgAppContextData = {}; UserYou.SetSteamId( '${ME}' );`)
+    .replace(`var g_ulTradePartnerSteamID = '${PARTNER}';`, `UserThem.SetSteamId( "${PARTNER}" );`);
+  const parsed = Offers.parseDetails(html, '500', ME);
+  assert.equal(parsed.meSteamId, ME);
+  assert.equal(parsed.partnerSteamId, PARTNER);
+  assert.equal(parsed.give[0].assetId, '900');
+  assert.throws(() => Offers.parseDetails(html, '500', PARTNER), /Steam account changed/);
+  assert.throws(() => Offers.parseDetails(html.replace('var g_rgAppContextData = {};', `var g_rgAppContextData = {}; var g_steamID = "${PARTNER}";`), '500', ME), /inconsistent account/);
+});
+
+test('escaped JSON trade status and an assigned offer ID are parsed without executing JavaScript', () => {
+  const status = { me: { assets: [{ appid: 570, contextid: '2', assetid: '900', amount: '1' }] }, them: { assets: [] }, note: 'Braces } escaped "quote" and backslash \\' };
+  const html = `<script>var g_steamID = "${ME}"; var g_ulTradePartnerSteamID = "${PARTNER}";
+    var g_rgCurrentTradeStatus = JSON.parse(${JSON.stringify(JSON.stringify(status))});
+    var g_nTradeOfferId = '500'; BeginTradeOffer(g_nTradeOfferId, false);
+  </script>`;
+  const parsed = Offers.parseDetails(html, '500', ME);
+  assert.equal(parsed.give[0].assetId, '900');
+  assert.deepEqual(parsed.receive, []);
+  assert.throws(() => Offers.parseDetails(html.replace('JSON.parse(', 'malicious.parse('), '500', ME));
+  assert.throws(() => Offers.parseDetails(html.replace("var g_nTradeOfferId = '500'", "var g_nTradeOfferId = '501'"), '500', ME));
+});
+
+test('plain HTML text cannot impersonate native Steam account initialization', () => {
+  const html = detailsHtml({ owner: PARTNER }).replace(`<script>var g_steamID = "${PARTNER}";`, `<div>g_steamID = "${ME}";</div><script>var g_steamID = "${PARTNER}";`);
+  assert.throws(() => Offers.parseDetails(html, '500', ME), /Steam account changed/);
+  const maliciousText = `<script>var note = ${JSON.stringify(`UserYou.SetSteamId('${ME}'); g_steamID = '${ME}';`)};
+    /* UserYou.SetSteamId('${ME}'); */
+  </script>`;
+  assert.throws(() => Offers.parseDetails(maliciousText + detailsHtml({ owner: PARTNER }), '500', ME), /Steam account changed/);
+});
+
+test('a verified final offer URL replaces a missing BeginTradeOffer ID while owner and partner remain required', () => {
+  const html = detailsHtml().replace("BeginTradeOffer( '500', false );", '');
+  assert.equal(Offers.parseDetails(html, '500', ME, 'https://steamcommunity.com/tradeoffer/500/?partner=39734274').offerId, '500');
+  assert.throws(() => Offers.parseDetails(html, '500', ME));
+  assert.throws(() => Offers.parseDetails(html.replace(`var g_steamID = "${ME}";`, ''), '500', ME, 'https://steamcommunity.com/tradeoffer/500/'));
+  assert.throws(() => Offers.parseDetails(html.replace(`var g_ulTradePartnerSteamID = '${PARTNER}';`, ''), '500', ME, 'https://steamcommunity.com/tradeoffer/500/'));
+  assert.throws(() => Offers.parseDetails(detailsHtml({ offerId: '501' }), '500', ME, 'https://steamcommunity.com/tradeoffer/500/'), /different trade offer/);
+  assert.throws(() => Offers.parseDetails(html, '500', ME, 'https://steamcommunity.com/tradeoffer/501/'), /different page/);
+  assert.throws(() => Offers.parseDetails(html, '500', ME, 'https://steamcommunity.com/login/home/'), /Sign in to Steam/);
+  assert.throws(() => Offers.parseDetails(html, '500', ME, 'https://attacker.invalid/tradeoffer/500/'), /different page/);
+});
+
+test('fetching uses the final response URL without weakening the signed-in owner check', async () => {
+  const owner = '76561198000000009';
+  const partner = '76561198000000010';
+  const html = detailsHtml({ owner, partner }).replace("BeginTradeOffer( '500', false );", '');
+  const result = await Offers.fetchDetails('500', owner, async () => ({ ok: true,
+    url: 'https://steamcommunity.com/tradeoffer/500/', text: async () => html,
+    json: async () => ({ success: 1, assets: [], descriptions: [] }) }));
+  assert.equal(result.give[0].assetId, '900');
+  await assert.rejects(Offers.fetchDetails('500', owner, async () => ({ ok: true, url: 'https://steamcommunity.com/login/home/', text: async () => '<html>Sign in</html>' })), /Sign in to Steam/);
+});
+
+function classHoverHtml({ appId = '570', classId = '82001', instanceId = '0', name = 'Ordinary item', descriptions = [] } = {}) {
+  return `<script>var ignored = true; BuildHover( 'economy_item_random', ${JSON.stringify({ appid: appId, classid: classId, instanceid: instanceId, market_hash_name: name, descriptions })} );</script>`;
+}
+
+test('native BuildHover metadata supplies only verified class names and gem flags', async () => {
+  const gemHtml = '<div style="background-image:url(https://cdn.steamstatic.com/apps/570/icons/econ/sockets/gem_color.png)"><span style="color:rgb(61,104,196)">Deep Blue</span><br><span>Prismatic Gem</span></div>';
+  const parsed = Offers.parseClassDescription(classHoverHtml(), '570', '82001', '0');
+  assert.equal(parsed.market_hash_name, 'Ordinary item');
+  assert.throws(() => Offers.parseClassDescription(classHoverHtml({ classId: '82002' }), '570', '82001', '0'));
+  const offer = { offerId: '500', meSteamId: ME, partnerSteamId: PARTNER,
+    give: [{ ownerSteamId: ME, appId: '570', classId: '82001', instanceId: '0', assetId: null, amount: 1 }],
+    receive: [{ ownerSteamId: PARTNER, appId: '570', classId: '82002', instanceId: '7', assetId: null, amount: 1 }] };
+  const data = await Offers.fetchClassDescriptions(offer, ME, async href => {
+    assert.match(href, /^https:\/\/steamcommunity\.com\/economy\/itemclasshover\/570\//);
+    const isGem = href.includes('/82002/7?');
+    return { ok: true, text: async () => classHoverHtml({ classId: isGem ? '82002' : '82001', instanceId: isGem ? '7' : '0', name: isGem ? 'Fractal Horns of Inner Abysm' : 'Ordinary item', descriptions: isGem ? [{ type: 'html', value: gemHtml }] : [] }) };
+  });
+  assert.equal(data.classItems.length, 2);
+  assert.equal(data.classItems.find(item => item.ownerSteamId === PARTNER).hasColoredGem, true);
+  assert.equal(data.classItems.find(item => item.ownerSteamId === ME).hasGems, false);
+  assert.ok(data.classItems.every(item => !Object.hasOwn(item, 'assetId')));
+  await assert.rejects(Offers.fetchClassDescriptions(offer, PARTNER), /Invalid trade offer/);
+});
+
+test('class hover names attach to exact native classes and preserve unknown asset identities', async () => {
+  const classData = { offerId: '500', meSteamId: ME, partnerSteamId: PARTNER, classItems: [
+    { ownerSteamId: ME, appId: '570', classId: '701', instanceId: '0', market_hash_name: 'Ordinary item', hasGems: false },
+    { ownerSteamId: PARTNER, appId: '570', classId: '700', instanceId: '0', market_hash_name: 'Fractal Horns of Inner Abysm', hasGems: true, hasColoredGem: true }
+  ] };
+  const result = await inDocument(fixture({ classOnly: true }), ({ me, classData }) => {
+    const [offer] = SIHLiteTradeOffers.read(document, { meSteamId: me }, { '500': classData });
+    return { give: offer.give, receive: offer.receive, slots: offer.slots.map(slot => slot.item) };
+  }, { classData });
+  assert.equal(result.give[0].market_hash_name, 'Ordinary item');
+  assert.equal(Object.hasOwn(result.give[0], 'contextId'), false);
+  assert.equal(result.receive[0].hasColoredGem, true);
+  assert.equal(result.receive[0].assetId, null);
+  assert.equal(result.slots[0].market_hash_name, 'Fractal Horns of Inner Abysm');
+});
+
 test('detail fetching makes only an authenticated GET and reports HTTP failures', async () => {
   const requests = [];
   const result = await Offers.fetchDetails('500', ME, async (url, options) => {

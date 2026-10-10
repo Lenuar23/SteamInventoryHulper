@@ -24,7 +24,7 @@ function inventory(owner, items) {
         LayoutPages() { this.layouts = (this.layouts || 0) + 1; }, SetActivePage(page) { this.pageCurrent = page; } };
 }
 
-function harness(items = [asset(1, 'Plain')]) {
+function harness(items = [asset(1, 'Plain')], options = {}) {
     const messages = [], listeners = new Map(), timers = [];
     const me = { strSteamId: ME, rgContexts: { 570: { 2: {} } } };
     const them = { strSteamId: THEM, rgContexts: { 570: { 2: {} } } };
@@ -40,7 +40,15 @@ function harness(items = [asset(1, 'Plain')]) {
         addEventListener: (type, listener) => listeners.set(type, listener), setInterval() {},
         setTimeout(callback) { timers.push(callback); return timers.length; }, clearTimeout() {},
         SIHLiteGems: { analyzeSteamAsset: item => ({ hasGems: Boolean(item.description?.insertedGems) }) } };
-    vm.runInNewContext(bridge, { window, document, globalThis: window });
+    if (options.prototypeValues) {
+        for (const side of ['me', 'them']) for (const kind of ['assets', 'currency']) {
+            Object.setPrototypeOf(window.g_rgCurrentTradeStatus[side][kind], Object.assign(Object.create(Array.prototype), {
+                fixtureEnumerablePrototypeMethod() {}
+            }));
+        }
+    }
+    const prototype = options.prototypeValues ? 'Object.values = function(object) { const result = []; for (const key in object) result.push(object[key]); return result; };' : '';
+    vm.runInNewContext(prototype + bridge, { window, document, globalThis: window });
     const send = (data, event = {}) => listeners.get('message')({ source: window, origin: window.location.origin, ...event,
         data: { source: 'SIH_LITE_TRADE_CONTENT', ...data } });
     return { window, me, them, own, other, slots, messages, timers, send,
@@ -143,6 +151,25 @@ test('offer snapshots keep offered quantities, currencies, invalid records and i
     assert.equal(orphan.offers.them[0].assetId, '123');
     assert.equal(orphan.offersComplete.them, false);
     assert.equal(h.slots.their_slots[0].getAttribute('data-sih-trade-owner'), THEM);
+});
+
+test('Prototype enumerable array methods never become unresolved offered items or currencies', () => {
+    const h = harness(undefined, { prototypeValues: true });
+    let snapshot = h.state();
+    assert.deepEqual(snapshot.offers, { me: [], them: [] });
+    assert.deepEqual(snapshot.offersComplete, { me: true, them: true });
+    h.window.g_rgCurrentTradeStatus.me.assets.push({ appid: 570, contextid: '2', assetid: '1', amount: 1 });
+    h.window.g_rgCurrentTradeStatus.them.currency.push({ appid: 440, contextid: '2', currencyid: '99', amount: 5 });
+    snapshot = h.state();
+    assert.equal(snapshot.offers.me.length, 1);
+    assert.equal(snapshot.offers.me[0].assetId, '1');
+    assert.equal(snapshot.offers.them.length, 1);
+    assert.equal(snapshot.offers.them[0].currencyId, '99');
+    h.window.g_rgCurrentTradeStatus.me.assets.pop();
+    h.window.g_rgCurrentTradeStatus.them.currency.pop();
+    snapshot = h.state();
+    assert.deepEqual(snapshot.offers, { me: [], them: [] });
+    assert.deepEqual(snapshot.offersComplete, { me: true, them: true });
 });
 
 test('cross-window and cross-origin messages cannot trigger sorting', () => {

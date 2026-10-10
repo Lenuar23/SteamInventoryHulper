@@ -8,6 +8,8 @@
     let steamId = null, activeDota = false, generation = 0;
     let priceState = 'loading', totalCents = null;
     let profileError = '', priceError = '', sortStatus = '', sortOrder = 'original';
+    let priceCache = null, profileCache = null, pricesLoaded = false;
+    let priceEpoch = 0, profileEpoch = 0;
     let busy = false, renderQueued = false, requestNumber = 0;
     let profileLoad = Promise.resolve();
     let gemFilter = 'all', gemDataRevision = 0;
@@ -65,55 +67,68 @@
         return namePrices.get(cleanName(name)) ?? null;
     }
 
-    function request(action, id) {
+    function request(action, id, force = false) {
         return new Promise((resolve, reject) => {
             const timer = setTimeout(() => reject(new Error('Steamprice request timed out. Please try again.')), 180000);
             try {
-                chrome.runtime.sendMessage({ action, steamId: id }, response => {
+                chrome.runtime.sendMessage({ action, steamId: id, force }, response => {
                     clearTimeout(timer);
                     const error = chrome.runtime.lastError;
                     if (error) reject(new Error(error.message));
                     else if (!response?.success) reject(new Error(response?.error || 'Steamprice did not return any data.'));
-                    else resolve(response.data);
+                    else resolve({ ...response.data, cacheInfo: {
+                        cached: response.cached === true,
+                        cachedAt: Number.isSafeInteger(response.cachedAt) ? response.cachedAt : Date.now(),
+                        scanned: response.scanned === true,
+                        error: response.cached === true && typeof response.error === 'string' ? response.error : ''
+                    } });
                 });
             } catch (error) { clearTimeout(timer); reject(error); }
         });
     }
 
-    async function loadPrices(id, currentGeneration) {
+    async function loadPrices(id, currentGeneration, force = false) {
+        const epoch = ++priceEpoch;
         priceState = 'loading'; priceError = ''; queueRender();
         try {
-            const data = await request('fetchPrices', id);
-            if (currentGeneration !== generation) return;
+            const data = await request('fetchPrices', id, force);
+            if (currentGeneration !== generation || epoch !== priceEpoch) return;
             if (!Array.isArray(data?.items)) throw new Error('Invalid price response.');
             buildPrices(data.items);
+            pricesLoaded = true; priceCache = data.cacheInfo; priceError = priceCache.error;
             priceState = 'ready';
             queueRender();
             if (activeDota && gemFilter === 'colored' && !busy) filterInventory('colored');
             // Empty price caches may have triggered a scan; request the total again
             // after the initial profile request settles, avoiding a stale overwrite.
-            await profileLoad;
-            if (currentGeneration === generation) profileLoad = loadProfile(id, currentGeneration);
+            if ((!force && !priceCache.cached) || priceCache.scanned) {
+                await profileLoad;
+                if (currentGeneration === generation && epoch === priceEpoch) profileLoad = loadProfile(id, currentGeneration, true);
+            }
         } catch (error) {
-            if (currentGeneration !== generation) return;
-            priceState = 'error'; priceError = error.message;
+            if (currentGeneration !== generation || epoch !== priceEpoch) return;
+            priceState = pricesLoaded ? 'ready' : 'error'; priceError = error.message;
+            if (pricesLoaded) priceCache = { ...priceCache, cached: true, error: error.message };
         }
         queueRender();
     }
 
-    async function loadProfile(id, currentGeneration) {
+    async function loadProfile(id, currentGeneration, force = false) {
+        const epoch = ++profileEpoch;
         profileError = '';
         try {
-            const data = await request('fetchProfile', id);
-            if (currentGeneration !== generation) return;
+            const data = await request('fetchProfile', id, force);
+            if (currentGeneration !== generation || epoch !== profileEpoch) return;
             const value = data?.totalValueCents;
             if (value === null || value === undefined || value === '' || !Number.isFinite(Number(value)) || Number(value) < 0) {
                 throw new Error('Steamprice did not return totalValueCents.');
             }
             totalCents = Math.round(Number(value));
+            profileCache = data.cacheInfo; profileError = profileCache.error;
         } catch (error) {
-            if (currentGeneration !== generation) return;
+            if (currentGeneration !== generation || epoch !== profileEpoch) return;
             profileError = error.message;
+            if (totalCents !== null) profileCache = { ...profileCache, cached: true, error: error.message };
         }
         queueRender();
     }
@@ -122,6 +137,7 @@
         if (steamId === id) return;
         steamId = id; generation++;
         totalCents = null; priceState = 'loading';
+        priceCache = profileCache = null; pricesLoaded = false;
         priceError = profileError = sortStatus = ''; sortOrder = 'original'; busy = false;
         gemFilter = 'all'; gemDataRevision++; refreshGemDataAfterState = false;
         assetPrices.clear(); namePrices.clear(); inventoryItems.clear(); apiGemInfo.clear();
@@ -255,8 +271,8 @@
         retry.className = 'sih-lite-sort-btn'; retry.textContent = 'Retry';
         retry.addEventListener('click', () => {
             if (!steamId) return;
-            if (priceState === 'error') loadPrices(steamId, generation);
-            if (profileError) loadProfile(steamId, generation);
+            if (priceState !== 'loading') loadPrices(steamId, generation, true);
+            profileLoad = loadProfile(steamId, generation, true);
         });
         panel.appendChild(retry);
         const status = document.createElement('div'); status.id = 'sih-lite-status';
@@ -267,13 +283,19 @@
 
     function setText(element, text) { if (element && element.textContent !== text) element.textContent = text; }
 
+    function cacheNotice(info, label) {
+        if (!info?.cached) return '';
+        return label + (Number.isSafeInteger(info.cachedAt)
+            ? ' from ' + new Date(info.cachedAt).toLocaleString('en-US') : '') + '.';
+    }
+
     function render() {
         installStyles();
         const panel = ensurePanel();
         if (panel) {
             panel.hidden = !activeDota;
             setText(panel.querySelector('#sih-lite-total-text'), totalCents !== null
-                ? `Dota 2 value: ${money(totalCents)}` : profileError ? 'Inventory value unavailable' : 'Loading inventory value…');
+                ? `Dota 2 value: ${money(totalCents)}${profileCache?.cached ? ' (cached)' : ''}` : profileError ? 'Inventory value unavailable' : 'Loading inventory value…');
             panel.querySelector('#sih-lite-total-text').title = 'Full inventory valuation from Steamprice; updates may be delayed.';
             for (const button of panel.querySelectorAll('[data-order]')) {
                 button.disabled = busy || (button.dataset.order !== 'original' && priceState !== 'ready');
@@ -282,9 +304,12 @@
             const gemButton = panel.querySelector('#sih-lite-gem-filter');
             gemButton.disabled = busy;
             gemButton.setAttribute('aria-pressed', String(gemFilter === 'colored'));
-            panel.querySelector('#sih-lite-retry').hidden = !profileError && priceState !== 'error';
-            setText(panel.querySelector('#sih-lite-status'), [priceState === 'loading' ? 'Loading Steamprice prices…' : priceError,
-                profileError, sortStatus].filter(Boolean).join(' '));
+            panel.querySelector('#sih-lite-retry').hidden = !profileError && !priceError && !priceCache?.cached && !profileCache?.cached && priceState !== 'error';
+            panel.querySelector('#sih-lite-retry').disabled = priceState === 'loading';
+            setText(panel.querySelector('#sih-lite-status'), Array.from(new Set([
+                priceState === 'loading' ? 'Loading Steamprice prices…' : priceError, profileError,
+                cacheNotice(priceCache, 'Cached prices'), cacheNotice(profileCache, 'Cached inventory value'), sortStatus
+            ].filter(Boolean))).join(' '));
         }
         for (const slot of document.querySelectorAll('.itemHolder .item, div.item')) {
             const match = (slot.id || slot.querySelector('a.inventory_item_link')?.href || '').match(/(?:item)?570_2_(\d+)/);
@@ -303,6 +328,8 @@
             const className = `sih-lite-badge sih-lite-${cents === null ? 'cache' : 'price'}`;
             if (badge.className !== className) badge.className = className;
             setText(badge, cents === null ? 'Cache' : money(cents));
+            badge.title = cents === null ? 'Collector\'s Cache item' :
+                cacheNotice(priceCache, 'Cached prices') || 'Steamprice valuation in USD.';
         }
     }
 
