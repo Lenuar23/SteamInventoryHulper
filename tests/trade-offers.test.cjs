@@ -258,6 +258,61 @@ test('verified hover variant fingerprints survive class-only hydration without i
   assert.equal(result.item.variantFingerprint, details.classItems[0].variantFingerprint);
 });
 
+test('verified plain Standard class metadata carries an ordinary estimate key without asset or context identity', async () => {
+  const offer = { offerId: '500', meSteamId: ME, partnerSteamId: PARTNER,
+    give: [{ ownerSteamId: ME, appId: '570', classId: '86111', instanceId: '0', assetId: null, amount: 1 }],
+    receive: [{ ownerSteamId: PARTNER, appId: '570', classId: '86112', instanceId: '0', assetId: null, amount: 1 }] };
+  const details = await Offers.fetchClassDescriptions(offer, ME, async href => {
+    const styled = href.includes('/86112/0?');
+    return { ok: true, text: async () => classHoverHtml({ classId: styled ? '86112' : '86111', name: 'Orb of Reminiscence',
+      descriptions: styled ? [{ value: 'Styles unlocked: 2' }] : [],
+      extra: { tags: [{ category: 'Quality', internal_name: 'unique' }], name_color: 'D2D2D2', tradable: 1, marketable: 1 } }) };
+  });
+  assert.equal(details.classItems[0].ordinaryFingerprint, '["ordinary-v1","standard","orb of reminiscence"]');
+  assert.equal(details.classItems[1].ordinaryFingerprint, null);
+  assert.ok(details.classItems.every(metadata => !Object.hasOwn(metadata, 'assetId') && !Object.hasOwn(metadata, 'contextId')));
+  assert.equal(Offers.normalizeItem(details.classItems[0], ME).ordinaryFingerprint, details.classItems[0].ordinaryFingerprint);
+  const html = fixture({ historical: true, classOnly: true }).replace('classinfo/570/701/0', 'classinfo/570/86111/0')
+    .replace('classinfo/570/700/0', 'classinfo/570/86112/0');
+  const hydrated = await inDocument(html, ({ me, details }) => {
+    const [offer] = SIHLiteTradeOffers.read(document, { meSteamId: me }, { '500': details });
+    return { give: offer.give[0], receive: offer.receive[0] };
+  }, { details });
+  assert.equal(hydrated.give.ordinaryFingerprint, details.classItems[0].ordinaryFingerprint);
+  assert.equal(hydrated.give.assetId, null);
+  assert.equal(Object.hasOwn(hydrated.give, 'contextId'), false);
+  assert.equal(hydrated.receive.ordinaryFingerprint, undefined);
+});
+
+test('Genuine weather class metadata verifies catalog quality and retains nonmarketable flags during hydration', async () => {
+  const offer = { offerId: '500', meSteamId: ME, partnerSteamId: PARTNER,
+    give: [{ ownerSteamId: ME, appId: '570', classId: '86211', instanceId: '0', assetId: null, amount: 1 }],
+    receive: [{ ownerSteamId: PARTNER, appId: '570', classId: '86212', instanceId: '0', assetId: null, amount: 1 }] };
+  const details = await Offers.fetchClassDescriptions(offer, ME, async href => {
+    const unavailable = href.includes('/86212/0?');
+    return { ok: true, text: async () => classHoverHtml({ classId: unavailable ? '86212' : '86211',
+      name: unavailable ? 'Genuine Weather Rain' : 'Genuine Weather Ash',
+      extra: { tags: [{ category: 'Quality', internal_name: 'genuine' }], name_color: '4D7455', tradable: 1, marketable: unavailable ? 0 : 1 } }) };
+  });
+  assert.equal(details.classItems[0].catalogFingerprint, '["catalog-v1","genuine weather ash","genuine"]');
+  assert.equal(details.classItems[0].ordinaryFingerprint, null);
+  assert.equal(details.classItems[0].marketable, true);
+  assert.equal(details.classItems[1].catalogFingerprint, null);
+  assert.equal(details.classItems[1].marketable, false);
+  const html = fixture({ historical: true, classOnly: true }).replace('classinfo/570/701/0', 'classinfo/570/86211/0')
+    .replace('classinfo/570/700/0', 'classinfo/570/86212/0');
+  const hydrated = await inDocument(html, ({ me, details }) => {
+    const [offer] = SIHLiteTradeOffers.read(document, { meSteamId: me }, { '500': details });
+    return { give: offer.give[0], receive: offer.receive[0] };
+  }, { details });
+  assert.equal(hydrated.give.catalogFingerprint, details.classItems[0].catalogFingerprint);
+  assert.equal(hydrated.give.tradable, true);
+  assert.equal(hydrated.give.assetId, null);
+  assert.equal(hydrated.receive.marketable, false);
+  assert.equal(Offers.normalizeItem({ appid: 570, tradable: 0, marketable: false }, ME).tradable, false);
+  assert.equal(Offers.normalizeItem({ appid: 570, marketable: true, description: { marketable: 0 } }, ME).marketable, false);
+});
+
 test('detail fetching makes only an authenticated GET and reports HTTP failures', async () => {
   const requests = [];
   const result = await Offers.fetchDetails('500', ME, async (url, options) => {

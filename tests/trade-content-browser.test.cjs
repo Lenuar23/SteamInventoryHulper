@@ -139,7 +139,8 @@ async function openFixture(t, options = {}) {
                 const response = plans ? plans[Math.min(index, plans.length - 1)] : {
                     success: true, data: request.action === 'fetchPrices'
                         ? { items: config.prices[request.steamId] || [] }
-                        : { totalValueCents: config.totals[request.steamId] ?? '0' }
+                        : request.action === 'fetchCollection' ? { items: config.collection || [] }
+                            : { totalValueCents: config.totals[request.steamId] ?? '0' }
                 };
                 if (response?.hold) window.__pendingResponses.push({ request, callback });
                 else setTimeout(() => callback(response), 0);
@@ -185,6 +186,7 @@ async function openFixture(t, options = {}) {
         snapshot, prices: options.prices || DEFAULT_PRICES,
         totals: options.totals || { [OWNER]: '12345', [PARTNER]: '67890', [THIRD_OWNER]: '54321' },
         plans: options.plans, sortReply: options.sortReply,
+        collection: options.collection,
         fetchPlans: options.fetchPlans, sessionId: options.sessionId === undefined ? 'fixture_session_123' : options.sessionId,
         monitorWork: options.monitorWork === true
     });
@@ -948,4 +950,193 @@ test('historical offers read public class hovers without opening a trade and lab
         'historical valuations need class metadata, never a separate editable trade or a trade acceptance request');
     const pricingRequests = await page.evaluate(() => window.__chromeRequests.filter(request => request.action === 'fetchPrices'));
     assert.ok(pricingRequests.every(request => request.scan === false), 'trade pages never launch automatic inventory-scanning tabs');
+});
+
+function ordinaryStockRow(assetid, marketHashName, priceCents) {
+    return {
+        assetid, marketHashName, priceCents, basePriceCents: priceCents,
+        quality: 'Standard', assetQuality: 'Standard',
+        rawTags: [{ category: 'Quality', internal_name: 'unique' }],
+        prismaticGems: [], etherealGems: [], kineticGems: [], unusualEffectGems: [],
+        emptySockets: 0, spectatorGames: 0, tradable: true, marketable: true,
+        isLegacy: false, legacyRgb: null, legacyPricing: null,
+        allStylesUnlocked: false, mayBeGiftedOnce: false, favored: false, unusualQuality: false,
+        isBuggedEthereal: false, isOtherBug: false, isGolden: false, isCrimson: false,
+        emptyEthereal: false, emptyPrismatic: false, isUnusualCourier: false, hasAllStyleCourier: false,
+        hasUnusualEffect: false, isCollectorBundle: false, canGiftCollectorBundle: false,
+        unpackGiftCollectorBundle: false, pbrCycled: false,
+        styleTotal: null, styleUnlocked: null, gem: null, paintSeed: null, wearRating: null,
+        stickers: null, infuser: null, roshanCycle: null, expirationDate: null, greevil: null, collectorSetPiece: null
+    };
+}
+
+function ordinaryClassHover(classid, market_hash_name) {
+    return `<script>BuildHover('economy_item_fixture', ${JSON.stringify({
+        appid: 570, classid, instanceid: '0', market_hash_name, name_color: 'D2D2D2',
+        tags: [{ category: 'Quality', internal_name: 'unique' }],
+        tradable: 1, marketable: 1, descriptions: []
+    })});</script>`;
+}
+
+test('historical ordinary items missing from their owner API use labeled matching stock estimates without borrowing foreign asset IDs', async t => {
+    const name = 'Verified Ordinary Hat';
+    const snapshot = listSnapshot([
+        listOffer('503', { active: false,
+            give: [item(OWNER, '100', 'Your Current Item')],
+            receive: [item(PARTNER, null, '', '2', { classId: '4000', instanceId: '0' })]
+        }),
+        listOffer('504', { active: false,
+            give: [item(OWNER, '999', name)],
+            receive: [item(PARTNER, '999', 'Unrelated Partner Item')]
+        })
+    ]);
+    const page = await openList(t, { snapshot, prices: {
+        [OWNER]: [{ assetid: '100', marketHashName: 'Your Current Item', priceCents: 500 },
+            ordinaryStockRow('999', name, 125)],
+        [PARTNER]: []
+    }, fetchPlans: {
+        'https://steamcommunity.com/economy/itemclasshover/570/4000/0?content_only=1&l=english': [
+            { text: ordinaryClassHover('4000', name) }
+        ]
+    } });
+    await waitText(listBadge(page, 'receive', 0, '503'), '$2.50');
+    await waitText(listBadge(page, 'give', 0, '503'), '$5.00');
+    assert.equal(await offerSummary(page, '503').locator('[data-role="receive"]').textContent(), 'You receive: $2.50');
+    assert.equal(await offerSummary(page, '503').locator('[data-role="net"]').textContent(), 'Net loss: −$2.50');
+    assert.match(await listBadge(page, 'receive', 0, '503').getAttribute('title'), /ordinary-item estimate.*Steamprice/i);
+    assert.match(await offerSummary(page, '503').locator('[data-role="status"]').textContent(), /current Steamprice ordinary-item estimate/i);
+    await waitText(listBadge(page, 'give', 0, '504'), '$1.25');
+    assert.equal(await listBadge(page, 'receive', 0, '504').count(), 0,
+        'an own-inventory asset ID must never become an exact partner asset price');
+    assert.equal(await offerSummary(page, '504').locator('[data-role="receive"]').textContent(), 'You receive: Unavailable');
+    assert.equal(await page.locator('#list_503_receive_0').getAttribute('data-economy-item'), 'classinfo/570/4000/0/a:2',
+        'the estimated class card retains its native class identity');
+    assert.equal(await fastAccept(page, '503').count(), 0);
+    assert.equal(await fastAccept(page, '504').count(), 0);
+    const pricingRequests = await page.evaluate(() => window.__chromeRequests.filter(request => request.action === 'fetchPrices'));
+    assert.deepEqual(pricingRequests.map(request => request.steamId).sort(), [OWNER, PARTNER].sort(),
+        'ordinary estimates use the inventories already loaded for this page');
+    assert.equal((await page.evaluate(() => window.__chromeRequests.filter(request => request.action === 'fetchCollection'))).length, 0,
+        'matching saved ordinary prices do not trigger an unnecessary collection request');
+    const calls = await page.evaluate(() => window.__fetchRequests);
+    assert.equal(calls.length, 1);
+    assert.ok(calls.every(call => call.method === 'GET' && call.url.includes('/economy/itemclasshover/')));
+});
+
+test('conflicting ordinary stock prices remain unknown on historical class cards and keep a partial trade valuation', async t => {
+    const name = 'Verified Ordinary Hat';
+    const snapshot = listSnapshot([listOffer('503', { active: false,
+        give: [item(OWNER, '100', 'Your Current Item')],
+        receive: [item(PARTNER, null, '', '2', { classId: '4000', instanceId: '0' })]
+    })]);
+    const page = await openList(t, { snapshot, prices: {
+        [OWNER]: [{ assetid: '100', marketHashName: 'Your Current Item', priceCents: 500 },
+            ordinaryStockRow('999', name, 125), ordinaryStockRow('998', name, 150)],
+        [PARTNER]: []
+    }, fetchPlans: {
+        'https://steamcommunity.com/economy/itemclasshover/570/4000/0?content_only=1&l=english': [
+            { text: ordinaryClassHover('4000', name) }
+        ]
+    } });
+    await waitText(listBadge(page, 'give', 0, '503'), '$5.00');
+    await page.waitForFunction(() => window.__fetchRequests.length === 1);
+    await frames(page);
+    assert.equal(await listBadge(page, 'receive', 0, '503').count(), 0);
+    assert.equal(await offerSummary(page, '503').locator('[data-role="receive"]').textContent(), 'You receive: Unavailable');
+    assert.equal(await offerSummary(page, '503').locator('[data-role="net"]').textContent(), 'Known difference: −$5.00');
+    assert.match(await offerSummary(page, '503').locator('[data-role="status"]').textContent(), /Partial valuation: 1 item unpriced/);
+    assert.doesNotMatch(await offerSummary(page, '503').locator('[data-role="status"]').textContent(), /Includes .* ordinary-item estimate/);
+    assert.doesNotMatch(await offerSummary(page, '503').locator('[data-role="net"]').textContent(), /Net gain|Net loss|Even/);
+    assert.ok((await page.evaluate(() => window.__fetchRequests)).every(call => !call.url.includes('/market/')),
+        'a conflicting Steamprice stock valuation must never trigger a different-source fallback');
+});
+
+function genuineClassHover(classid, market_hash_name) {
+    return `<script>BuildHover('economy_item_fixture', ${JSON.stringify({
+        appid: 570, classid, instanceid: '0', market_hash_name, name_color: '4D7455',
+        tags: [{ category: 'Quality', internal_name: 'genuine' }],
+        tradable: 1, marketable: 1, descriptions: []
+    })});</script>`;
+}
+
+test('historical Weather items absent from owner APIs use one shared Steamprice collection while existing asset prices remain primary', async t => {
+    const snapshot = listSnapshot([
+        listOffer('505', { active: false,
+            give: [item(OWNER, '100', 'Your Current Item')],
+            receive: [
+                item(PARTNER, null, '', '2', { classId: '5000', instanceId: '0' }),
+                item(PARTNER, null, '', '1', { classId: '5001', instanceId: '0' }),
+                item(PARTNER, '321', 'Genuine Weather Aurora')
+            ]
+        }),
+        listOffer('506', { active: false,
+            give: [item(OWNER, '100', 'Your Current Item')],
+            receive: [item(PARTNER, null, '', '1', { classId: '5000', instanceId: '0' })]
+        })
+    ]);
+    const page = await openList(t, { snapshot, prices: {
+        [OWNER]: [{ assetid: '100', marketHashName: 'Your Current Item', priceCents: 500 }],
+        [PARTNER]: [{ assetid: '321', marketHashName: 'Genuine Weather Aurora', priceCents: 92 }]
+    }, collection: [
+        { marketHashName: 'Genuine Weather Ash', priceCents: 671, source: 'steamprice-collection' },
+        { marketHashName: 'Genuine Weather Rain', priceCents: 613, source: 'steamprice-collection' },
+        { marketHashName: 'Genuine Weather Aurora', priceCents: 999, source: 'steamprice-collection' }
+    ], fetchPlans: {
+        'https://steamcommunity.com/economy/itemclasshover/570/5000/0?content_only=1&l=english': [
+            { text: genuineClassHover('5000', 'Genuine Weather Ash') }
+        ],
+        'https://steamcommunity.com/economy/itemclasshover/570/5001/0?content_only=1&l=english': [
+            { text: genuineClassHover('5001', 'Genuine Weather Rain') }
+        ]
+    } });
+    await waitText(listBadge(page, 'receive', 0, '505'), '$13.42');
+    await waitText(listBadge(page, 'receive', 1, '505'), '$6.13');
+    await waitText(listBadge(page, 'receive', 2, '505'), '$0.92');
+    await waitText(listBadge(page, 'receive', 0, '506'), '$6.71');
+    assert.equal(await offerSummary(page, '505').locator('[data-role="receive"]').textContent(), 'You receive: $20.47');
+    assert.equal(await offerSummary(page, '505').locator('[data-role="net"]').textContent(), 'Net gain: +$15.47');
+    assert.match(await listBadge(page, 'receive', 0, '505').getAttribute('title'), /Current estimate from Steamprice collection/i);
+    assert.doesNotMatch(await listBadge(page, 'receive', 2, '505').getAttribute('title'), /collection/i,
+        'an exact owner price remains primary even when the shared collection disagrees');
+    assert.match(await offerSummary(page, '505').locator('[data-role="status"]').textContent(), /Includes 2 current Steamprice collection estimates/i);
+    assert.equal(await page.locator('#list_505_receive_0').getAttribute('data-economy-item'), 'classinfo/570/5000/0/a:2');
+    const collectionRequests = await page.evaluate(() => window.__chromeRequests.filter(request => request.action === 'fetchCollection'));
+    assert.equal(collectionRequests.length, 1, 'all visible offers share one collection request');
+    assert.equal(collectionRequests[0].steamId, OWNER, 'the collection uses only the verified signed-in viewer');
+    const calls = await page.evaluate(() => window.__fetchRequests);
+    assert.equal(calls.length, 2, 'repeated historical classes reuse their verified descriptions');
+    assert.ok(calls.every(call => call.method === 'GET' && call.url.includes('/economy/itemclasshover/')),
+        'collection estimates need no Steam Market request or editable trade page');
+    assert.equal(await fastAccept(page, '505').count(), 0);
+});
+
+test('missing historical socketed variants never request generic Steamprice collection prices', async t => {
+    const name = 'Socketed Hat';
+    const snapshot = listSnapshot([listOffer('506', { active: false,
+        give: [item(OWNER, '100', 'Your Current Item')],
+        receive: [item(PARTNER, null, '', '1', { classId: '6000', instanceId: '0' })]
+    })]);
+    const gemHtml = '<div style="background-image:url(https://cdn.steamstatic.com/apps/570/icons/econ/sockets/gem_color.hash.png)">' +
+        '<span style="color:rgb(61,104,196)">Deep Blue</span><br><span>Prismatic Gem</span></div>';
+    const description = {
+        appid: 570, classid: '6000', instanceid: '0', market_hash_name: name, name_color: 'D2D2D2',
+        tags: [{ category: 'Quality', internal_name: 'unique' }],
+        tradable: 1, marketable: 1, descriptions: [{ type: 'html', value: gemHtml }]
+    };
+    const page = await openList(t, { snapshot, prices: {
+        [OWNER]: [{ assetid: '100', marketHashName: 'Your Current Item', priceCents: 500 }],
+        [PARTNER]: []
+    }, fetchPlans: {
+        'https://steamcommunity.com/economy/itemclasshover/570/6000/0?content_only=1&l=english': [
+            { text: `<script>BuildHover('economy_item_fixture', ${JSON.stringify(description)});</script>` }
+        ]
+    } });
+    await waitText(listBadge(page, 'give', 0, '506'), '$5.00');
+    await page.waitForFunction(() => window.__fetchRequests.length === 1);
+    await frames(page);
+    assert.equal(await listBadge(page, 'receive', 0, '506').count(), 0);
+    assert.equal(await offerSummary(page, '506').locator('[data-role="receive"]').textContent(), 'You receive: Unavailable');
+    assert.match(await offerSummary(page, '506').locator('[data-role="status"]').textContent(), /Partial valuation: 1 item unpriced/);
+    assert.equal((await page.evaluate(() => window.__chromeRequests.filter(request => request.action === 'fetchCollection'))).length, 0,
+        'a generic collection entry cannot value an attached gem');
 });

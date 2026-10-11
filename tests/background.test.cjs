@@ -7,6 +7,18 @@ const vm = require('node:vm');
 const source = fs.readFileSync(path.join(__dirname, '..', 'background.js'), 'utf8');
 const steamId = '76561198012345678';
 const ok = data => ({ ok: true, status: 200, json: async () => data });
+const collectionCatalog = (priceCents = 613) => ({ collections: [{
+    id: 29, name: 'WEATHER', priceSource: 'steam', kind: 'regular', owned: 1, total: 2,
+    items: [
+        { id: 601, itemName: 'Genuine Weather Rain', steamPriceCents: 0, cashPriceCents: priceCents,
+            owned: true, ownedAssetid: '31985914724', ownedItemName: 'Genuine Weather Rain',
+            disablePrices: false, fullSet: false, unpackHint: false, dotagiftx: false, itemType: 'Misc', slot: 'Weather',
+            collectorLowestAskCents: null, collectorAvgSaleCents: null },
+        { id: 598, itemName: 'Genuine Weather Aurora', steamPriceCents: 0, cashPriceCents: 92,
+            owned: false, ownedAssetid: null, disablePrices: false, fullSet: false, unpackHint: false, dotagiftx: false,
+            itemType: 'Misc', slot: 'Weather', collectorLowestAskCents: null, collectorAvgSaleCents: null }
+    ]
+}], overallOwned: 1, overallTotal: 2 });
 
 function setup(fetchImpl, options = {}) {
     let listener;
@@ -22,7 +34,8 @@ function setup(fetchImpl, options = {}) {
     const stored = options.stored || {};
     const storage = { gets: [], sets: [] };
     const timers = [];
-    vm.runInNewContext(source, {
+    const imports = [];
+    const context = vm.createContext({
         AbortController,
         Date: TestDate,
         CompressionStream,
@@ -31,6 +44,11 @@ function setup(fetchImpl, options = {}) {
         Blob,
         atob,
         btoa,
+        importScripts(filename) {
+            assert.equal(filename, 'collection-prices.js');
+            imports.push(filename);
+            vm.runInContext(fs.readFileSync(path.join(__dirname, '..', filename), 'utf8'), context, { filename });
+        },
         fetch: async (url, init) => {
             requests.push(url);
             requestTimes.push(now);
@@ -75,14 +93,17 @@ function setup(fetchImpl, options = {}) {
                 }
             }
         }
-    }, { filename: 'background.js' });
+    });
+    vm.runInContext(source, context, { filename: 'background.js' });
     return {
         requests,
         requestTimes,
         tabs,
         timers,
+        imports,
         storage,
         stored,
+        get currentTime() { return now; },
         advance(ms) { now += ms; },
         send(action, id = steamId, extra = {}) {
             return new Promise(resolve => listener({ action, steamId: id, ...extra }, {}, resolve));
@@ -243,7 +264,7 @@ test('pagination limits and changing metadata produce errors instead of truncati
     assert.match(changedResponse.error, /changed during loading/);
 });
 
-for (const action of ['fetchProfile', 'fetchPrices']) {
+for (const action of ['fetchProfile', 'fetchPrices', 'fetchCollection']) {
     test(`${action} aborts timed out requests and does not start a scan`, async () => {
         const env = setup(async (_, { signal }) => new Promise((resolve, reject) => {
             signal.addEventListener('abort', () => reject(new Error('AbortError')), { once: true });
@@ -257,7 +278,8 @@ for (const action of ['fetchProfile', 'fetchPrices']) {
     test(`${action} shares in-flight work, caches success and permits a forced request`, async () => {
         let release;
         const gate = new Promise(resolve => { release = resolve; });
-        const data = action === 'fetchProfile' ? { totalValueCents: '100' } : { items: [{ assetid: '1' }], totalPages: 1 };
+        const data = action === 'fetchProfile' ? { totalValueCents: '100' }
+            : action === 'fetchCollection' ? collectionCatalog() : { items: [{ assetid: '1' }], totalPages: 1 };
         const env = setup(async () => { await gate; return ok(data); });
         const first = env.send(action);
         const second = env.send(action);
@@ -835,4 +857,183 @@ test('a server Retry-After delays other owners too instead of moving a burst to 
     const replies = await Promise.all([env.send('fetchProfile', owner(0)), env.send('fetchProfile', owner(1))]);
     assert.ok(replies.every(result => result.success));
     assert.ok(env.requestTimes[1] - env.requestTimes[0] >= 2000);
+});
+
+test('collection action returns Weather cash quotes and never transfers collection ownership or opens a scan', async () => {
+    const catalog = collectionCatalog();
+    catalog.collections[0].items[0].image = 'x'.repeat(100000);
+    const env = setup(async () => ok(catalog));
+    const result = await env.send('fetchCollection', steamId, { scan: true });
+    assert.equal(result.success, true);
+    assert.equal(result.cached, false);
+    assert.equal(result.needsScan, undefined);
+    assert.equal(result.scanned, undefined);
+    assert.deepEqual(env.imports, ['collection-prices.js']);
+    assert.deepEqual(JSON.parse(JSON.stringify(result.data)), {
+        items: [
+            { marketHashName: 'Genuine Weather Rain', priceCents: 613 },
+            { marketHashName: 'Genuine Weather Aurora', priceCents: 92 }
+        ], collectionCount: 1, itemCount: 2
+    });
+    assert.deepEqual(env.requests, [`https://steamprice.com/api/dota2/collection/${steamId}`]);
+    assert.deepEqual(env.tabs, { created: [], removed: [] });
+    await env.flush();
+    const saved = env.stored[cacheKey].entries[`fetchCollection:${steamId}`];
+    assert.equal(saved.data.items[0].assetid, undefined);
+    assert.equal(saved.data.items[0].ownedAssetid, undefined);
+    assert.equal(saved.data.items[0].owned, undefined);
+    assert.equal(saved.data.items[0].image, undefined);
+    assert.ok(JSON.stringify(saved.data).length < 300);
+});
+
+test('an empty collection catalog is cached without triggering an inventory scan', async () => {
+    const env = setup(async () => ok({ collections: [] }));
+    const first = await env.send('fetchCollection');
+    const second = await env.send('fetchCollection');
+    assert.equal(first.success, true);
+    assert.deepEqual(JSON.parse(JSON.stringify(first.data)), { items: [], collectionCount: 0, itemCount: 0 });
+    assert.equal(second.cached, true);
+    assert.equal(second.needsScan, undefined);
+    assert.equal(env.requests.length, 1);
+    assert.equal(env.tabs.created.length, 0);
+});
+
+test('collection requests validate the viewer ID before contacting the public API', async () => {
+    const env = setup(async () => { throw new Error('Must not fetch'); });
+    for (const id of ['../collection', '7656119801234567', 76561198012345678, null]) {
+        const result = await env.send('fetchCollection', id);
+        assert.equal(result.success, false);
+        assert.match(result.error, /SteamID64/);
+    }
+    assert.equal(env.requests.length, 0);
+    assert.equal(env.tabs.created.length, 0);
+});
+
+test('persisted collection catalogs stay separate from asset prices, profile totals, and other viewers', async () => {
+    const stored = { unrelatedPreference: 'keep' };
+    const first = setup(async url => ok(url.includes('/collection/') ? collectionCatalog()
+        : url.includes('/profile/') ? { totalValueCents: 12345 }
+            : { items: [{ assetid: '123', marketHashName: 'Genuine Weather Rain', priceCents: 777 }], totalPages: 1 }), { stored });
+    await Promise.all(['fetchProfile', 'fetchPrices', 'fetchCollection'].map(action => first.send(action)));
+    await first.flush();
+    const restarted = setup(async () => ok(collectionCatalog(500)), { stored, now: first.currentTime });
+    const cached = await restarted.send('fetchCollection');
+    assert.equal(cached.cached, true);
+    assert.equal(cached.data.items[0].priceCents, 613);
+    assert.equal((await restarted.send('fetchPrices')).data.items[0].priceCents, 777);
+    assert.equal((await restarted.send('fetchProfile')).data.totalValueCents, 12345);
+    assert.equal(restarted.requests.length, 0);
+    const other = await restarted.send('fetchCollection', owner(1));
+    assert.equal(other.cached, false);
+    assert.equal(other.data.items[0].priceCents, 500);
+    assert.equal(restarted.requests.length, 1);
+    assert.equal(stored.unrelatedPreference, 'keep');
+});
+
+test('collection outages return only a labeled unexpired last complete catalog', async () => {
+    let outage = false;
+    const env = setup(async () => outage ? http(502) : ok(collectionCatalog()));
+    const initial = await env.send('fetchCollection');
+    env.advance(90000);
+    outage = true;
+    const stale = await env.send('fetchCollection');
+    assert.equal(stale.success, true);
+    assert.equal(stale.cached, true);
+    assert.equal(initial.success, true);
+    assert.equal(stale.cachedAt, 1800000000000);
+    assert.equal(stale.data.items[0].priceCents, 613);
+    assert.match(stale.error, /502/);
+    assert.equal(env.requests.length, 4);
+    env.advance(24 * 60 * 60 * 1000);
+    const expired = await env.send('fetchCollection');
+    assert.equal(expired.success, false);
+    assert.equal(expired.data, undefined);
+    assert.equal(env.tabs.created.length, 0);
+});
+
+test('invalid collection payloads and HTTP 403 cannot masquerade as a cached successful valuation', async () => {
+    for (const failure of [http(403), ok([]), ok({}), ok({ collections: [{}] }), ok({ success: false, error: 'Unavailable catalog' })]) {
+        let fail = false;
+        const env = setup(async () => fail ? failure : ok(collectionCatalog()));
+        await env.send('fetchCollection');
+        env.advance(90000);
+        fail = true;
+        const result = await env.send('fetchCollection');
+        assert.equal(result.success, false);
+        assert.equal(result.data, undefined);
+        assert.equal(env.requests.length, 2);
+        assert.equal(env.tabs.created.length, 0);
+    }
+});
+
+test('collection response decoding shares the single paced GET gate with inventory and profile loading', async () => {
+    let release;
+    const env = setup(async url => url.includes('/collection/')
+        ? { ok: true, status: 200, json: () => new Promise(resolve => { release = () => resolve(collectionCatalog()); }) }
+        : ok(url.includes('/profile/') ? { totalValueCents: 123 } : { items: [{ assetid: '123' }], totalPages: 1 }));
+    const collection = env.send('fetchCollection');
+    await env.flush();
+    const profile = env.send('fetchProfile', owner(1));
+    const prices = env.send('fetchPrices', owner(2), { scan: false });
+    await env.flush();
+    assert.equal(env.requests.length, 1, 'The collection body retains the GET slot while decoding');
+    release();
+    const results = await Promise.all([collection, profile, prices]);
+    assert.ok(results.every(result => result.success));
+    assert.equal(env.requests.length, 3);
+    for (let index = 1; index < env.requestTimes.length; index++) {
+        assert.ok(env.requestTimes[index] - env.requestTimes[index - 1] >= 350);
+    }
+    assert.equal(env.tabs.created.length, 0);
+});
+
+test('corrupt compact collection cache entries are rejected while extra raw ownership is discarded', async () => {
+    const now = 1800000000000;
+    const compact = { items: [{ marketHashName: 'Genuine Weather Rain', priceCents: 613 }], collectionCount: 1, itemCount: 1 };
+    for (const data of [
+        { ...compact, itemCount: 2 },
+        { ...compact, collectionCount: 1001 },
+        { ...compact, items: [{ marketHashName: 'Genuine Weather Rain', priceCents: 0 }] },
+        { ...compact, items: [{ marketHashName: '', priceCents: 10 }] }
+    ]) {
+        const stored = { [cacheKey]: { version: 1, entries: {
+            [`fetchCollection:${steamId}`]: { action: 'fetchCollection', steamId, cachedAt: now, data }
+        } } };
+        const env = setup(async () => ok(collectionCatalog(500)), { stored, now });
+        const result = await env.send('fetchCollection');
+        assert.equal(result.cached, false);
+        assert.equal(result.data.items[0].priceCents, 500);
+        assert.equal(env.requests.length, 1);
+    }
+    const contaminated = { ...compact, items: [{ ...compact.items[0], ownedAssetid: '123', assetid: '456', image: 'x'.repeat(10000) }] };
+    const stored = { [cacheKey]: { version: 1, entries: {
+        [`fetchCollection:${steamId}`]: { action: 'fetchCollection', steamId, cachedAt: now, data: contaminated }
+    } } };
+    const env = setup(async () => { throw new Error('Fresh cache should avoid a GET'); }, { stored, now });
+    const result = await env.send('fetchCollection');
+    assert.equal(result.cached, true);
+    assert.deepEqual(JSON.parse(JSON.stringify(result.data)), compact);
+    assert.equal(env.requests.length, 0);
+});
+
+test('large collection catalogs cache only compact prices and survive compressed worker restarts', async () => {
+    const catalog = collectionCatalog();
+    const template = catalog.collections[0].items[1];
+    catalog.collections[0].items = Array.from({ length: 1000 }, (_, index) => ({
+        ...template, itemName: `Ordinary collection item ${index}`, cashPriceCents: 100 + index, image: 'x'.repeat(1000)
+    }));
+    const stored = {};
+    const env = setup(async () => ok(catalog), { stored });
+    const initial = await env.send('fetchCollection');
+    assert.equal(initial.data.itemCount, 1000);
+    for (let attempt = 0; attempt < 30 && stored[cacheKey]?.encoding !== 'gzip'; attempt++) await new Promise(resolve => setTimeout(resolve, 5));
+    assert.equal(stored[cacheKey]?.encoding, 'gzip');
+    const restarted = setup(async () => { throw new Error('Must use the compressed catalog cache'); }, { stored });
+    const restored = await restarted.send('fetchCollection');
+    assert.equal(restored.cached, true);
+    assert.equal(restored.data.collectionCount, 1);
+    assert.equal(restored.data.itemCount, 1000);
+    assert.equal(restored.data.items[999].priceCents, 1099);
+    assert.equal(restored.data.items[999].image, undefined);
+    assert.equal(restarted.requests.length, 0);
 });

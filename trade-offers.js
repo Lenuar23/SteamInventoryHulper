@@ -77,8 +77,19 @@
     for (const field of ['hasGems', 'hasColoredGem']) {
       if (value[field] === true) item[field] = true;
     }
+    for (const field of ['tradable', 'marketable']) {
+      const flags = [value[field], description[field]];
+      if (flags.some(flag => flag === false || flag === 0)) item[field] = false;
+      else if (flags.some(flag => flag === true || flag === 1)) item[field] = true;
+    }
     if (typeof value.variantFingerprint === 'string' && value.variantFingerprint.length <= 160) {
       item.variantFingerprint = value.variantFingerprint;
+    }
+    if (typeof value.ordinaryFingerprint === 'string' && value.ordinaryFingerprint.length <= 560) {
+      item.ordinaryFingerprint = value.ordinaryFingerprint;
+    }
+    if (typeof value.catalogFingerprint === 'string' && value.catalogFingerprint.length <= 600) {
+      item.catalogFingerprint = value.catalogFingerprint;
     }
     const currencyId = numericId(value.currencyId ?? value.currencyid);
     if (value.isCurrency === true || value.is_currency === true || currencyId) {
@@ -137,7 +148,10 @@
         if (!metadata) continue;
         const item = normalizeItem({ ...old, market_hash_name: metadata.market_hash_name,
           hasGems: old.hasGems || metadata.hasGems, hasColoredGem: old.hasColoredGem || metadata.hasColoredGem,
-          variantFingerprint: metadata.variantFingerprint }, old.ownerSteamId);
+          variantFingerprint: metadata.variantFingerprint, ordinaryFingerprint: metadata.ordinaryFingerprint,
+          catalogFingerprint: metadata.catalogFingerprint,
+          tradable: old.tradable === false || old.tradable === 0 || metadata.tradable === false || metadata.tradable === 0 ? false : metadata.tradable ?? old.tradable,
+          marketable: old.marketable === false || old.marketable === 0 || metadata.marketable === false || metadata.marketable === 0 ? false : metadata.marketable ?? old.marketable }, old.ownerSteamId);
         if (!item) continue;
         // Class hovers do not carry a context. Leave it unknown rather than
         // representing a verified Dota class as an explicit invalid context.
@@ -462,10 +476,17 @@
           const gems = Gems?.analyzeSteamAsset(description);
           // Class metadata supplies names and variant flags only. The caller
           // keeps ownership and asset IDs from its already verified native DOM.
-          metadata.push({ ownerSteamId: item.ownerSteamId, appId: item.appId, classId: item.classId, instanceId: item.instanceId,
+          const entry = { ownerSteamId: item.ownerSteamId, appId: item.appId, classId: item.classId, instanceId: item.instanceId,
             market_hash_name: typeof description.market_hash_name === 'string' ? description.market_hash_name.slice(0, 512) : '',
             hasGems: Boolean(gems?.hasGems), hasColoredGem: Boolean(gems?.hasColoredGem),
-            variantFingerprint: Prices?.variantFingerprint(description) || null });
+            variantFingerprint: Prices?.variantFingerprint(description) || null,
+            ordinaryFingerprint: Prices?.ordinaryFingerprint(description) || null,
+            catalogFingerprint: Prices?.catalogFingerprint(description) || null };
+          for (const field of ['tradable', 'marketable']) {
+            if (description[field] === false || description[field] === 0) entry[field] = false;
+            else if (description[field] === true || description[field] === 1) entry[field] = true;
+          }
+          metadata.push(entry);
         } catch (_) { failed = true; }
       }
     }

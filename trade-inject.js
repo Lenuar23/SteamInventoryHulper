@@ -101,7 +101,7 @@
         const ownerSteamId = steamId(user);
         const count = quantity(amount === undefined ? asset?.amount : amount);
         const key = [side, ownerSteamId, String(app), String(context), assetId(asset), count,
-            desc.market_hash_name, desc.market_name, desc.name];
+            desc.market_hash_name, desc.market_name, desc.name, desc.tradable, desc.marketable];
         const cached = asset && typeof asset === 'object' ? itemSnapshots.get(asset) : null;
         if (cached && cached.description === desc && cached.descriptions === desc.descriptions &&
             key.every((value, index) => cached.key[index] === value)) return cached.data;
@@ -109,9 +109,13 @@
         const data = {
             assetId: assetId(asset), ownerSteamId, side, appId: String(app), contextId: String(context),
             name: String(desc.market_hash_name || desc.market_name || desc.name || '').slice(0, 512),
-            market_hash_name: String(desc.market_hash_name || desc.market_name || '').slice(0, 512),
+            market_hash_name: String(desc.market_hash_name || '').slice(0, 512),
             amount: count, hasGems: Boolean(gems.hasGems), hasColoredGem: Boolean(gems.hasColoredGem)
         };
+        for (const field of ['tradable', 'marketable']) {
+            if ([true, 1, '1'].includes(desc[field])) data[field] = true;
+            else if ([false, 0, '0'].includes(desc[field])) data[field] = false;
+        }
         if (asset && typeof asset === 'object') itemSnapshots.set(asset, { key, description: desc, descriptions: desc.descriptions, data });
         return data;
     }
@@ -333,24 +337,19 @@
         };
     }
 
-    function cleanName(name) {
-        return String(name || '').toLowerCase()
-            .replace(/^(inscribed|autographed|corrupted|frozen|heroic|cursed|genuine|favored|ascent|elder|unusual|exalted|infused|auspicious|base|legacy|sealed)\s+/i, '')
-            .replace(/\s+(bundle|set)$/i, '').trim();
-    }
-
     function priceFor(holder, prices) {
         const asset = holderAsset(holder);
         const id = assetId(asset);
         if (prices.assets.has(id)) return prices.assets.get(id);
         const desc = description(asset);
-        const name = String(desc.market_hash_name || desc.market_name || '').toLowerCase().trim();
+        const name = String(desc.market_hash_name || '').toLowerCase().trim();
         // Different sockets and qualities can share a market hash name. Only
         // an exact owner/asset price can value these individual variants.
-        if (!name || gemDetails(asset).hasGems || /\b(?:fractal horns of inner abysm|baby roshan|jumo)\b/i.test(name) ||
+        if (!name || [false, 0, '0'].includes(desc.tradable) || [false, 0, '0'].includes(desc.marketable) ||
+            gemDetails(asset).hasGems || /\b(?:fractal horns of inner abysm|baby roshan|jumo)\b/i.test(name) ||
             /^(?:unusual|inscribed|autographed|corrupted)\s+/i.test(name)) return null;
         if (prices.names.has(name)) return prices.names.get(name);
-        return prices.cleanNames.has(cleanName(name)) ? prices.cleanNames.get(cleanName(name)) : null;
+        return null;
     }
 
     function ensureSelected(user, ownerId) {

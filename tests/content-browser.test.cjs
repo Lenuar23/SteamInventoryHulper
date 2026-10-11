@@ -6,8 +6,8 @@ const { chromium } = require('playwright');
 const OWNER = '76561198012345678';
 const OTHER_OWNER = '76561198087654321';
 const DEFAULT_ITEMS = [
-    { assetid: '100', marketHashName: 'Same Name', priceCents: '250' },
-    { assetid: '101', marketHashName: 'Same Name', priceCents: '999' }
+    { assetid: '100', marketHashName: 'Same Name', priceCents: '250', tradable: true, marketable: true },
+    { assetid: '101', marketHashName: 'Same Name', priceCents: '999', tradable: true, marketable: true }
 ];
 const INVENTORY = [
     { assetId: '100', name: 'Same Name' },
@@ -181,7 +181,77 @@ test('zero total and zero item prices display as $0.00', async t => {
     assert.equal(await sortButton(page, 'desc').isEnabled(), true);
 });
 
-test('malformed generic record IDs, empty cleaned names and invalid prices do not poison sort messages', async t => {
+test('Candyworks and nonmarketable Sniper copies cannot inherit a tradable item price, while exact assets and gem previews remain available', async t => {
+    const sniper = 'Full-Bore Bonanza';
+    const native = (assetId, extra = {}) => ({ assetId, name: sniper, marketHashName: sniper,
+        tradable: true, marketable: true, quality: 'unique', ...extra });
+    const page = await openFixture(t, {
+        totalValueCents: 3321,
+        inventory: [
+            native('100', { tradable: false, marketable: false }),
+            native('101', { tradable: 1, marketable: 0 }),
+            native('102'),
+            native('103', { tradable: null, marketable: null }),
+            native('104', { marketHashName: undefined }),
+            native('105', { name: 'Explicit owner valuation', marketHashName: 'Explicit owner valuation', tradable: false, marketable: false }),
+            { ...NATIVE_TB, assetId: '106', marketHashName: NATIVE_TB.name, tradable: false, marketable: false }
+        ],
+        items: [
+            { assetid: '900', marketHashName: sniper, priceCents: 10002, tradable: true, marketable: true, assetQuality: 'standard' },
+            { assetid: '105', marketHashName: 'Explicit owner valuation', priceCents: 123, tradable: false, marketable: false }
+        ]
+    });
+    await waitText(badge(page, '102'), '$100.02');
+    await waitText(badge(page, '105'), '$1.23');
+    for (const id of ['100', '101', '103', '104', '106']) {
+        assert.equal(await badge(page, id).count(), 0, `asset ${id} has no matching eligible market valuation`);
+    }
+    await colorLink(page, '106').waitFor({ state: 'visible' });
+    const colorUrl = new URL(await colorLink(page, '106').getAttribute('href'));
+    assert.deepEqual(['r', 'g', 'b'].map(key => colorUrl.searchParams.get(key)), ['161', '255', '89']);
+    assert.equal(colorUrl.searchParams.get('kind'), 'regular');
+    await sortButton(page, 'desc').click();
+    await page.waitForFunction(() => window.__sortRequests.length === 1);
+    const prices = await page.evaluate(() => window.__sortRequests[0].prices);
+    assert.deepEqual(prices.namePrices, [[sniper.toLowerCase(), 10002]]);
+    assert.ok(prices.assetPrices.some(([id, cents]) => id === '105' && cents === 123));
+    assert.equal(await page.locator('#sih-lite-total-text').textContent(), 'Dota 2 value: $33.21',
+        'full inventory value remains the API total rather than the sum of unrelated market variants');
+});
+
+test('name fallback preserves complete canonical names and rejects conflicting, unpriced, socketed and unknown API variants', async t => {
+    const native = (assetId, name, extra = {}) => ({ assetId, name, marketHashName: name,
+        tradable: true, marketable: true, quality: 'unique', ...extra });
+    const api = (assetid, marketHashName, priceCents, extra = {}) => ({ assetid, marketHashName, priceCents,
+        tradable: true, marketable: true, ...extra });
+    const page = await openFixture(t, {
+        inventory: [
+            native('100', 'Blade'), native('101', 'Plain Blade'), native('102', 'Ambiguous Sniper'),
+            native('103', 'Unknown Price'), native('104', 'Display-only Name', { marketHashName: undefined }),
+            native('105', 'Socketed Item', { hasGems: true }), native('106', 'Plain Safe Item'),
+            native('107', 'API Flags Unknown'), native('108', 'Plain Safe Item', { quality: 'genuine' }),
+            native('109', 'Plain Safe Item', { hasSocket: true }), native('110', 'API Gem Item')
+        ],
+        items: [
+            api('900', 'Inscribed Blade Set', 50000), api('901', 'Plain Blade Bundle', 2000),
+            api('902', 'Ambiguous Sniper', 1000), api('903', 'Ambiguous Sniper', 2000),
+            api('904', 'Unknown Price', null), api('905', 'Unknown Price', 3000),
+            api('906', 'Display-only Name', 4000), api('907', 'Socketed Item', 5000),
+            api('908', 'Plain Safe Item', 700), api('909', 'API Flags Unknown', 6000, { tradable: undefined, marketable: undefined }),
+            api('910', 'API Gem Item', 7000, { prismaticGems: ['Bright Green'] })
+        ]
+    });
+    await waitText(badge(page, '106'), '$7.00');
+    for (const id of ['100', '101', '102', '103', '104', '105', '107', '108', '109', '110']) {
+        assert.equal(await badge(page, id).count(), 0, `unsafe fallback ${id} must remain unpriced`);
+    }
+    await sortButton(page, 'desc').click();
+    await page.waitForFunction(() => window.__sortRequests.length === 1);
+    const names = await page.evaluate(() => window.__sortRequests[0].prices.namePrices);
+    assert.ok(!names.some(([name]) => ['blade', 'plain blade', 'ambiguous sniper', 'unknown price', 'api flags unknown', 'api gem item'].includes(name)));
+});
+
+test('malformed generic record IDs, missing canonical names and invalid prices do not poison sort messages', async t => {
     const page = await openFixture(t, { items: [
         ...DEFAULT_ITEMS,
         { id: 'price-row-uuid', name: 'Unusual ', priceCents: 1 },
@@ -214,7 +284,8 @@ test('all sort buttons work when profile total fails and send complete known pri
     assert.deepEqual(requests.map(request => request.order), ['desc', 'asc', 'original']);
     assert.ok(requests.every(request => request.steamId === OWNER));
     assert.deepEqual(requests[0].prices.assetPrices, [['100', 250], ['101', 999]]);
-    assert.ok(requests[0].prices.namePrices.some(([name, price]) => name === 'same name' && price === 999));
+    assert.ok(!requests[0].prices.namePrices.some(([name]) => name === 'same name'),
+        'conflicting same-name prices cannot pick a winner by API row order');
     assert.equal(await page.locator('#sih-lite-status').textContent(), 'Profile total unavailable Steam order restored.');
 });
 

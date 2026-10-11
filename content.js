@@ -15,10 +15,37 @@
     let gemFilter = 'all', gemDataRevision = 0;
     let refreshGemDataAfterState = false;
 
-    const cleanName = name => String(name || '').toLowerCase()
-        .replace(/^(inscribed|autographed|corrupted|frozen|heroic|cursed|genuine|favored|ascent|elder|unusual|exalted|infused|auspicious|base|legacy|sealed)\s+/i, '')
-        .replace(/\s+(bundle|set)$/i, '').trim();
+    const NON_STANDARD_NAME = /^(?:inscribed|autographed|corrupted|frozen|heroic|cursed|genuine|favored|ascent|elder|unusual|exalted|infused|auspicious|base|legacy|sealed)\s+/i;
+    const GEM_CAPABLE_NAME = /\b(?:fractal horns of inner abysm|baby roshan|jumo)\b/i;
     const money = cents => `$${(cents / 100).toFixed(2)}`;
+
+    function canonicalName(item) {
+        const value = item?.marketHashName || item?.market_hash_name || item?.hash_name;
+        return typeof value === 'string' && value.trim().length > 0 && value.trim().length <= 512
+            ? value.trim().toLowerCase() : '';
+    }
+
+    function permitted(value) {
+        return value === true || value === 1 || value === '1';
+    }
+
+    function plainNameFallback(item, name, gemInfo, apiRecord = false) {
+        if (!name || !permitted(item.tradable) || !permitted(item.marketable) || NON_STANDARD_NAME.test(name) ||
+            GEM_CAPABLE_NAME.test(name) || item.hasGems === true || item.hasColoredGem === true ||
+            item.hasSocket === true || gemInfo?.hasGems) return false;
+        if ([item.assetQuality, item.quality].some(quality => quality != null &&
+            !['standard', 'unique'].includes(String(quality).toLowerCase()))) return false;
+        const tags = apiRecord ? item.rawTags || item.tags : null;
+        const qualities = (Array.isArray(tags) ? tags : []).filter(tag => String(tag?.category).toLowerCase() === 'quality');
+        if (qualities.length > 1 || (qualities.length === 1 && String(qualities[0].internal_name).toLowerCase() !== 'unique')) return false;
+        return !apiRecord || (!['collectorAvgSaleCents', 'collectorLowestAskCents', 'legacyRgb']
+            .some(key => item[key] != null) && item.isLegacy !== true && !(Number(item.emptySockets) > 0));
+    }
+
+    function storePrice(map, key, cents) {
+        if (!map.has(key)) map.set(key, cents);
+        else if (map.get(key) !== cents) map.set(key, null);
+    }
 
     function parsePrice(item) {
         if (!item || typeof item !== 'object') return null;
@@ -44,27 +71,26 @@
         apiGemInfo.clear();
         gemDataRevision++;
         for (const item of items) {
+            if (!item || typeof item !== 'object') continue;
             const assetId = item.assetid ?? item.assetId ?? item.asset_id ?? item.id;
+            const gemInfo = globalThis.SIHLiteGems.analyzeSteampriceItem(item);
             if (/^\d{1,20}$/.test(String(assetId))) {
-                apiGemInfo.set(String(assetId), globalThis.SIHLiteGems.analyzeSteampriceItem(item));
+                apiGemInfo.set(String(assetId), gemInfo);
             }
             const cents = parsePrice(item);
-            if (cents === null) continue;
-            if (/^\d{1,20}$/.test(String(assetId))) assetPrices.set(String(assetId), cents);
-            const name = item.marketHashName || item.market_hash_name || item.hash_name || item.name || item.marketName || item.market_name || item.title || item.item_name;
-            if (name) {
-                for (const key of [String(name).trim().toLowerCase(), cleanName(name)]) {
-                    if (key && key.length <= 512) namePrices.set(key, cents);
-                }
-            }
+            if (cents !== null && /^\d{1,20}$/.test(String(assetId))) storePrice(assetPrices, String(assetId), cents);
+            const name = canonicalName(item);
+            if (plainNameFallback(item, name, gemInfo, true)) storePrice(namePrices, name, cents);
         }
     }
 
-    function getPrice(assetId, name) {
+    function getPrice(assetId, item) {
         if (assetPrices.has(assetId)) return assetPrices.get(assetId);
-        const raw = String(name || '').trim().toLowerCase();
-        if (namePrices.has(raw)) return namePrices.get(raw);
-        return namePrices.get(cleanName(name)) ?? null;
+        // Missing API assets can be nonmarketable Candyworks copies. Their
+        // image or display name does not establish a matching market variant.
+        const name = canonicalName(item);
+        if (!item || !plainNameFallback(item, name, item)) return null;
+        return namePrices.get(name) ?? null;
     }
 
     function request(action, id, force = false) {
@@ -158,7 +184,8 @@
         }, 125000);
         pendingSorts.set(requestId, { timer, type: 'SORT', order, generation, gemDataRevision });
         window.postMessage({source: 'SIH_LITE_CONTENT', type: 'SORT', requestId, steamId, order,
-            prices: {assetPrices: Array.from(assetPrices), namePrices: Array.from(namePrices)}}, window.location.origin);
+            prices: {assetPrices: Array.from(assetPrices).filter(([, cents]) => cents !== null),
+                namePrices: Array.from(namePrices).filter(([, cents]) => cents !== null)}}, window.location.origin);
         queueRender();
     }
 
@@ -322,7 +349,7 @@
             const assetId = match[1], info = inventoryItems.get(assetId), image = slot.querySelector('img');
             const name = info?.name || image?.alt || image?.title || '';
             renderColorLink(slot, assetId, name);
-            const cents = getPrice(assetId, name), isCache = info?.isCache || /collector'?s cache/i.test(name);
+            const cents = getPrice(assetId, info), isCache = info?.isCache || /collector'?s cache/i.test(name);
             if (cents === null && !isCache) { if (badge) badge.remove(); continue; }
             if (!badge) { badge = document.createElement('div'); slot.appendChild(badge); }
             const className = `sih-lite-badge sih-lite-${cents === null ? 'cache' : 'price'}`;

@@ -89,15 +89,39 @@ test('foreign owners, malformed prices and unsupported requests fail promptly wi
     assert.equal(h.own.layouts, undefined);
 });
 
-test('a conflicting cleaned alias cannot borrow a cheaper exact name price', async () => {
+test('native sorting never strips quality prefixes to borrow another variant price', async () => {
     const h = harness([asset(1, 'Exalted Blade'), asset(2, 'Blade'), asset(3, 'Genuine Blade'), asset(4, 'Frozen Sword')]);
-    // Blade 100 and Genuine Blade 200 conflict on cleaned "blade". Root removes
-    // that ambiguous alias but keeps both unambiguous canonical exact names.
+    // Only matching canonical names can price these items. Frozen Sword must
+    // not receive the price of an ordinary Sword from the old cleaned map.
     h.sort({ prices: { assetPrices: [], namePrices: [['blade', 100], ['genuine blade', 200]],
         cleanNamePrices: [['sword', 50]] } });
     await flush();
     assert.equal(result(h).success, true);
-    assert.deepEqual(h.own.rgItemElements.map(holder => holder.rgItem.id), ['3', '2', '4', '1']);
+    assert.deepEqual(h.own.rgItemElements.map(holder => holder.rgItem.id), ['3', '2', '1', '4']);
+});
+
+test('nonmarketable copies and missing canonical names cannot borrow trade sorting prices', async () => {
+    const copies = [asset(1, 'Sniper Scope', { tradable: 0, marketable: 0 }),
+        asset(2, 'Sniper Scope', { tradable: 1, marketable: 1 }),
+        asset(3, 'Sniper Scope', { tradable: false, marketable: true }),
+        asset(4, '', { market_name: 'Sniper Scope', tradable: 1, marketable: 1 }),
+        asset(5, 'Genuine Sniper Scope', { tradable: 1, marketable: 1 }),
+        asset(6, 'Sniper Scope Bundle', { tradable: 1, marketable: 1 }),
+        asset(7, 'Sniper Scope', { tradable: 0, marketable: 0 })];
+    const h = harness(copies);
+    const state = h.state();
+    assert.equal(state.inventories[0].items[0].tradable, false);
+    assert.equal(state.inventories[0].items[0].marketable, false);
+    assert.equal(state.inventories[0].items[3].market_hash_name, '');
+    h.sort({ prices: { assetPrices: [['7', 751]], namePrices: [['sniper scope', 100]],
+        cleanNamePrices: [['sniper scope', 9999]] } });
+    await flush();
+    assert.equal(result(h).success, true);
+    assert.deepEqual(h.own.rgItemElements.map(holder => holder.rgItem.id), ['7', '2', '1', '3', '4', '5', '6']);
+    copies[0].tradable = copies[0].marketable = 1;
+    const updated = h.state();
+    assert.equal(updated.inventories[0].items.find(item => item.assetId === '1').marketable, true,
+        'metadata cache must notice marketability changes');
 });
 
 test('pending native replacement loads fully, reports owner progress and rejects a concurrent sort', async () => {

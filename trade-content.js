@@ -15,6 +15,8 @@
     const requestQueue = [];
     let runningRequests = 0, renderQueued = false, editor = null, list = null;
     let lastRenderAt = 0, badgeEpoch = 0;
+    let ordinaryEstimates = new Map(), ordinaryEstimateEpoch = 0;
+    const collection = { owner: null, index: new Map(), state: 'idle', error: '', cache: null, epoch: 0 };
     const badgeNodes = new Set();
     const observedOffers = new WeakSet();
     const offerObserver = typeof IntersectionObserver === 'function'
@@ -102,6 +104,7 @@
             data.needsScan = data.priceCache.needsScan;
             data.priceError = data.priceCache.error;
             data.priceState = 'ready';
+            void rebuildOrdinaryEstimates();
             queueRender();
             // A price request may have populated an empty Steamprice inventory.
             // Refresh the full value after the initial profile request settles.
@@ -135,6 +138,64 @@
             if (start + 300 < items.length) await new Promise(resolve => setTimeout(resolve, 0));
         }
         return index;
+    }
+
+    async function rebuildOrdinaryEstimates() {
+        const epoch = ++ordinaryEstimateEpoch;
+        const estimates = new Map();
+        const maps = [...owners.values()].map(data => data.index?.sharedOrdinaryPrices).filter(map => map instanceof Map);
+        let processed = 0;
+        for (const map of maps) for (const [key, cents] of map) {
+            if (epoch !== ordinaryEstimateEpoch) return;
+            if (!estimates.has(key)) estimates.set(key, cents);
+            else if (estimates.get(key) !== cents) estimates.set(key, null);
+            if (++processed % 300 === 0) await new Promise(resolve => setTimeout(resolve, 0));
+        }
+        if (epoch !== ordinaryEstimateEpoch) return;
+        ordinaryEstimates = estimates;
+        queueRender();
+    }
+
+    async function loadCollection(owner, force = false) {
+        if (!validOwner(owner) || collection.state === 'loading') return;
+        const epoch = ++collection.epoch;
+        if (collection.owner !== owner) collection.index = new Map();
+        collection.owner = owner;
+        collection.state = 'loading'; collection.error = '';
+        queueRender();
+        try {
+            const response = await request('fetchCollection', owner, force);
+            if (epoch !== collection.epoch || collection.owner !== owner) return;
+            if (!Array.isArray(response?.items) || response.items.length > 100000) {
+                throw new Error('Steamprice returned invalid collection prices.');
+            }
+            const index = new Map();
+            for (let start = 0; start < response.items.length; start += 300) {
+                if (epoch !== collection.epoch) return;
+                const part = Prices.buildCatalogIndex(response.items.slice(start, start + 300));
+                for (const [name, cents] of part) {
+                    if (!index.has(name)) index.set(name, cents);
+                    else if (index.get(name) !== cents) index.set(name, null);
+                }
+                if (start + 300 < response.items.length) await new Promise(resolve => setTimeout(resolve, 0));
+            }
+            if (epoch !== collection.epoch) return;
+            collection.index = index;
+            collection.cache = response.cacheInfo;
+            collection.error = collection.cache.error;
+            collection.state = 'ready';
+        } catch (error) {
+            if (epoch !== collection.epoch) return;
+            collection.error = error.message;
+            collection.state = 'error';
+            if (collection.index.size) collection.cache = { ...collection.cache, cached: true, error: error.message };
+        }
+        queueRender();
+    }
+
+    function needsCollection(items) {
+        return items.some(item => item.catalogFingerprint &&
+            Prices.getPrice(priceIndex(item.ownerSteamId), item, ordinaryEstimates, collection.index).cents === null);
     }
 
     function loadProfile(data, force = false) {
@@ -238,8 +299,8 @@
     }
 
     function renderSummary(element, give, receive, me, them, extraStatus = '', completeness = {}) {
-        const a = Prices.summarize(give, priceIndex(me));
-        const b = Prices.summarize(receive, priceIndex(them));
+        const a = Prices.summarize(give, priceIndex(me), ordinaryEstimates, collection.index);
+        const b = Prices.summarize(receive, priceIndex(them), ordinaryEstimates, collection.index);
         if (completeness.me === false) a.complete = false;
         if (completeness.them === false) b.complete = false;
         const net = Prices.difference(a, b);
@@ -262,6 +323,19 @@
         if (a.nonDotaCount + b.nonDotaCount) status.push('Only Dota 2 items are priced.');
         const estimated = (a.estimatedCount || 0) + (b.estimatedCount || 0);
         if (estimated) status.push('Includes ' + estimated + ' current gem variant estimate' + (estimated === 1 ? '.' : 's.'));
+        const ordinaryEstimated = (a.ordinaryEstimatedCount || 0) + (b.ordinaryEstimatedCount || 0);
+        if (ordinaryEstimated) status.push('Includes ' + ordinaryEstimated + ' current Steamprice ordinary-item estimate' +
+            (ordinaryEstimated === 1 ? '.' : 's.') + ' Saved source prices may be cached.');
+        const catalogEstimated = (a.catalogEstimatedCount || 0) + (b.catalogEstimatedCount || 0);
+        if (catalogEstimated) {
+            status.push('Includes ' + catalogEstimated + ' current Steamprice collection estimate' + (catalogEstimated === 1 ? '.' : 's.'));
+            const cached = cacheNotice(collection.cache, 'Cached collection prices');
+            if (cached) status.push(cached);
+        }
+        if (needsCollection([...give, ...receive])) {
+            if (collection.state === 'loading') status.push('Loading Steamprice collection prices…');
+            else if (collection.error) status.push('Steamprice collection prices: ' + collection.error);
+        }
         for (const id of new Set([me, them])) {
             const data = owners.get(id);
             if (data?.priceState === 'loading') status.push('Loading ' + (id === me ? 'your' : 'partner') + ' prices…');
@@ -276,8 +350,8 @@
 
     function renderBadge(element, item) {
         let badge = element.querySelector('.sih-lite-trade-price');
-        const price = Prices.getPrice(priceIndex(item.ownerSteamId), item);
-        const value = Prices.summarize([item], priceIndex(item.ownerSteamId));
+        const price = Prices.getPrice(priceIndex(item.ownerSteamId), item, ordinaryEstimates, collection.index);
+        const value = Prices.summarize([item], priceIndex(item.ownerSteamId), ordinaryEstimates, collection.index);
         if (price.cents === null || !value.complete) {
             if (badge) badge.remove();
             return;
@@ -296,6 +370,9 @@
         text(badge, money(value.knownCents));
         badge.title = 'Steamprice: ' + money(price.cents) + ' each, quantity ' + String(item.amount ?? 1) + '.' +
             (price.source === 'variant' ? ' Current estimate for the matching gem variant; exact asset details are unavailable.' : '') +
+            (price.source === 'ordinary-estimate' ? ' Current ordinary-item estimate from saved Steamprice prices; exact asset details are unavailable. Source prices may be cached.' : '') +
+            (price.source === 'catalog' ? ' Current estimate from Steamprice collection; exact asset details are unavailable.' +
+                (collection.cache?.cached ? ' ' + cacheNotice(collection.cache, 'Cached collection prices') : '') : '') +
             (owners.get(item.ownerSteamId)?.priceCache?.cached
                 ? ' ' + cacheNotice(owners.get(item.ownerSteamId).priceCache, 'Cached prices') : '');
     }
@@ -446,7 +523,7 @@
             }
             // Only ordinary, unambiguous aliases may price items Steam has not
             // loaded yet. An asset-specific gem price is never a name fallback.
-            for (const [source, target] of [[data.index.exactNames, namePrices], [data.index.cleanNames, cleanNamePrices]]) {
+            for (const [source, target] of [[data.index.exactNames, namePrices]]) {
                 for (const [key, cents] of source) {
                     if (!key.startsWith(prefix) || !Number.isSafeInteger(cents)) continue;
                     target.push([key.slice(prefix.length), cents]);
@@ -527,6 +604,9 @@
             if (give.some(item => String(item.appId ?? item.appid) === '570')) ownerData(me);
             if (receive.some(item => String(item.appId ?? item.appid) === '570')) ownerData(them);
             loadDetails(offer);
+            if (collection.state === 'idle' && needsCollection([...give, ...receive]) &&
+                ![me, them].some(id => owners.get(id)?.priceState === 'loading') &&
+                details.get(offer.offerId)?.state !== 'loading') void loadCollection(me);
             let summary = offer.element.querySelector('.sih-lite-trade-summary');
             if (!summary) {
                 summary = makeSummary();
@@ -535,6 +615,8 @@
                 const retry = makeButton('Retry prices', () => {
                     retryOwners([list.meSteamId, offer.partnerSteamId]);
                     if (details.get(offer.offerId)?.state === 'error') loadDetails(offer, true);
+                    if (collection.owner === list.meSteamId && collection.state !== 'loading' &&
+                        (collection.error || collection.cache?.cached)) void loadCollection(list.meSteamId, true);
                 });
                 retry.classList.add('sih-lite-trade-retry');
                 summary.appendChild(retry);
@@ -547,9 +629,10 @@
             summary.querySelector('.sih-lite-trade-retry').hidden =
                 !owners.get(me)?.priceError && !owners.get(them)?.priceError && !detail?.error &&
                 !owners.get(me)?.priceCache?.cached && !owners.get(them)?.priceCache?.cached &&
-                !owners.get(me)?.needsScan && !owners.get(them)?.needsScan;
+                !owners.get(me)?.needsScan && !owners.get(them)?.needsScan &&
+                !collection.error && !collection.cache?.cached;
             summary.querySelector('.sih-lite-trade-retry').disabled =
-                [me, them].some(id => owners.get(id)?.priceState === 'loading') || detail?.state === 'loading';
+                [me, them].some(id => owners.get(id)?.priceState === 'loading') || detail?.state === 'loading' || collection.state === 'loading';
             for (const slot of offer.slots || []) if (slot.element) {
                 badges.push([slot.element, { ...slot.item, ownerSteamId: slot.side === 'give' ? me : them }]);
             }

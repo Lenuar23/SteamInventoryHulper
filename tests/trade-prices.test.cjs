@@ -3,7 +3,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const test = require('node:test');
 const vm = require('node:vm');
-const { buildIndex, getPrice, summarize, difference, variantFingerprint } = require('../trade-prices.js');
+const { buildIndex, getPrice, summarize, difference, variantFingerprint, ordinaryFingerprint, buildCatalogIndex, catalogFingerprint } = require('../trade-prices.js');
 
 const OWNER = '76561198012345678';
 const PARTNER = '76561198087654321';
@@ -38,10 +38,11 @@ test('zero, string cents, collector priority and generic dollars retain per-unit
     assert.equal(getPrice(index, item('105', '')).cents, null);
 });
 
-test('ordinary canonical exact and cleaned aliases work without using renamed display names', () => {
+test('ordinary aliases use the full canonical name and keep qualities, bundles and sets distinct', () => {
     const index = buildIndex([{ assetid: '100', marketHashName: 'Genuine Sword Set', priceCents: 250 }], OWNER);
     assert.deepEqual(getPrice(index, item('999', 'Genuine Sword Set')), { cents: 250, source: 'name' });
-    assert.deepEqual(getPrice(index, item('999', 'Sword')), { cents: 250, source: 'clean-name' });
+    for (const name of ['Sword', 'Genuine Sword', 'Sword Set', 'Genuine Sword Bundle']) assert.equal(getPrice(index, item('999', name)).cents, null);
+    assert.equal(index.cleanNames.size, 0, 'legacy bridge field remains empty for compatibility');
     assert.deepEqual(getPrice(index, item('999', undefined, { description: { market_hash_name: 'Genuine Sword Set', name: 'Custom name' } })),
         { cents: 250, source: 'name' });
     assert.equal(getPrice(index, item('999', undefined, { name: 'Genuine Sword Set' })).cents, null);
@@ -90,7 +91,7 @@ test('native installed socket HTML blocks unsafe base-price fallback', () => {
 test('stack quantities multiply price while summary counts remain offered item slots', () => {
     const index = buildIndex([{ assetid: '100', priceCents: 250 }, { assetid: '101', priceCents: 0 }], OWNER);
     assert.deepEqual(summarize([item('100', '', { amount: '3' }), item('101', '', { amount: 100 })], index),
-        { knownCents: 750, itemCount: 2, pricedCount: 2, unpricedCount: 0, nonDotaCount: 0, estimatedCount: 0, complete: true });
+        { knownCents: 750, itemCount: 2, pricedCount: 2, unpricedCount: 0, nonDotaCount: 0, estimatedCount: 0, ordinaryEstimatedCount: 0, catalogEstimatedCount: 0, complete: true });
     assert.equal(getPrice(index, item('100', '', { amount: 3 })).cents, 250, 'lookup returns a unit price');
     assert.equal(summarize([item('100', '')], index).knownCents, 250, 'missing amount defaults to one slot');
 });
@@ -99,7 +100,7 @@ test('unknown prices and non-Dota items produce a partial known total', () => {
     const index = buildIndex([{ assetid: '100', priceCents: 250 }], OWNER);
     assert.deepEqual(summarize([
         item('100', '', { amount: 2 }), item('999', 'Unknown'), item('100', '', { appId: 730, amount: 5 })
-    ], index), { knownCents: 500, itemCount: 3, pricedCount: 1, unpricedCount: 2, nonDotaCount: 1, estimatedCount: 0, complete: false });
+    ], index), { knownCents: 500, itemCount: 3, pricedCount: 1, unpricedCount: 2, nonDotaCount: 1, estimatedCount: 0, ordinaryEstimatedCount: 0, catalogEstimatedCount: 0, complete: false });
     assert.deepEqual(getPrice(index, item('100', '', { appId: 730 })), { cents: null, source: 'non-dota' });
     assert.equal(getPrice(index, item('100', '', { appId: undefined })).cents, null, 'missing application cannot claim a Dota valuation');
 });
@@ -110,7 +111,7 @@ test('offered currency identifiers cannot collide with priced assets and always 
     assert.deepEqual(getPrice(index, currency), { cents: null, source: 'unknown' });
     assert.equal(getPrice(index, item('100', '', { is_currency: true })).cents, null);
     assert.deepEqual(summarize([item('100', ''), currency], index),
-        { knownCents: 250, itemCount: 2, pricedCount: 1, unpricedCount: 1, nonDotaCount: 0, estimatedCount: 0, complete: false });
+        { knownCents: 250, itemCount: 2, pricedCount: 1, unpricedCount: 1, nonDotaCount: 0, estimatedCount: 0, ordinaryEstimatedCount: 0, catalogEstimatedCount: 0, complete: false });
     assert.deepEqual(getPrice(index, { ...currency, appId: '730' }), { cents: null, source: 'non-dota' });
 });
 
@@ -213,7 +214,7 @@ test('verified ordinary TB colors match only the same owner and quality and are 
     const offered = item(null, 'Fractal Horns of Inner Abysm', { description: tbDescription(), amount: 2 });
     assert.deepEqual(getPrice(index, offered), { cents: 11767, source: 'variant' });
     assert.deepEqual(summarize([offered], index), { knownCents: 23534, itemCount: 1, pricedCount: 1,
-        unpricedCount: 0, nonDotaCount: 0, estimatedCount: 1, complete: true });
+        unpricedCount: 0, nonDotaCount: 0, estimatedCount: 1, ordinaryEstimatedCount: 0, catalogEstimatedCount: 0, complete: true });
     assert.equal(getPrice(index, { ...offered, ownerSteamId: PARTNER }).cents, null);
     assert.equal(getPrice(index, { ...offered, description: tbDescription({ quality: 'exalted' }) }).cents, null);
     assert.equal(getPrice(index, item('400', '', { description: tbDescription() })).source, 'asset', 'real exact asset identity takes priority');
@@ -281,4 +282,196 @@ test('unknown occupied sockets, ethereal effects, styles and unsupported courier
     assert.equal(getPrice(index, item(null, 'Sword', { variantFingerprint: variantFingerprint(tbDescription()) })).cents, null);
     assert.equal(getPrice(index, item(null, 'Exalted Fractal Horns of Inner Abysm', { variantFingerprint: variantFingerprint(tbDescription()) })).cents, null);
     assert.equal(getPrice(index, item(null, 'Fractal Horns of Inner Abysm', { variantFingerprint: '["tb-v1","standard","regular",1,2,3]' })).cents, null);
+});
+
+function ordinaryApi(extra = {}) {
+    return basicTbApi({ marketHashName: 'Orb of Reminiscence', prismaticGems: [], priceCents: 92, basePriceCents: 92, ...extra });
+}
+
+function ordinaryDescription(extra = {}) {
+    return { market_hash_name: 'Orb of Reminiscence', name_color: 'D2D2D2', tradable: 1, marketable: 1,
+        tags: [{ category: 'Quality', internal_name: 'unique' }], descriptions: [], ...extra };
+}
+
+test('shared ordinary estimates use verified exact standard variants without borrowing another owner asset', () => {
+    const other = buildIndex([ordinaryApi()], PARTNER);
+    const own = buildIndex([], OWNER);
+    const description = ordinaryDescription();
+    const fingerprint = ordinaryFingerprint(description);
+    assert.equal(fingerprint, '["ordinary-v1","standard","orb of reminiscence"]');
+    assert.equal(ordinaryFingerprint(ordinaryApi(), true), fingerprint);
+    assert.equal(other.sharedOrdinaryPrices.get(fingerprint), 92);
+    const offered = item('400', 'Orb of Reminiscence', { description });
+    assert.deepEqual(getPrice(own, offered), { cents: null, source: 'unknown' });
+    assert.deepEqual(getPrice(own, offered, other.sharedOrdinaryPrices), { cents: 92, source: 'ordinary-estimate' });
+    assert.equal(own.assetPrices.size, 0);
+    assert.equal(offered.assetId, '400', 'lookup does not alter owner or asset identity');
+    const reduced = item(null, 'Orb of Reminiscence', { ordinaryFingerprint: fingerprint });
+    assert.deepEqual(getPrice(own, reduced, other.sharedOrdinaryPrices), { cents: 92, source: 'ordinary-estimate' });
+    assert.equal(getPrice(own, { ...reduced, market_hash_name: 'A different orb' }, other.sharedOrdinaryPrices).cents, null);
+    assert.equal(getPrice(own, { ...reduced, market_hash_name: undefined, name: 'Orb of Reminiscence' }, other.sharedOrdinaryPrices).cents, null);
+});
+
+test('stock API flags, quality and full/base cash agreement are required for pooled ordinary prices', () => {
+    const fingerprint = ordinaryFingerprint(ordinaryApi(), true);
+    for (const change of [
+        { quality: 'Genuine' }, { assetQuality: undefined }, { rawTags: undefined }, { favored: undefined },
+        { allStylesUnlocked: true }, { styleUnlocked: 2 }, { emptySockets: 1 }, { kineticGems: ['Fireborn Assault'] },
+        { isOtherBug: true }, { isGolden: true }, { isCrimson: true }, { isLegacy: true }, { tradable: false },
+        { collectorAvgSaleCents: 92 }, { collectorLowestAskCents: 92 }, { collectorSetPiece: 'Set piece' },
+        { marketHashName: 'Genuine Orb of Reminiscence' }, { gems: ['A rune'] }, { unusualEffectGems: undefined }
+    ]) {
+        assert.equal(ordinaryFingerprint(ordinaryApi(change), true), null, JSON.stringify(change));
+        assert.equal(buildIndex([ordinaryApi(change)], PARTNER).sharedOrdinaryPrices.size, 0);
+    }
+    for (const change of [{ priceCents: null }, { basePriceCents: null }, { priceCents: 93 }, { priceCents: true }]) {
+        assert.equal(buildIndex([ordinaryApi(), ordinaryApi({ assetid: '401', ...change })], PARTNER).sharedOrdinaryPrices.get(fingerprint), null);
+    }
+    assert.equal(buildIndex([ordinaryApi({ scmPriceCents: 300, priceCents: 92, basePriceCents: 92 })], PARTNER).sharedOrdinaryPrices.get(fingerprint), 92,
+        'cash estimate never replaces Steamprice values with SCM dollars');
+    const zero = buildIndex([ordinaryApi({ priceCents: 0, basePriceCents: 0 })], PARTNER);
+    assert.equal(zero.sharedOrdinaryPrices.get(fingerprint), 0);
+});
+
+test('historical ordinary fingerprints reject quality changes, unknown metadata and every socket or style', () => {
+    assert.ok(ordinaryFingerprint(ordinaryDescription({ tags: [] })));
+    for (const extra of [
+        { tags: [], name_color: '' }, { tags: [{ category: 'Quality', internal_name: 'genuine' }] },
+        { tags: [{ category: 'Quality', internal_name: 'unique' }, { category: 'Quality', internal_name: 'unique' }] },
+        { tradable: 0 }, { marketable: false }, { descriptions: undefined },
+        { market_hash_name: 'Inscribed Orb of Reminiscence' }, { hasGems: true },
+        { descriptions: [{ value: 'Styles unlocked: 2' }] },
+        { descriptions: [{ value: 'Rune: kills counted' }] },
+        { descriptions: [{ value: '<div style="background-image:url(https://cdn.steamstatic.com/apps/570/icons/econ/sockets/gem_empty.hash.png)">Свободное гнездо</div>' }] },
+        { descriptions: [{ value: '<div style="background-image:url(https://cdn.steamstatic.com/apps/570/icons/econ/sockets/gem_rune.hash.png)">Золота заработано</div>' }] }
+    ]) assert.equal(ordinaryFingerprint(ordinaryDescription(extra)), null, JSON.stringify(extra));
+    assert.equal(ordinaryFingerprint({ ...tbDescription(), descriptions: [] }), null, 'colored-gem models remain excluded even without socket data');
+});
+
+test('owner asset and conflicting aliases retain priority over pooled ordinary estimates', () => {
+    const pool = buildIndex([ordinaryApi()], PARTNER).sharedOrdinaryPrices;
+    const offered = item('400', 'Orb of Reminiscence', { ordinaryFingerprint: ordinaryFingerprint(ordinaryDescription()) });
+    assert.deepEqual(getPrice(buildIndex([ordinaryApi({ priceCents: 500, basePriceCents: 500 })], OWNER), offered, pool), { cents: 500, source: 'asset' });
+    const conflict = buildIndex([ordinaryApi(), ordinaryApi({ priceCents: 500 })], OWNER);
+    assert.deepEqual(getPrice(conflict, offered, pool), { cents: null, source: 'unknown' });
+    const nameConflict = buildIndex([ordinaryApi({ assetid: '500' }), ordinaryApi({ assetid: '501', priceCents: 500 })], OWNER);
+    assert.deepEqual(getPrice(nameConflict, offered, pool), { cents: null, source: 'unknown' });
+    assert.deepEqual(getPrice(buildIndex([], OWNER), offered, new Map([[ordinaryFingerprint(ordinaryDescription()), null]])), { cents: null, source: 'unknown' });
+});
+
+test('pooled ordinary estimates keep unsafe gem, currency, app, context, owner and forged fingerprint rows unknown', () => {
+    const pool = buildIndex([ordinaryApi()], PARTNER).sharedOrdinaryPrices;
+    const own = buildIndex([], OWNER);
+    const offered = item(null, 'Orb of Reminiscence', { ordinaryFingerprint: ordinaryFingerprint(ordinaryDescription()) });
+    for (const extra of [
+        { hasGems: true }, { hasColoredGem: true }, { kineticGems: ['Fireborn Assault'] }, { isCurrency: true },
+        { appId: undefined }, { contextId: '3' }, { ownerSteamId: undefined },
+        { market_hash_name: 'Inscribed Orb of Reminiscence' },
+        { ordinaryFingerprint: '["ordinary-v1","genuine","orb of reminiscence"]' },
+        { ordinaryFingerprint: '["ordinary-v1","standard","a different orb"]' }
+    ]) assert.equal(getPrice(own, { ...offered, ...extra }, pool).cents, null, JSON.stringify(extra));
+    assert.equal(getPrice(own, { ...offered, appId: '730' }, pool).source, 'non-dota');
+});
+
+test('ordinary estimates count separately from gem estimates and multiply offered stack quantities', () => {
+    const own = buildIndex([basicTbApi()], OWNER);
+    const pool = buildIndex([ordinaryApi()], PARTNER).sharedOrdinaryPrices;
+    const ordinary = item(null, 'Orb of Reminiscence', { ordinaryFingerprint: ordinaryFingerprint(ordinaryDescription()), amount: 3 });
+    const colored = item(null, 'Fractal Horns of Inner Abysm', { description: tbDescription() });
+    assert.deepEqual(summarize([ordinary, colored], own, pool), { knownCents: 12043, itemCount: 2, pricedCount: 2,
+        unpricedCount: 0, nonDotaCount: 0, estimatedCount: 1, ordinaryEstimatedCount: 1, catalogEstimatedCount: 0, complete: true });
+    assert.equal(summarize([ordinary], own).ordinaryEstimatedCount, 0);
+    assert.equal(summarize([ordinary], own).unpricedCount, 1);
+});
+
+function genuineWeatherDescription(extra = {}) {
+    return ordinaryDescription({ market_hash_name: 'Genuine Weather Ash', name_color: '4D7455',
+        tags: [{ category: 'Quality', internal_name: 'genuine' }], ...extra });
+}
+
+test('exact Steamprice catalog estimates cover Genuine weather absent from every owner inventory', () => {
+    const description = genuineWeatherDescription();
+    const key = catalogFingerprint(description);
+    assert.equal(key, '["catalog-v1","genuine weather ash","genuine"]');
+    const offered = item(null, description.market_hash_name, { catalogFingerprint: key, amount: 2, tradable: true, marketable: true });
+    const catalog = buildCatalogIndex([{ marketHashName: 'Genuine Weather Ash', priceCents: 671 },
+        { marketHashName: 'Genuine Weather Rain', priceCents: 106 }]);
+    const own = buildIndex([], OWNER);
+    assert.deepEqual(getPrice(own, offered), { cents: null, source: 'unknown' });
+    assert.deepEqual(getPrice(own, offered, new Map(), catalog), { cents: 671, source: 'catalog' });
+    assert.deepEqual(summarize([offered], own, new Map(), catalog), { knownCents: 1342, itemCount: 1, pricedCount: 1,
+        unpricedCount: 0, nonDotaCount: 0, estimatedCount: 0, ordinaryEstimatedCount: 0, catalogEstimatedCount: 1, complete: true });
+    assert.equal(offered.assetId, null, 'catalog does not assign owner assets to historical classes');
+    assert.equal(catalogFingerprint(genuineWeatherDescription({ tags: [] })), key);
+    assert.equal(getPrice(own, { ...offered, market_hash_name: 'Weather Ash' }, new Map(), catalog).cents, null, 'Genuine prefix is retained');
+});
+
+test('catalog estimates require known Standard or Genuine quality and reject gem/socket/style metadata', () => {
+    const description = genuineWeatherDescription();
+    const catalog = buildCatalogIndex([{ marketHashName: 'Genuine Weather Ash', priceCents: 671 }, { marketHashName: 'Orb of Reminiscence', priceCents: 92 }]);
+    const own = buildIndex([], OWNER);
+    assert.ok(catalogFingerprint(ordinaryDescription()));
+    for (const extra of [
+        { tags: [], name_color: '' }, { tags: [{ category: 'Quality', internal_name: 'unique' }] },
+        { market_hash_name: 'Weather Ash' }, { tradable: 0 }, { marketable: false }, { descriptions: undefined },
+        { hasColoredGem: true }, { kineticGems: ['Fireborn Assault'] }, { styleUnlocked: 2 }, { isOtherBug: true },
+        { descriptions: [{ value: '<div style="background-image:url(https://cdn.steamstatic.com/apps/570/icons/econ/sockets/gem_empty.hash.png)">Empty slot</div>' }] },
+        { descriptions: [{ value: 'Styles unlocked: 2' }] }
+    ]) assert.equal(catalogFingerprint({ ...description, ...extra }), null, JSON.stringify(extra));
+    for (const name of ['Inscribed Orb of Reminiscence', 'Exalted Orb of Reminiscence', 'Unusual Baby Roshan', 'Genuine Fractal Horns of Inner Abysm']) {
+        assert.equal(catalogFingerprint(genuineWeatherDescription({ market_hash_name: name })), null);
+    }
+    const forged = item(null, 'Exalted Orb of Reminiscence', { catalogFingerprint: '["catalog-v1","exalted orb of reminiscence",null]' });
+    assert.equal(getPrice(own, forged, new Map(), buildCatalogIndex([{ marketHashName: forged.market_hash_name, priceCents: 999 }])).cents, null);
+    const styled = item(null, description.market_hash_name, { catalogFingerprint: catalogFingerprint(description),
+        description: genuineWeatherDescription({ descriptions: [{ value: 'Styles unlocked: 2' }] }) });
+    assert.equal(getPrice(own, styled, new Map(), catalog).cents, null, 'claimed class key cannot bypass full native style metadata');
+});
+
+test('Steamprice owner and pooled priorities, including conflicts, cannot be bypassed by catalog estimates', () => {
+    const key = ordinaryFingerprint(ordinaryDescription());
+    const offered = item('400', 'Orb of Reminiscence', { ordinaryFingerprint: key, catalogFingerprint: catalogFingerprint(ordinaryDescription()) });
+    const catalog = buildCatalogIndex([{ marketHashName: 'Orb of Reminiscence', priceCents: 999 }]);
+    const own = buildIndex([ordinaryApi()], OWNER);
+    assert.deepEqual(getPrice(own, offered, new Map(), catalog), { cents: 92, source: 'asset' });
+    assert.deepEqual(getPrice(own, { ...offered, assetId: null }, new Map(), catalog), { cents: 92, source: 'name' });
+    const empty = buildIndex([], OWNER);
+    assert.deepEqual(getPrice(empty, offered, new Map([[key, 123]]), catalog), { cents: 123, source: 'ordinary-estimate' });
+    assert.equal(getPrice(empty, offered, new Map([[key, null]]), catalog).cents, null);
+    assert.equal(getPrice(buildIndex([ordinaryApi(), ordinaryApi({ priceCents: 93 })], OWNER), offered, new Map(), catalog).cents, null);
+    assert.equal(getPrice(buildIndex([ordinaryApi({ assetid: '500' }), ordinaryApi({ assetid: '501', priceCents: 93 })], OWNER), offered, new Map(), catalog).cents, null);
+});
+
+test('catalog names stay exact and conflicting or unavailable cash prices remain unknown', () => {
+    const catalog = buildCatalogIndex([{ marketHashName: 'Genuine Weather Ash', priceCents: 671 },
+        { marketHashName: 'Genuine Weather Ash', priceCents: 672 }, { marketHashName: 'Genuine Weather Rain', priceCents: 0 },
+        { marketHashName: 'Genuine Weather Moonbeam', priceCents: null }, { marketHashName: 'Genuine Weather Aurora', priceCents: '92' },
+        { marketHashName: 'Invalid', priceCents: true }, { name: 'Display name only', priceCents: 99 }]);
+    assert.equal(catalog.get('genuine weather ash'), null);
+    assert.equal(catalog.get('genuine weather rain'), null);
+    assert.equal(catalog.get('genuine weather moonbeam'), null);
+    assert.equal(catalog.get('genuine weather aurora'), 92);
+    assert.equal(catalog.get('invalid'), null);
+    assert.equal(catalog.has('display name only'), false);
+    const offered = item(null, 'Genuine Weather Ash', { description: genuineWeatherDescription() });
+    assert.equal(getPrice(buildIndex([], OWNER), offered, new Map(), catalog).cents, null);
+    assert.throws(() => buildCatalogIndex(new Array(100001)), /100000 price items/);
+    assert.throws(() => buildCatalogIndex({}), /must be an array/);
+});
+
+test('explicit unavailable native flags block all aliases and estimates while exact API assets retain priority', () => {
+    const own = buildIndex([ordinaryApi()], OWNER);
+    const empty = buildIndex([], OWNER);
+    const description = ordinaryDescription();
+    const offered = item(null, description.market_hash_name, { ordinaryFingerprint: ordinaryFingerprint(description), catalogFingerprint: catalogFingerprint(description) });
+    const pool = new Map([[offered.ordinaryFingerprint, 92]]);
+    const catalog = buildCatalogIndex([{ marketHashName: description.market_hash_name, priceCents: 99 }]);
+    for (const field of ['tradable', 'marketable']) for (const value of [false, 0]) {
+        const unavailable = { ...offered, [field]: value };
+        assert.equal(getPrice(own, unavailable, pool, catalog).cents, null, `${field} ${value}: owner alias`);
+        assert.equal(getPrice(empty, unavailable, pool, catalog).cents, null, `${field} ${value}: estimate`);
+        assert.equal(getPrice(own, { ...unavailable, assetId: '400' }, pool, catalog).source, 'asset');
+        assert.equal(catalogFingerprint({ ...description, [field]: value }), null);
+        assert.equal(getPrice(own, { ...offered, description: { ...description, [field]: value } }, pool, catalog).cents, null);
+    }
 });

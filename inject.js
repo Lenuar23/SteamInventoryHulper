@@ -105,6 +105,11 @@
             items.push({
                 assetId: String(asset.assetid),
                 name: String(description.market_hash_name || description.name || description.market_name || '').slice(0, 512),
+                marketHashName: typeof description.market_hash_name === 'string' ? description.market_hash_name.slice(0, 512) : '',
+                tradable: marketFlag(description.tradable),
+                marketable: marketFlag(description.marketable),
+                quality: nativeQuality(description),
+                hasSocket: hasSocket(description),
                 isCache: isCollectorsCache(description),
                 ...gemDetails(asset)
             });
@@ -155,10 +160,22 @@
         };
     }
 
-    function cleanName(name) {
-        return name.toLowerCase()
-            .replace(/^(inscribed|autographed|corrupted|frozen|heroic|cursed|genuine|favored|ascent|elder|unusual|exalted|infused|auspicious|base|legacy|sealed)\s+/i, '')
-            .replace(/\s+(bundle|set)$/i, '').trim();
+    function marketFlag(value) {
+        if (value === true || value === 1 || value === '1') return true;
+        if (value === false || value === 0 || value === '0') return false;
+        return null;
+    }
+
+    function nativeQuality(description) {
+        const qualities = (Array.isArray(description.tags) ? description.tags : [])
+            .filter(tag => String(tag?.category).toLowerCase() === 'quality');
+        if (qualities.length > 1) return 'ambiguous';
+        return qualities.length ? String(qualities[0].internal_name || '').toLowerCase() || 'ambiguous' : null;
+    }
+
+    function hasSocket(description) {
+        return Array.isArray(description.descriptions) && description.descriptions.some(entry =>
+            typeof entry?.value === 'string' && /\/econ\/sockets\//i.test(entry.value));
     }
 
     function priceFor(holder, prices) {
@@ -166,10 +183,14 @@
         const id = String(asset.assetid);
         if (prices.assets.has(id)) return prices.assets.get(id);
         const description = asset.description || {};
-        const name = String(description.market_hash_name || description.name || description.market_name || '').trim().toLowerCase();
-        if (prices.names.has(name)) return prices.names.get(name);
-        const cleaned = cleanName(name);
-        return prices.names.has(cleaned) ? prices.names.get(cleaned) : null;
+        const name = typeof description.market_hash_name === 'string' ? description.market_hash_name.trim().toLowerCase() : '';
+        const quality = nativeQuality(description);
+        if (!name || name.length > 512 || marketFlag(description.tradable) !== true || marketFlag(description.marketable) !== true ||
+            (quality !== null && quality !== 'unique' && quality !== 'standard') ||
+            /^(?:inscribed|autographed|corrupted|frozen|heroic|cursed|genuine|favored|ascent|elder|unusual|exalted|infused|auspicious|base|legacy|sealed)\s+/i.test(name) ||
+            /\b(?:fractal horns of inner abysm|baby roshan|jumo)\b/i.test(name) ||
+            hasSocket(description) || gemDetails(asset).hasGems) return null;
+        return prices.names.has(name) ? prices.names.get(name) : null;
     }
 
     function ensureCurrent(active, steamId, expectedItems) {

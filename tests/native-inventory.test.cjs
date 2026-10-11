@@ -22,7 +22,10 @@ function deferred() {
 }
 
 function holder(id, name) {
-    const node = { rgItem: { assetid: String(id), appid: 570, description: { market_hash_name: name, type: 'Rare Wearable' } }, filtered: false };
+    const node = { rgItem: { assetid: String(id), appid: 570, description: {
+        market_hash_name: name, type: 'Rare Wearable', tradable: 1, marketable: 1,
+        tags: [{ category: 'Quality', internal_name: 'unique' }]
+    } }, filtered: false };
     const metadata = new Map();
     const result = {
         0: node,
@@ -204,11 +207,62 @@ test('price sorts keep native holders and events, stable ties, zero prices and u
     app.dispose();
 });
 
-test('asset prices override exact names; cleaned names remain a fallback', async () => {
+test('asset prices override exact canonical names; quality prefixes and set suffixes remain distinct', async () => {
     const active = inventory([holder(1, 'Inscribed Sword Set'), holder(2, 'Sword'), holder(3, 'Sword')]);
     const app = harness(active);
     assert.equal((await app.sort('asc', [['2', 200]], [['sword', 500]])).success, true);
-    assert.deepEqual(ids(active), ['2', '1', '3']);
+    assert.deepEqual(ids(active), ['2', '3', '1']);
+    app.dispose();
+});
+
+test('price sorting keeps nonmarketable Sniper and Candyworks copies unpriced without hiding exact owner values or gem colors', async () => {
+    const name = 'Full-Bore Bonanza';
+    const unavailable = holder(1, name);
+    unavailable[0].rgItem.description.tradable = 0;
+    unavailable[0].rgItem.description.marketable = 0;
+    const marketBlocked = holder(2, name);
+    marketBlocked[0].rgItem.description.marketable = '0';
+    const marketable = holder(3, name);
+    const unknown = holder(4, name);
+    delete unknown[0].rgItem.description.tradable;
+    delete unknown[0].rgItem.description.marketable;
+    const explicit = holder(5, 'Explicit owner valuation');
+    explicit[0].rgItem.description.tradable = false;
+    explicit[0].rgItem.description.marketable = false;
+    const colored = gemHolder(6, 'Fractal Horns of Inner Abysm');
+    colored[0].rgItem.description.tradable = 0;
+    colored[0].rgItem.description.marketable = 0;
+    const active = inventory([unavailable, marketBlocked, marketable, unknown, explicit, colored]);
+    const app = harness(active);
+    const initial = app.messages.find(message => message.type === 'INVENTORY').items;
+    assert.equal(initial[0].marketHashName, name);
+    assert.equal(initial[0].tradable, false);
+    assert.equal(initial[0].marketable, false);
+    assert.equal(initial[3].tradable, null);
+    assert.equal(initial[3].marketable, null);
+    assert.equal(initial[2].quality, 'unique');
+    assert.equal(initial[5].hasColoredGem, true, 'market restrictions never suppress colored gem metadata');
+    assert.equal((await app.sort('desc', [['5', 123]], [[name.toLowerCase(), 10002]])).success, true);
+    assert.deepEqual(ids(active), ['3', '5', '1', '2', '4', '6']);
+    assert.equal((await app.filter('colored')).success, true);
+    assert.deepEqual(active.visible.map(item => item[0].rgItem.assetid), ['6']);
+    assert.equal((await app.sort('original')).success, true);
+    assert.deepEqual(ids(active), ['1', '2', '3', '4', '5', '6']);
+    app.dispose();
+});
+
+test('native name sorting rejects display-only names, different quality and sockets despite identical canonical names', async () => {
+    const displayOnly = holder(1, 'Plain Safe Item');
+    delete displayOnly[0].rgItem.description.market_hash_name;
+    displayOnly[0].rgItem.description.name = 'Plain Safe Item';
+    const genuine = holder(2, 'Plain Safe Item');
+    genuine[0].rgItem.description.tags = [{ category: 'Quality', internal_name: 'genuine' }];
+    const socketed = gemHolder(3, 'Plain Safe Item');
+    const ordinary = holder(4, 'Plain Safe Item');
+    const active = inventory([displayOnly, genuine, socketed, ordinary]);
+    const app = harness(active);
+    assert.equal((await app.sort('desc', [], [['plain safe item', 700]])).success, true);
+    assert.deepEqual(ids(active), ['4', '1', '2', '3']);
     app.dispose();
 });
 

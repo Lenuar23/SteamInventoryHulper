@@ -1,3 +1,5 @@
+importScripts('collection-prices.js');
+
 const STEAMPRICE_ROOT = 'https://steamprice.com';
 const REQUEST_TIMEOUT_MS = 15000;
 const OPERATION_TIMEOUT_MS = 180000;
@@ -71,7 +73,7 @@ function compactPriceRecord(item) {
 }
 
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-    if (!request || !['fetchPrices', 'fetchProfile'].includes(request.action)) return;
+    if (!request || !['fetchPrices', 'fetchProfile', 'fetchCollection'].includes(request.action)) return;
     let steamId;
     try { steamId = validateSteamId(request.steamId); }
     catch (error) { sendResponse({ success: false, error: error.message }); return; }
@@ -215,6 +217,31 @@ async function fetchProfile(steamId, deadline) {
     return normalizeProfile(await fetchJson(`${STEAMPRICE_ROOT}/api/dota2/profile/${steamId}`, deadline));
 }
 
+function normalizeCollectionCache(data) {
+    if (!Array.isArray(data.items) || data.items.length > 100000 ||
+        readInteger(data.collectionCount) === null || readInteger(data.collectionCount) > 1000 ||
+        readInteger(data.itemCount) !== data.items.length) {
+        throw new Error('Steamprice returned an invalid collection price snapshot.');
+    }
+    const items = data.items.map(item => {
+        if (!item || typeof item !== 'object' || Array.isArray(item) ||
+            typeof item.marketHashName !== 'string' || !item.marketHashName.trim() || item.marketHashName.length > 512 ||
+            !Number.isSafeInteger(item.priceCents) || item.priceCents <= 0) {
+            throw new Error('Steamprice returned invalid collection price items.');
+        }
+        const marketHashName = item.marketHashName.trim();
+        // A collection is a price catalog. It must never gain asset ownership
+        // from old storage or inherit the user's ownedAssetid fields.
+        return { marketHashName, priceCents: item.priceCents };
+    });
+    return { items, collectionCount: readInteger(data.collectionCount), itemCount: items.length };
+}
+
+async function fetchCollection(steamId, deadline) {
+    const data = await fetchJson(`${STEAMPRICE_ROOT}/api/dota2/collection/${steamId}`, deadline);
+    return normalizeCollectionCache(globalThis.SIHLiteCollectionPrices.compactCollection(data));
+}
+
 async function handleFetchPrices(steamId, deadline, allowScan) {
     let items = await fetchAllPrices(steamId, deadline);
     let scanned = false;
@@ -321,7 +348,7 @@ async function loadWithCache(action, steamId, force, allowScan = true) {
             const deadline = Date.now() + OPERATION_TIMEOUT_MS;
             const result = action === 'fetchPrices'
                 ? await handleFetchPrices(steamId, deadline, allowScan)
-                : { data: await fetchProfile(steamId, deadline) };
+                : { data: action === 'fetchCollection' ? await fetchCollection(steamId, deadline) : await fetchProfile(steamId, deadline) };
             if (!result.needsScan && (action !== 'fetchProfile' || epoch === profileEpoch)) {
                 cache.set(key, { action, steamId, cachedAt: Date.now(), usedAt: Date.now(), data: result.data });
                 pruneCache();
@@ -344,11 +371,15 @@ async function loadWithCache(action, steamId, force, allowScan = true) {
 }
 
 function validCacheEntry(key, entry, now) {
-    if (!entry || !['fetchPrices', 'fetchProfile'].includes(entry.action) ||
+    if (!entry || !['fetchPrices', 'fetchProfile', 'fetchCollection'].includes(entry.action) ||
         typeof entry.steamId !== 'string' || !/^\d{17}$/.test(entry.steamId) || key !== `${entry.action}:${entry.steamId}` ||
         !Number.isSafeInteger(entry.cachedAt) || entry.cachedAt > now || now - entry.cachedAt > STALE_CACHE_MS ||
         !entry.data || typeof entry.data !== 'object' || Array.isArray(entry.data)) return false;
     if (entry.action === 'fetchProfile') return readInteger(entry.data.totalValueCents) !== null;
+    if (entry.action === 'fetchCollection') {
+        try { normalizeCollectionCache(entry.data); return true; }
+        catch { return false; }
+    }
     return Array.isArray(entry.data.items) && entry.data.items.every(item => item && typeof item === 'object' && !Array.isArray(item));
 }
 
@@ -399,6 +430,7 @@ function ensureCache() {
             const now = Date.now();
             for (const [key, entry] of Object.entries(entries || {})) if (validCacheEntry(key, entry, now)) {
                 if (entry.action === 'fetchProfile') entry.data = normalizeProfile(entry.data);
+                else if (entry.action === 'fetchCollection') entry.data = normalizeCollectionCache(entry.data);
                 else entry.data = { items: entry.data.items.map(compactPriceRecord) };
                 cache.set(key, entry);
             }

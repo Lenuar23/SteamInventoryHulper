@@ -8,6 +8,7 @@
     const DOLLAR_FIELDS = ['price', 'lowest_price', 'cost', 'value'];
     const GEM_CAPABLE_NAME = /\b(?:fractal horns of inner abysm|baby roshan|jumo)\b/i;
     const GEM_QUALITY_NAME = /^(?:unusual|inscribed|autographed|corrupted)\s+/i;
+    const NON_STANDARD_NAME = /^(?:inscribed|autographed|corrupted|frozen|heroic|cursed|genuine|favored|ascent|elder|unusual|exalted|infused|auspicious|base|legacy|sealed)\s+/i;
     // Stable Dota gem colors, verified against Steamprice's regular gem table.
     // Prices are always obtained from the owner's API inventory, never this table.
     const REGULAR_COLORS = new Map([
@@ -32,10 +33,6 @@
         'canGiftCollectorBundle', 'unpackGiftCollectorBundle', 'pbrCycled'];
     const VARIANT_NULL_FIELDS = ['styleTotal', 'styleUnlocked', 'gem', 'paintSeed', 'wearRating', 'stickers',
         'infuser', 'roshanCycle', 'expirationDate', 'greevil', 'collectorSetPiece'];
-    const cleanName = name => name.toLowerCase()
-        .replace(/^(inscribed|autographed|corrupted|frozen|heroic|cursed|genuine|favored|ascent|elder|unusual|exalted|infused|auspicious|base|legacy|sealed)\s+/i, '')
-        .replace(/\s+(bundle|set)$/i, '').trim();
-
     function ownerId(value) {
         return typeof value === 'string' && /^\d{17}$/.test(value) ? value : null;
     }
@@ -61,6 +58,11 @@
         const value = item?.marketHashName || item?.market_hash_name || item?.description?.market_hash_name;
         return typeof value === 'string' && value.trim().length > 0 && value.trim().length <= 512
             ? value.trim().toLowerCase() : '';
+    }
+
+    function explicitUnavailable(item) {
+        return [item, item?.description].some(record => record && ['tradable', 'marketable']
+            .some(field => record[field] === false || record[field] === 0));
     }
 
     function parsePrice(item) {
@@ -223,19 +225,140 @@
         } catch (_) { return null; }
     }
 
+    function ordinaryName(item, apiRecord) {
+        const name = canonicalName(item);
+        if (!name || NON_STANDARD_NAME.test(name) || unsafeNameFallback(item, name, apiRecord)) return '';
+        const description = item?.description && typeof item.description === 'object' ? item.description : item;
+        const tags = apiRecord ? item.rawTags || item.tags : description.tags;
+        const qualities = (Array.isArray(tags) ? tags : []).filter(tag => tag && String(tag.category).toLowerCase() === 'quality');
+        if (qualities.length > 1) return '';
+        if (qualities.length === 1) {
+            if (String(qualities[0].internal_name).toLowerCase() !== 'unique') return '';
+        } else if (apiRecord || String(description.name_color || '').toLowerCase() !== 'd2d2d2') return '';
+        if (apiRecord && ![item.assetQuality, item.quality].every(value => typeof value === 'string' && value.toLowerCase() === 'standard')) return '';
+        return name;
+    }
+
+    // Shared prices describe a plain market variant, never an owner's asset.
+    // Keep this stricter than the owner's name aliases: quality, sockets,
+    // styles, collector pricing and every exceptional API flag must be known.
+    function ordinaryFingerprint(item, apiRecord = false) {
+        if (!item || typeof item !== 'object' || explicitUnavailable(item)) return null;
+        const name = ordinaryName(item, apiRecord);
+        if (!name) return null;
+        if (apiRecord) {
+            if (VARIANT_FALSE_FLAGS.some(key => item[key] !== false) || VARIANT_NULL_FIELDS.some(key => item[key] !== null) ||
+                item.emptySockets !== 0 || item.spectatorGames !== 0 || item.tradable !== true || item.marketable !== true ||
+                item.isLegacy !== false || item.legacyRgb !== null || item.legacyPricing !== null) return null;
+            if (['prismaticGems', 'etherealGems', 'kineticGems', 'unusualEffectGems'].some(key => !Array.isArray(item[key]) || item[key].length)) return null;
+            if (item.gems != null && (!Array.isArray(item.gems) || item.gems.length)) return null;
+            if (['collectorAvgSaleCents', 'collectorLowestAskCents'].some(key => item[key] != null)) return null;
+        } else {
+            const description = item?.description && typeof item.description === 'object' ? item.description : item;
+            if (![true, 1].includes(description.tradable) || ![true, 1].includes(description.marketable) || !Array.isArray(description.descriptions)) return null;
+            if (description.descriptions.some(entry => typeof entry?.value === 'string' &&
+                /(?:\/econ\/sockets\/|\b(?:styles?|runes?|autograph|charge|bugged|gifted|socket|gem)\b)/i.test(entry.value.replace(/<[^>]*>/g, ' ')))) return null;
+            // Socket icon URLs live inside HTML attributes, before text stripping.
+            if (description.descriptions.some(entry => typeof entry?.value === 'string' && /\/econ\/sockets\//i.test(entry.value))) return null;
+        }
+        return JSON.stringify(['ordinary-v1', 'standard', name]);
+    }
+
+    function verifiedOrdinaryFingerprint(value, item) {
+        if (typeof value !== 'string' || value.length > 560) return null;
+        try {
+            const parts = JSON.parse(value);
+            const name = canonicalName(item);
+            if (!Array.isArray(parts) || parts.length !== 3 || parts[0] !== 'ordinary-v1' || parts[1] !== 'standard' ||
+                !name || parts[2] !== name || NON_STANDARD_NAME.test(name) || unsafeNameFallback(item, name) || explicitUnavailable(item)) return null;
+            if ((item.description || Object.prototype.hasOwnProperty.call(item, 'descriptions')) && ordinaryFingerprint(item) !== JSON.stringify(parts)) return null;
+            return JSON.stringify(parts);
+        } catch (_) { return null; }
+    }
+
+    function catalogQuality(name) {
+        if (/^genuine\s+\S/.test(name)) return 'genuine';
+        return NON_STANDARD_NAME.test(name) ? null : 'standard';
+    }
+
+    function plainNativeDescription(item) {
+        const description = item?.description && typeof item.description === 'object' ? item.description : item;
+        if (explicitUnavailable(item) || ![true, 1].includes(description?.tradable) || ![true, 1].includes(description?.marketable) || !Array.isArray(description?.descriptions)) return false;
+        if ([item, description].some(record => VARIANT_FALSE_FLAGS.some(key => record[key] === true) ||
+            (record.styleUnlocked != null && record.styleUnlocked !== 0) || (record.styleTotal != null && record.styleTotal !== 0))) return false;
+        return !description.descriptions.some(entry => typeof entry?.value === 'string' &&
+            (/\/econ\/sockets\//i.test(entry.value) || /\b(?:styles?|runes?|autograph|charge|bugged|gifted|socket|gem)\b/i.test(entry.value.replace(/<[^>]*>/g, ' '))));
+    }
+
+    function catalogFingerprint(item) {
+        if (!item || typeof item !== 'object') return null;
+        const name = canonicalName(item);
+        const quality = catalogQuality(name);
+        if (!name || !quality || unsafeNameFallback(item, name) || !plainNativeDescription(item)) return null;
+        const description = item.description && typeof item.description === 'object' ? item.description : item;
+        const qualities = (Array.isArray(description.tags) ? description.tags : [])
+            .filter(tag => tag && String(tag.category).toLowerCase() === 'quality');
+        if (qualities.length > 1) return null;
+        const actual = String(qualities[0]?.internal_name || '').toLowerCase();
+        const color = String(description.name_color || '').toLowerCase();
+        if (qualities.length) {
+            if ((quality === 'standard' && actual !== 'unique') || (quality === 'genuine' && actual !== 'genuine')) return null;
+        } else if (color !== (quality === 'standard' ? 'd2d2d2' : '4d7455')) return null;
+        return JSON.stringify(['catalog-v1', name, quality]);
+    }
+
+    function verifiedCatalogFingerprint(value, item) {
+        if (typeof value !== 'string' || value.length > 600) return null;
+        try {
+            const parts = JSON.parse(value);
+            const name = canonicalName(item);
+            const quality = catalogQuality(name);
+            if (!Array.isArray(parts) || parts.length !== 3 || parts[0] !== 'catalog-v1' ||
+                !name || !quality || parts[1] !== name || parts[2] !== quality || unsafeNameFallback(item, name) || explicitUnavailable(item)) return null;
+            if ((item.description || Object.prototype.hasOwnProperty.call(item, 'descriptions')) && catalogFingerprint(item) !== JSON.stringify(parts)) return null;
+            return JSON.stringify(parts);
+        } catch (_) { return null; }
+    }
+
+    function buildCatalogIndex(catalogItems) {
+        if (!Array.isArray(catalogItems)) throw new TypeError('Catalog price items must be an array.');
+        if (catalogItems.length > MAX_INDEX_ITEMS) throw new RangeError('Steamprice catalog exceeds the supported 100000 price items.');
+        const index = new Map();
+        for (const item of catalogItems) {
+            if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+            const name = canonicalName(item);
+            if (!name) continue;
+            const value = item.priceCents;
+            const cents = ['number', 'string'].includes(typeof value) && String(value).trim() !== '' &&
+                Number.isSafeInteger(Number(value)) && Number(value) > 0 ? Number(value) : null;
+            storePrice(index, name, cents);
+        }
+        return index;
+    }
+
     function buildIndex(apiItems, ownerSteamId) {
         if (!Array.isArray(apiItems)) throw new TypeError('Price items must be an array.');
         if (apiItems.length > MAX_INDEX_ITEMS) throw new RangeError('Steamprice inventory exceeds the supported 100000 price items.');
         if (ownerSteamId !== undefined && !ownerId(ownerSteamId)) {
             throw new TypeError('A valid inventory owner SteamID64 is required.');
         }
-        const index = { ownerSteamId: ownerSteamId || null, assetPrices: new Map(), exactNames: new Map(), cleanNames: new Map(), variants: new Map() };
+        const index = { ownerSteamId: ownerSteamId || null, assetPrices: new Map(), exactNames: new Map(), cleanNames: new Map(), variants: new Map(), sharedOrdinaryPrices: new Map() };
         for (const item of apiItems) {
             if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
             const owner = ownerId(ownerSteamId ?? item.ownerSteamId);
             const context = contextId(item);
             if (!owner || (appId(item) !== undefined && String(appId(item)) !== '570') ||
                 (context !== undefined && String(context) !== '2')) continue;
+            const ordinary = ordinaryFingerprint(item, true);
+            if (ordinary) {
+                // The API's ordinary cash valuation must agree with its base
+                // price. SCM values and collector asks are separate sources.
+                const fullPrice = item.priceCents ?? item.price_cents;
+                const basePrice = item.basePriceCents;
+                const known = [fullPrice, basePrice].every(value => ['number', 'string'].includes(typeof value) &&
+                    String(value).trim() !== '' && Number.isSafeInteger(Number(value)) && Number(value) >= 0);
+                storePrice(index.sharedOrdinaryPrices, ordinary, known && Number(fullPrice) === Number(basePrice) ? Number(fullPrice) : null);
+            }
             const core = variantCore(item, true);
             if (core) {
                 // Incomplete or exceptional candidates poison the estimate too;
@@ -252,13 +375,11 @@
             const name = canonicalName(item);
             if (!name || unsafeNameFallback(item, name, true)) continue;
             storePrice(index.exactNames, `${owner}:${name}`, cents);
-            const cleaned = cleanName(name);
-            if (cleaned) storePrice(index.cleanNames, `${owner}:${cleaned}`, cents);
         }
         return index;
     }
 
-    function getPrice(index, item) {
+    function getPrice(index, item, ordinaryEstimates, collectionIndex) {
         const unknown = { cents: null, source: 'unknown' };
         if (!item || typeof item !== 'object') return unknown;
         const app = appId(item);
@@ -274,6 +395,7 @@
             const cents = index.assetPrices.get(`${owner}:${asset}`);
             return cents === null ? unknown : { cents, source: 'asset' };
         }
+        if (explicitUnavailable(item)) return unknown;
         const name = canonicalName(item);
         const bareModel = name.replace(/^(?:exalted|standard)\s+/, '');
         let fingerprint = bareModel === 'fractal horns of inner abysm'
@@ -290,10 +412,15 @@
             const cents = index.exactNames.get(exact);
             return cents === null ? unknown : { cents, source: 'name' };
         }
-        const cleaned = `${owner}:${cleanName(name)}`;
-        if (index.cleanNames.has(cleaned)) {
-            const cents = index.cleanNames.get(cleaned);
-            return cents === null ? unknown : { cents, source: 'clean-name' };
+        const ordinary = verifiedOrdinaryFingerprint(item.ordinaryFingerprint, item) || ordinaryFingerprint(item);
+        if (ordinary && ordinaryEstimates instanceof Map && ordinaryEstimates.has(ordinary)) {
+            const cents = ordinaryEstimates.get(ordinary);
+            return Number.isSafeInteger(cents) && cents >= 0 ? { cents, source: 'ordinary-estimate' } : unknown;
+        }
+        const catalog = verifiedCatalogFingerprint(item.catalogFingerprint, item) || catalogFingerprint(item);
+        if (catalog && collectionIndex instanceof Map && collectionIndex.has(name)) {
+            const cents = collectionIndex.get(name);
+            return Number.isSafeInteger(cents) && cents > 0 ? { cents, source: 'catalog' } : unknown;
         }
         return unknown;
     }
@@ -306,11 +433,11 @@
         return Number.isSafeInteger(amount) && amount > 0 ? amount : null;
     }
 
-    function summarize(items, index) {
+    function summarize(items, index, ordinaryEstimates, collectionIndex) {
         if (!Array.isArray(items)) throw new TypeError('Trade items must be an array.');
-        let knownCents = 0, pricedCount = 0, unpricedCount = 0, nonDotaCount = 0, estimatedCount = 0;
+        let knownCents = 0, pricedCount = 0, unpricedCount = 0, nonDotaCount = 0, estimatedCount = 0, ordinaryEstimatedCount = 0, catalogEstimatedCount = 0;
         for (const item of items) {
-            const price = getPrice(index, item);
+            const price = getPrice(index, item, ordinaryEstimates, collectionIndex);
             const amount = amountFor(item);
             const value = price.cents !== null && amount !== null ? price.cents * amount : null;
             if (price.source === 'non-dota') nonDotaCount++;
@@ -320,9 +447,11 @@
                 knownCents += value;
                 pricedCount++;
                 if (price.source === 'variant') estimatedCount++;
+                if (price.source === 'ordinary-estimate') ordinaryEstimatedCount++;
+                if (price.source === 'catalog') catalogEstimatedCount++;
             }
         }
-        return { knownCents, itemCount: items.length, pricedCount, unpricedCount, nonDotaCount, estimatedCount, complete: unpricedCount === 0 };
+        return { knownCents, itemCount: items.length, pricedCount, unpricedCount, nonDotaCount, estimatedCount, ordinaryEstimatedCount, catalogEstimatedCount, complete: unpricedCount === 0 };
     }
 
     function difference(give, receive) {
@@ -335,7 +464,7 @@
         return { knownCents, cents: complete ? knownCents : null, complete };
     }
 
-    const api = { buildIndex, getPrice, summarize, difference, variantFingerprint };
+    const api = { buildIndex, getPrice, summarize, difference, variantFingerprint, ordinaryFingerprint, buildCatalogIndex, catalogFingerprint };
     root.SIHLiteTradePrices = api;
     if (typeof module === 'object' && module && module.exports) module.exports = api;
 })(globalThis);
