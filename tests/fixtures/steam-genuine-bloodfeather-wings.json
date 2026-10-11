@@ -1,0 +1,59 @@
+{
+  "appid": 570,
+  "classid": "771156290",
+  "instanceid": "6003713659",
+  "tradable": 1,
+  "marketable": 1,
+  "market_hash_name": "Genuine Bloodfeather Wings",
+  "name_color": "4D7455",
+  "descriptions": [
+    {
+      "type": "html",
+      "value": "Used By: Queen of Pain",
+      "name": "attribute"
+    },
+    {
+      "type": "html",
+      "value": "The ravens who feast upon the corpses of the cursed oft grow vile and monstrous. From horror devoured was woven a span worthy of agony's mistress. Includes ambient particle.",
+      "name": "attribute"
+    },
+    {
+      "type": "html",
+      "value": "<div style=\"white-space: nowrap; margin: 10px\"><div style=\"white-space: nowrap; padding: 3px;\"><div style=\"width: 60px; height: 32px; vertical-align: top; display: inline-block;\"><div style=\"position: relative; width: 48px; height: 32px; vertical-align: top; display: inline-block; border: 2px solid rgb(255, 255, 255);\"><div style=\"position: absolute; width: 48px; height: 32px; vertical-align: top; display: inline-block; background-size: contain; background-image: url(https://cdn.steamstatic.com/apps/570/icons/econ/sockets/gem_animation.5382a038dccfcc17afca6e4c429993fed96a5482.png)\"></div></div></div><div style=\"vertical-align: top; display: inline-block; margin-left: 12px padding: 2px\"><span style=\"font-size: 18px; white-space: normal; color: rgb(255, 255, 255)\">Allure of the Succubus</span><br><span style=\"font-size: 12px\">Kinetic Gem</span></div></div></div>"
+    }
+  ],
+  "tags": [
+    {
+      "category": "Quality",
+      "internal_name": "genuine",
+      "localized_category_name": "Quality",
+      "localized_tag_name": "Genuine",
+      "color": "4D7455"
+    },
+    {
+      "category": "Rarity",
+      "internal_name": "Rarity_Immortal",
+      "localized_category_name": "Rarity",
+      "localized_tag_name": "Immortal",
+      "color": "e4ae39"
+    },
+    {
+      "category": "Type",
+      "internal_name": "wearable",
+      "localized_category_name": "Type",
+      "localized_tag_name": "Wearable"
+    },
+    {
+      "category": "Slot",
+      "internal_name": "back",
+      "localized_category_name": "Slot",
+      "localized_tag_name": "Back"
+    },
+    {
+      "category": "Hero",
+      "internal_name": "npc_dota_hero_queenofpain",
+      "localized_category_name": "Hero",
+      "localized_tag_name": "Queen of Pain"
+    }
+  ]
+}

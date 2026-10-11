@@ -8,6 +8,9 @@
   const Prices = globalThis.SIHLiteTradePrices || (typeof require === 'function' ? require('./trade-prices.js') : null);
   const STEAM_GET_SPACING_MS = 300;
   const MAX_CLASS_CACHE_ITEMS = 512;
+  const CLASS_ASSET_CACHE_TTL_MS = 90000;
+  const MAX_CLASS_ASSET_OWNERS = 6;
+  const MAX_CLASS_ASSETS = 100000;
 
   function steamId(value) {
     if (typeof value === 'number') return null;
@@ -496,6 +499,150 @@
     return result;
   }
 
+  const currentClassInventories = new Map();
+
+  async function loadCurrentClassInventory(owner, fetchImpl, force) {
+    let cache = currentClassInventories.get(owner);
+    if (cache?.pending) return cache.pending;
+    if (!force && cache?.classes && Date.now() - cache.loadedAt < CLASS_ASSET_CACHE_TTL_MS) {
+      currentClassInventories.delete(owner);
+      currentClassInventories.set(owner, cache);
+      return cache.classes;
+    }
+    cache = { pending: null, classes: null, loadedAt: 0 };
+    currentClassInventories.delete(owner);
+    currentClassInventories.set(owner, cache);
+    while (currentClassInventories.size > MAX_CLASS_ASSET_OWNERS) currentClassInventories.delete(currentClassInventories.keys().next().value);
+    cache.pending = (async () => {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 120000);
+      const classes = new Map();
+      const seenAssets = new Set();
+      const cursors = new Set();
+      let cursor = null, expectedCount = null, page = 0;
+      try {
+        while (true) {
+          if (++page > 500) throw new Error('Steam inventory class page limit exceeded.');
+          const url = new URL(`https://steamcommunity.com/inventory/${owner}/570/2/`);
+          url.searchParams.set('l', 'english');
+          url.searchParams.set('count', '2000');
+          if (cursor) url.searchParams.set('start_assetid', cursor);
+          const body = await scheduleSteamRequest(async () => {
+            const response = await fetchImpl(url.href, { credentials: 'include', signal: controller.signal });
+            if (!response.ok) throw new Error(`Steam inventory classes returned HTTP ${response.status}.`);
+            if (response.url) {
+              const address = new URL(response.url);
+              if (address.origin !== 'https://steamcommunity.com' || address.username || address.password || address.hash ||
+                  !new RegExp(`^/inventory/${owner}/570/2/?$`).test(address.pathname)) {
+                throw new Error('Steam returned a different inventory instead of this owner.');
+              }
+            }
+            return response.json();
+          }, controller.signal);
+          if (controller.signal.aborted) throw aborted();
+          if (!body || !(body.success === true || body.success === 1)) throw new Error('Steam inventory classes are unavailable.');
+          if (Object.hasOwn(body, 'total_inventory_count')) {
+            const count = body.total_inventory_count;
+            if (!(typeof count === 'number' || (typeof count === 'string' && /^(?:0|[1-9]\d*)$/.test(count)))) {
+              throw new Error('Steam returned an invalid inventory item count.');
+            }
+            const total = Number(body.total_inventory_count);
+            if (!Number.isSafeInteger(total) || total < 0 || total > MAX_CLASS_ASSETS || (expectedCount != null && expectedCount !== total)) {
+              throw new Error('Steam inventory changed while its classes were loading.');
+            }
+            expectedCount = total;
+          } else if (page === 1) throw new Error('Steam did not provide a complete inventory item count.');
+          const assets = body.assets ?? (expectedCount === 0 ? [] : null);
+          if (!Array.isArray(assets) || assets.length > 2000) throw new Error('Steam returned invalid inventory classes.');
+          for (let index = 0; index < assets.length; index++) {
+            const asset = assets[index];
+            const assetId = numericId(asset?.assetid);
+            const classId = numericId(asset?.classid);
+            const instanceId = asset?.instanceid == null ? '' : String(asset.instanceid);
+            const claimedOwner = asset?.ownerSteamId ?? asset?.ownerid ?? asset?.owner;
+            if (!assetId || !classId || (typeof asset.instanceid === 'number' && !Number.isSafeInteger(asset.instanceid)) ||
+                !/^\d{1,20}$/.test(instanceId) || String(asset.appid) !== '570' ||
+                (asset.contextid != null && String(asset.contextid) !== '2') || (claimedOwner != null && String(claimedOwner) !== owner) ||
+                seenAssets.has(assetId)) throw new Error('Steam returned inconsistent inventory classes.');
+            seenAssets.add(assetId);
+            if (seenAssets.size > MAX_CLASS_ASSETS) throw new Error('Steam inventory class limit exceeded.');
+            const key = `${classId}:${instanceId}`;
+            if (!classes.has(key)) classes.set(key, []);
+            classes.get(key).push(assetId);
+            // Release the event loop between small chunks; only IDs are kept,
+            // and descriptions/images from the downloaded page are discarded.
+            if ((index + 1) % 256 === 0) {
+              await new Promise(resolve => setTimeout(resolve, 0));
+              if (controller.signal.aborted) throw aborted();
+            }
+          }
+          const more = body.more_items === true || body.more_items === 1;
+          if (Object.hasOwn(body, 'more_items') && body.more_items !== false && body.more_items !== 0 && !more) throw new Error('Steam returned invalid inventory pagination.');
+          if (!more) break;
+          if (seenAssets.size >= expectedCount) throw new Error('Steam returned inconsistent inventory pagination.');
+          const next = numericId(body.last_assetid);
+          if (!next || !assets.length || cursors.has(next)) throw new Error('Steam returned invalid inventory pagination.');
+          cursors.add(next);
+          cursor = next;
+        }
+        if (expectedCount == null || seenAssets.size !== expectedCount) throw new Error('Steam inventory changed while its classes were loading.');
+        cache.classes = classes;
+        cache.loadedAt = Date.now();
+        return classes;
+      } catch (error) {
+        if (currentClassInventories.get(owner) === cache) currentClassInventories.delete(owner);
+        if (error.name === 'AbortError') throw new Error('Loading current inventory classes timed out.');
+        throw error;
+      } finally { clearTimeout(timer); cache.pending = null; }
+    })();
+    return cache.pending;
+  }
+
+  function waitForClassInventory(pending, signal) {
+    if (!signal) return pending;
+    if (signal.aborted) return Promise.reject(aborted());
+    // One offer leaving the viewport should stop its own wait without
+    // cancelling a shared scan that another visible offer is using.
+    return new Promise((resolve, reject) => {
+      const cancel = () => reject(aborted());
+      signal.addEventListener('abort', cancel, { once: true });
+      pending.then(value => { signal.removeEventListener('abort', cancel); resolve(value); },
+        error => { signal.removeEventListener('abort', cancel); reject(error); });
+    });
+  }
+
+  async function fetchClassAssets(offer, expectedMeSteamId, fetchImpl = globalThis.fetch, options = {}) {
+    const offerId = numericId(offer?.offerId);
+    const meSteamId = steamId(offer?.meSteamId);
+    const partnerSteamId = steamId(offer?.partnerSteamId);
+    if (!offerId || !meSteamId || meSteamId !== steamId(expectedMeSteamId) || !partnerSteamId || partnerSteamId === meSteamId) throw new Error('Invalid trade offer.');
+    if (options?.signal?.aborted) throw aborted();
+    const wanted = new Map();
+    const items = [...(offer.give || []).map(item => ({ item, owner: meSteamId })),
+      ...(offer.receive || []).map(item => ({ item, owner: partnerSteamId }))];
+    for (const { item, owner } of items) {
+      if (item?.appId !== '570' || item.isCurrency || item.ownerSteamId !== owner ||
+          (item.contextId != null && item.contextId !== '2') || !numericId(item.classId) || !/^\d{1,20}$/.test(String(item.instanceId))) continue;
+      if (!wanted.has(item.ownerSteamId)) wanted.set(item.ownerSteamId, new Map());
+      wanted.get(item.ownerSteamId).set(`${item.classId}:${item.instanceId}`, item);
+    }
+    const classAssets = [];
+    let failed = false;
+    for (const [owner, classes] of wanted) {
+      try {
+        if (options?.signal?.aborted) throw aborted();
+        const inventory = await waitForClassInventory(loadCurrentClassInventory(owner, fetchImpl, options?.force === true), options?.signal);
+        for (const [key, item] of classes) {
+          classAssets.push({ ownerSteamId: owner, appId: '570', contextId: '2', classId: item.classId,
+            instanceId: item.instanceId, assetIds: [...(inventory.get(key) || [])] });
+        }
+      } catch (error) { if (error.name === 'AbortError') throw error; failed = true; }
+    }
+    const result = { offerId, meSteamId, partnerSteamId, classAssets };
+    if (failed) result.classAssetError = 'Some matching current inventory assets are unavailable. Only confirmed item estimates can be shown.';
+    return result;
+  }
+
   const classInventories = new Map();
 
   function inventoryEndpoint(html, details, owner, appId, contextId) {
@@ -685,7 +832,7 @@
     } finally { clearTimeout(timer); }
   }
 
-  const api = { read, applyDetails, fetchDetails, fetchClassDescriptions, parseDetails, parseClassDescription, parseEconomyKey, normalizeItem, steamId, accountSteamId };
+  const api = { read, applyDetails, fetchDetails, fetchClassDescriptions, fetchClassAssets, parseDetails, parseClassDescription, parseEconomyKey, normalizeItem, steamId, accountSteamId };
   globalThis.SIHLiteTradeOffers = api;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
 })();

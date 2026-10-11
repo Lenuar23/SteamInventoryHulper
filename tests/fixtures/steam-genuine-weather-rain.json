@@ -1,0 +1,50 @@
+{
+  "appid": "570",
+  "classid": "519295759",
+  "instanceid": "93973071",
+  "tradable": 1,
+  "marketable": 0,
+  "market_hash_name": "Genuine Weather Rain",
+  "name_color": "4D7455",
+  "descriptions": [
+    {
+      "type": "html",
+      "value": "This item cannot be listed on the Steam Community Market.",
+      "name": "attribute"
+    }
+  ],
+  "tags": [
+    {
+      "internal_name": "genuine",
+      "name": "Genuine",
+      "category": "Quality",
+      "color": "4D7455",
+      "category_name": "Quality"
+    },
+    {
+      "internal_name": "Rarity_Mythical",
+      "name": "Mythical",
+      "category": "Rarity",
+      "color": "8847ff",
+      "category_name": "Rarity"
+    },
+    {
+      "internal_name": "misc",
+      "name": "Misc",
+      "category": "Type",
+      "category_name": "Type"
+    },
+    {
+      "internal_name": "weather",
+      "name": "Weather",
+      "category": "Slot",
+      "category_name": "Slot"
+    },
+    {
+      "internal_name": "DOTA_OtherType",
+      "name": "Other",
+      "category": "Hero",
+      "category_name": "Hero"
+    }
+  ]
+}

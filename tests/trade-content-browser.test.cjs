@@ -125,6 +125,13 @@ async function openFixture(t, options = {}) {
         window.__acceptRequests = [];
         window.__fetchRequests = [];
         window.__pendingFetches = [];
+        window.__copiedDiagnostics = [];
+        Object.defineProperty(navigator, 'clipboard', { configurable: true, value: {
+            async writeText(value) {
+                window.__copiedDiagnostics.push(String(value));
+                if (config.clipboardFailure) throw new Error('Clipboard permission denied');
+            }
+        } });
         window.__tradeSnapshot = config.snapshot;
         window.__sortReply = config.sortReply || { success: true, count: 4 };
         const callCounts = new Map();
@@ -188,9 +195,10 @@ async function openFixture(t, options = {}) {
         plans: options.plans, sortReply: options.sortReply,
         collection: options.collection,
         fetchPlans: options.fetchPlans, sessionId: options.sessionId === undefined ? 'fixture_session_123' : options.sessionId,
-        monitorWork: options.monitorWork === true
+        monitorWork: options.monitorWork === true,
+        clipboardFailure: options.clipboardFailure === true
     });
-    for (const file of ['gems.js', 'trade-prices.js', 'trade-offers.js', 'trade-accept.js', 'trade-content.js']) {
+    for (const file of ['gems.js', 'trade-prices.js', 'trade-offers.js', 'trade-accept.js', 'trade-diagnostics.js', 'trade-content.js']) {
         await page.addScriptTag({ path: path.join(__dirname, '..', file) });
     }
     await page.locator(options.panel || '#sih-lite-trade-editor-summary').first().waitFor({ state: 'attached' });
@@ -478,7 +486,7 @@ function listHtml(snapshot) {
 async function openList(t, options = {}) {
     const snapshot = options.snapshot || listSnapshot();
     return openFixture(t, { ...options, snapshot, html: listHtml(snapshot),
-        url: `https://steamcommunity.com/profiles/${OWNER}/tradeoffers/${options.sent ? 'sent/' : ''}`,
+        url: options.url || `https://steamcommunity.com/profiles/${OWNER}/tradeoffers/${options.sent ? 'sent/' : ''}`,
         panel: '.sih-lite-trade-summary' });
 }
 
@@ -1055,9 +1063,239 @@ function genuineClassHover(classid, market_hash_name) {
     return `<script>BuildHover('economy_item_fixture', ${JSON.stringify({
         appid: 570, classid, instanceid: '0', market_hash_name, name_color: '4D7455',
         tags: [{ category: 'Quality', internal_name: 'genuine' }],
-        tradable: 1, marketable: 1, descriptions: []
+        tradable: 1, marketable: 0, descriptions: []
     })});</script>`;
 }
+
+function socketedClassHover(classid, market_hash_name, sockets, instanceid = '0') {
+    return `<script>BuildHover('economy_item_fixture', ${JSON.stringify({
+        appid: 570, classid, instanceid, market_hash_name, name_color: 'CF6A32',
+        tradable: 1, marketable: 1, descriptions: sockets.map(([icon, name, type]) => ({ type: 'html', value:
+            `<div style="background-image:url(https://cdn.steamstatic.com/apps/570/icons/econ/sockets/${icon}.hash.png)">` +
+            `<span style="font-size:18px;color:rgb(61,104,196)">${name}</span><br><span>${type}</span></div>`
+        }))
+    })});</script>`;
+}
+
+function currentClassAsset(assetid, classid, instanceid = '0') {
+    return { appid: 570, contextid: '2', assetid, classid, instanceid, amount: '1' };
+}
+
+function currentClassInventory(assets, extra = {}) {
+    return { success: 1, assets, total_inventory_count: assets.length, more_items: 0, ...extra };
+}
+
+test('historical rune, kinetic and Inscribed TB cards use labeled owner class estimates after every public inventory page is verified', async t => {
+    const snapshot = listSnapshot([listOffer('610', { active: false, incoming: false,
+        give: [item(OWNER, null, '', '1', { classId: '6100', instanceId: '0' }),
+            item(OWNER, null, '', '2', { classId: '6101', instanceId: '0' })],
+        receive: [item(PARTNER, null, '', '1', { classId: '6200', instanceId: '42' })]
+    })]);
+    const mineUrl = `https://steamcommunity.com/inventory/${OWNER}/570/2/?l=english&count=2000`;
+    const theirsUrl = `https://steamcommunity.com/inventory/${PARTNER}/570/2/?l=english&count=2000`;
+    const page = await openList(t, { snapshot, sent: true, prices: {
+        [OWNER]: [
+            { assetid: '7100', marketHashName: 'Golden Bloodfeather Feast', priceCents: 1750 },
+            { assetid: '7101', marketHashName: 'Wings of the Foulfell Corruptor', priceCents: 925 },
+            { assetid: '7102', marketHashName: 'Golden Bloodfeather Feast', priceCents: 1750 }
+        ],
+        [PARTNER]: [
+            { assetid: '7200', marketHashName: 'Inscribed Fractal Horns of Inner Abysm', priceCents: 11767 },
+            { assetid: '7100', marketHashName: 'Golden Bloodfeather Feast', priceCents: 99999 }
+        ]
+    }, fetchPlans: {
+        'https://steamcommunity.com/economy/itemclasshover/570/6100/0?content_only=1&l=english': [{
+            text: socketedClassHover('6100', 'Golden Bloodfeather Feast', [['gem_rune', 'Kills: 4096', 'Inscribed Gem']])
+        }],
+        'https://steamcommunity.com/economy/itemclasshover/570/6101/0?content_only=1&l=english': [{
+            text: socketedClassHover('6101', 'Wings of the Foulfell Corruptor', [['gem_kinetic', 'Kinetic: Burning Wings', 'Kinetic Gem']])
+        }],
+        'https://steamcommunity.com/economy/itemclasshover/570/6200/42?content_only=1&l=english': [{
+            text: socketedClassHover('6200', 'Inscribed Fractal Horns of Inner Abysm', [
+                ['gem_color', 'Deep Blue', 'Prismatic Gem'], ['gem_rune', 'Gold Earned: 128438', 'Inscribed Gem']
+            ], '42')
+        }],
+        [mineUrl]: [{ data: currentClassInventory([currentClassAsset('7100', '6100'), currentClassAsset('7101', '6101')],
+            { total_inventory_count: 3, more_items: 1, last_assetid: '7101' }) }],
+        [mineUrl + '&start_assetid=7101']: [{ data: currentClassInventory([currentClassAsset('7102', '6100')],
+            { total_inventory_count: 3 }) }],
+        [theirsUrl]: [{ data: currentClassInventory([currentClassAsset('7200', '6200', '42')]) }]
+    } });
+    await waitText(listBadge(page, 'give', 0, '610'), '$17.50');
+    await waitText(listBadge(page, 'give', 1, '610'), '$18.50');
+    await waitText(listBadge(page, 'receive', 0, '610'), '$117.67');
+    assert.equal(await offerSummary(page, '610').locator('[data-role="give"]').textContent(), 'You give: $36.00');
+    assert.equal(await offerSummary(page, '610').locator('[data-role="net"]').textContent(), 'Net gain: +$81.67');
+    assert.match(await offerSummary(page, '610').locator('[data-role="status"]').textContent(), /Includes 3 current estimates matched by exact item class and variant/);
+    assert.match(await listBadge(page, 'give', 0, '610').getAttribute('title'), /all matching item classes and variants.*Historical asset identity is unchanged/);
+    const keys = await page.locator('#tradeofferid_610 .trade_item').evaluateAll(elements => elements.map(element => element.dataset.economyItem));
+    assert.deepEqual(keys, ['classinfo/570/6100/0/a:1', 'classinfo/570/6101/0/a:2', 'classinfo/570/6200/42/a:1']);
+    assert.equal(await offerSummary(page, '610').locator('.sih-lite-trade-diagnostics').isVisible(), false, 'all three verified estimates are priced');
+    const requests = await page.evaluate(() => window.__fetchRequests);
+    assert.equal(requests.filter(request => request.url.includes('/inventory/')).length, 3, 'all matching current copies are checked across both owner inventories');
+    assert.ok(requests.every(request => request.method === 'GET'));
+    assert.ok(requests.every(request => !request.url.includes('/tradeoffer/')));
+    assert.equal(await fastAccept(page, '610').count(), 0);
+});
+
+test('conflicting or missing class candidate quotes remain unknown and copied diagnostics retain evidence without private data or extra requests', async t => {
+    const snapshot = listSnapshot([listOffer('611', { active: false, incoming: false,
+        give: [item(OWNER, null, '', '1', { classId: '6110', instanceId: '0',
+            token: 'secret_snapshot_token', sessionid: 'secret_snapshot_cookie' })],
+        receive: [item(PARTNER, null, '', '1', { classId: '6210', instanceId: '0' })]
+    })]);
+    const page = await openList(t, { snapshot, sent: true,
+        url: `https://steamcommunity.com/profiles/${OWNER}/tradeoffers/sent/?token=secret_url_token&access_token=secret_access_token`,
+        sessionId: 'secret_cookie_session', prices: {
+            [OWNER]: [{ assetid: '7110', marketHashName: 'Golden Bloodfeather Feast', priceCents: 1750 },
+                { assetid: '7111', marketHashName: 'Golden Bloodfeather Feast', priceCents: 2750 }],
+            [PARTNER]: [{ assetid: '7999', marketHashName: 'Unrelated Item', priceCents: 123 }]
+        }, fetchPlans: {
+            'https://steamcommunity.com/economy/itemclasshover/570/6110/0?content_only=1&l=english': [{
+                text: socketedClassHover('6110', 'Golden Bloodfeather Feast', [['gem_rune', 'Kills: 42', 'Inscribed Gem']])
+            }],
+            'https://steamcommunity.com/economy/itemclasshover/570/6210/0?content_only=1&l=english': [{
+                text: socketedClassHover('6210', 'Inscribed Fractal Horns of Inner Abysm', [['gem_color', 'Deep Blue', 'Prismatic Gem']])
+            }],
+            [`https://steamcommunity.com/inventory/${OWNER}/570/2/?l=english&count=2000`]: [{
+                data: currentClassInventory([currentClassAsset('7110', '6110'), currentClassAsset('7111', '6110')])
+            }],
+            [`https://steamcommunity.com/inventory/${PARTNER}/570/2/?l=english&count=2000`]: [{
+                data: currentClassInventory([currentClassAsset('7210', '6210')])
+            }]
+        }
+    });
+    await page.waitForFunction(() => window.__fetchRequests.filter(request => request.url.includes('/inventory/')).length === 2);
+    await page.locator('#tradeofferid_611 .sih-lite-trade-retry:enabled').waitFor();
+    await frames(page);
+    assert.equal(await listBadge(page, 'give', 0, '611').count(), 0);
+    assert.equal(await listBadge(page, 'receive', 0, '611').count(), 0);
+    assert.match(await offerSummary(page, '611').locator('[data-role="status"]').textContent(), /Partial valuation: 2 items unpriced/);
+    assert.doesNotMatch(await offerSummary(page, '611').locator('[data-role="net"]').textContent(), /Net gain|Net loss|Even/);
+    const before = await page.evaluate(() => ({ fetches: window.__fetchRequests.length, prices: window.__chromeRequests.length }));
+    await offerSummary(page, '611').locator('.sih-lite-trade-diagnostics').click();
+    await waitText(offerSummary(page, '611').locator('[data-role="diagnostics-status"]'), 'Price diagnostics copied.');
+    const copied = await page.evaluate(() => window.__copiedDiagnostics.at(-1));
+    const report = JSON.parse(copied);
+    assert.equal(report.version, '1.3.4');
+    assert.equal(report.offer.offerId, '611');
+    assert.equal(report.offer.meSteamId, OWNER);
+    assert.equal(report.offer.partnerSteamId, PARTNER);
+    assert.equal(report.pathname, `/profiles/${OWNER}/tradeoffers/sent/`);
+    assert.equal(report.classPrices.state, 'ready');
+    const give = report.items.find(entry => entry.location === 'summary.give[0]');
+    const receive = report.items.find(entry => entry.location === 'summary.receive[0]');
+    assert.equal(give.identity.assetId, null, 'current proof must not replace a historical asset identity');
+    assert.equal(give.identity.classId, '6110');
+    assert.equal(give.identity.instanceId, '0');
+    assert.equal(give.flags.tradable, true);
+    assert.equal(give.flags.marketable, true);
+    assert.equal(give.flags.hasGems, true);
+    assert.deepEqual(give.classProof.assetIds, ['7110', '7111']);
+    assert.equal(give.matches.class.cents, null);
+    assert.equal(give.reason.code, 'class-price-conflict');
+    assert.deepEqual(receive.classProof.assetIds, ['7210']);
+    assert.equal(receive.price.cents, null);
+    assert.equal(receive.reason.code, 'class-candidate-price-missing');
+    assert.doesNotMatch(copied, /secret_|sessionid|access_token|token=|cookie|\?/i);
+    await frames(page);
+    assert.deepEqual(await page.evaluate(() => ({ fetches: window.__fetchRequests.length, prices: window.__chromeRequests.length })), before,
+        'copying existing diagnostics performs no price or Steam GET requests');
+    assert.equal(await fastAccept(page, '611').count(), 0);
+});
+
+test('price diagnostics provide a selected readonly textarea when clipboard access fails', async t => {
+    const snapshot = listSnapshot([listOffer('612', { active: false,
+        give: [item(OWNER, '100', 'Shared Item')],
+        receive: [item(PARTNER, '999', 'Inscribed Fractal Horns of Inner Abysm', '1', { hasGems: true, tradable: 1, marketable: 1 })]
+    })]);
+    const page = await openList(t, { snapshot, clipboardFailure: true });
+    await waitText(listBadge(page, 'give', 0, '612'), '$2.50');
+    const before = await page.evaluate(() => ({ fetches: window.__fetchRequests.length, prices: window.__chromeRequests.length }));
+    await offerSummary(page, '612').locator('.sih-lite-trade-diagnostics').click();
+    const field = offerSummary(page, '612').locator('textarea.sih-lite-trade-diagnostics-text');
+    await field.waitFor({ state: 'visible' });
+    assert.equal(await field.getAttribute('readonly'), '');
+    assert.equal(await field.getAttribute('aria-label'), 'Price diagnostics');
+    assert.equal(await field.inputValue(), await page.evaluate(() => window.__copiedDiagnostics.at(-1)));
+    const report = JSON.parse(await field.inputValue());
+    assert.equal(report.offer.offerId, '612');
+    assert.equal(report.items.find(entry => entry.side === 'receive').identity.assetId, '999');
+    assert.equal(await field.evaluate(element => document.activeElement === element && element.selectionEnd === element.value.length), true);
+    await waitText(offerSummary(page, '612').locator('[data-role="diagnostics-status"]'), 'Copy the price diagnostics below.');
+    assert.deepEqual(await page.evaluate(() => ({ fetches: window.__fetchRequests.length, prices: window.__chromeRequests.length })), before);
+});
+
+test('an empty current class proof cannot block a Weather catalog quote restored by Retry prices', async t => {
+    const snapshot = listSnapshot([listOffer('613', { active: false,
+        give: [item(OWNER, '100', 'Shared Item')],
+        receive: [item(PARTNER, null, '', '1', { classId: '6250', instanceId: '0' })]
+    })]);
+    const inventoryUrl = `https://steamcommunity.com/inventory/${PARTNER}/570/2/?l=english&count=2000`;
+    const page = await openList(t, { snapshot, prices: {
+        [OWNER]: DEFAULT_PRICES[OWNER],
+        [PARTNER]: [{ assetid: '7999', marketHashName: 'Unrelated Item', priceCents: 123 }]
+    }, plans: { fetchCollection: [
+        { success: false, error: 'Steamprice collection temporarily unavailable.' },
+        { success: true, data: { items: [{ marketHashName: 'Genuine Weather Ash', priceCents: 671, source: 'steamprice-collection' }] } }
+    ] }, fetchPlans: {
+        'https://steamcommunity.com/economy/itemclasshover/570/6250/0?content_only=1&l=english': [{
+            text: genuineClassHover('6250', 'Genuine Weather Ash')
+        }],
+        [inventoryUrl]: [{ data: currentClassInventory([]) }]
+    } });
+    await page.waitForFunction(url => window.__fetchRequests.some(request => request.url === url), inventoryUrl);
+    await offerSummary(page, '613').locator('.sih-lite-trade-retry:enabled').waitFor();
+    assert.equal(await listBadge(page, 'receive', 0, '613').count(), 0);
+    assert.match(await offerSummary(page, '613').locator('[data-role="status"]').textContent(), /collection temporarily unavailable/);
+    await offerSummary(page, '613').locator('.sih-lite-trade-retry').click();
+    await waitText(listBadge(page, 'receive', 0, '613'), '$6.71');
+    assert.equal(await offerSummary(page, '613').locator('[data-role="receive"]').textContent(), 'You receive: $6.71');
+    assert.equal(await offerSummary(page, '613').locator('[data-role="net"]').textContent(), 'Net gain: +$4.21');
+    assert.match(await listBadge(page, 'receive', 0, '613').getAttribute('title'), /Current estimate from Steamprice collection/);
+    assert.equal((await page.evaluate(() => window.__chromeRequests)).filter(request => request.action === 'fetchCollection').length, 2);
+    assert.equal(await page.locator('#list_613_receive_0').getAttribute('data-economy-item'), 'classinfo/570/6250/0/a:1');
+});
+
+test('failed forced class rescans discard an older single-copy estimate after the owner price inventory changes', async t => {
+    const snapshot = listSnapshot([listOffer('614', { active: false,
+        give: [item(OWNER, null, '', '1', { classId: '6300', instanceId: '0' })],
+        receive: [item(PARTNER, '103', 'Partner Item')]
+    })]);
+    const inventoryUrl = `https://steamcommunity.com/inventory/${OWNER}/570/2/?l=english&count=2000`;
+    const oldRows = [{ assetid: '100', marketHashName: 'Golden Bloodfeather Feast', priceCents: 100 }];
+    const page = await openList(t, { snapshot, plans: {
+        [`${OWNER}:fetchPrices`]: [cachedReply({ items: oldRows }), { success: true, data: { items: [
+            ...oldRows, { assetid: '101', marketHashName: 'Golden Bloodfeather Feast', priceCents: 300 }
+        ] } }]
+    }, fetchPlans: {
+        'https://steamcommunity.com/economy/itemclasshover/570/6300/0?content_only=1&l=english': [{
+            text: socketedClassHover('6300', 'Golden Bloodfeather Feast', [['gem_rune', 'Kills: 100', 'Inscribed Gem']])
+        }],
+        [inventoryUrl]: [
+            { data: currentClassInventory([currentClassAsset('100', '6300')]) },
+            { status: 503, data: { success: 0 } }
+        ]
+    } });
+    await waitText(listBadge(page, 'give', 0, '614'), '$1.00');
+    await waitText(listBadge(page, 'receive', 0, '614'), '$2.00');
+    assert.equal(await offerSummary(page, '614').locator('[data-role="net"]').textContent(), 'Net gain: +$1.00');
+    assert.match(await listBadge(page, 'give', 0, '614').getAttribute('title'), /all matching item classes/);
+    await offerSummary(page, '614').locator('.sih-lite-trade-retry').click();
+    await page.waitForFunction(url => window.__fetchRequests.filter(request => request.url === url).length === 2, inventoryUrl);
+    await offerSummary(page, '614').locator('.sih-lite-trade-retry:enabled').waitFor();
+    await frames(page);
+    assert.equal(await listBadge(page, 'give', 0, '614').count(), 0,
+        'the old one-copy proof cannot value a changed owner inventory when the forced scan fails');
+    assert.equal(await listBadge(page, 'receive', 0, '614').textContent(), '$2.00', 'verified opposite-side prices remain available');
+    assert.equal(await offerSummary(page, '614').locator('[data-role="give"]').textContent(), 'You give: Unavailable');
+    assert.equal(await offerSummary(page, '614').locator('[data-role="net"]').textContent(), 'Known difference: +$2.00');
+    assert.match(await offerSummary(page, '614').locator('[data-role="status"]').textContent(), /Current variant prices:.*unavailable/i);
+    assert.doesNotMatch(await offerSummary(page, '614').locator('[data-role="status"]').textContent(), /Includes .* matched by exact item class/);
+    assert.equal(await offerSummary(page, '614').locator('.sih-lite-trade-retry').isVisible(), true);
+    assert.ok((await page.evaluate(() => window.__chromeRequests)).some(request => request.action === 'fetchPrices' && request.steamId === OWNER && request.force));
+    assert.equal(await page.locator('#list_614_give_0').getAttribute('data-economy-item'), 'classinfo/570/6300/0/a:1');
+});
 
 test('historical Weather items absent from owner APIs use one shared Steamprice collection while existing asset prices remain primary', async t => {
     const snapshot = listSnapshot([

@@ -377,7 +377,7 @@ const HTML = `<!doctype html><html><head><style>
         setTimeout(() => callback({ success: true, data }), 0);
       }
     }}; window.fetch = () => { throw new Error('Trade smoke must not call a real endpoint.'); };`);
-    for (const file of ['gems.js', 'trade-prices.js', 'trade-offers.js', 'trade-accept.js', 'trade-content.js']) {
+    for (const file of ['gems.js', 'trade-prices.js', 'trade-offers.js', 'trade-accept.js', 'trade-diagnostics.js', 'trade-content.js']) {
       await isolated(fs.readFileSync(path.join(__dirname, '..', file), 'utf8'));
     }
     await page.locator('#sih-lite-trade-inventory-panel [data-role="inventory-me"]').filter({ hasText: '$123.45' }).waitFor();

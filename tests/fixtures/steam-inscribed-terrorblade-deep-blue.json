@@ -1,0 +1,85 @@
+{
+  "appid": 570,
+  "classid": "9033088085",
+  "instanceid": "9054180735",
+  "tradable": 1,
+  "marketable": 1,
+  "market_hash_name": "Inscribed Fractal Horns of Inner Abysm",
+  "name_color": "CF6A32",
+  "descriptions": [
+    {
+      "type": "html",
+      "value": "Used By: Terrorblade",
+      "name": "attribute"
+    },
+    {
+      "type": "html",
+      "value": " ",
+      "name": "attribute"
+    },
+    {
+      "type": "html",
+      "value": "Fractal Horns of Inner Abysm",
+      "color": "9da1a9",
+      "name": "attribute"
+    },
+    {
+      "type": "html",
+      "value": "Fractal Horns of Inner Abysm",
+      "color": "6c7075",
+      "name": "attribute"
+    },
+    {
+      "value": "''<font color=\"#2981BA\">Think happy thoughts, think happy thoughts'</>'''",
+      "name": "attribute"
+    },
+    {
+      "type": "html",
+      "value": " ",
+      "name": "attribute"
+    },
+    {
+      "type": "html",
+      "value": "( Not Deletable )",
+      "name": "attribute"
+    },
+    {
+      "type": "html",
+      "value": "<div style=\"white-space: nowrap; margin: 10px\"><div style=\"white-space: nowrap; padding: 3px;\"><div style=\"width: 60px; height: 32px; vertical-align: top; display: inline-block;\"><div style=\"position: relative; width: 48px; height: 32px; vertical-align: top; display: inline-block; border: 2px solid rgb(61, 104, 196);\"><div style=\"position: absolute; width: 48px; height: 32px; vertical-align: top; display: inline-block; background-size: contain; background-image: url(https://cdn.steamstatic.com/apps/570/icons/econ/sockets/gem_color.991870a920f3defab3c5a1b4c77fb747e8dfca1d.png)\"></div><div style=\"position: absolute; filter:alpha(opacity=90); -moz-opacity:0.9; -khtml-opacity: 0.9; opacity: 0.9; width: 48px; height: 32px; vertical-align: top; display: inline-block; background-size: contain; background-image: url(https://cdn.steamstatic.com/apps/570/icons/econ/sockets/gem_color_mask.d6a50dcfd6ef4220c0935872ab03b1b0f464fefa.png)\"></div></div></div><div style=\"vertical-align: top; display: inline-block; margin-left: 12px padding: 2px\"><span style=\"font-size: 18px; white-space: normal; color: rgb(61, 104, 196)\">Deep Blue</span><br><span style=\"font-size: 12px\">Prismatic Gem</span></div></div><div style=\"white-space: nowrap; padding: 3px;\"><div style=\"width: 60px; height: 32px; vertical-align: top; display: inline-block;\"><div style=\"position: relative; width: 48px; height: 32px; vertical-align: top; display: inline-block; border: 2px solid rgb(255, 255, 255);\"><div style=\"position: absolute; width: 48px; height: 32px; vertical-align: top; display: inline-block; background-size: contain; background-image: url(https://cdn.steamstatic.com/apps/570/icons/econ/sockets/gem_stat.30d7935c1f0a1b9e8e28c691c2bd28f7d5f471bc.png)\"></div></div></div><div style=\"vertical-align: top; display: inline-block; margin-left: 12px padding: 2px\"><span style=\"font-size: 18px; white-space: normal; color: rgb(255, 255, 255)\">Gold Earned: 128438</span><br><span style=\"font-size: 12px\">Inscribed Gem</span></div></div></div>"
+    }
+  ],
+  "tags": [
+    {
+      "category": "Quality",
+      "internal_name": "strange",
+      "localized_category_name": "Quality",
+      "localized_tag_name": "Inscribed",
+      "color": "CF6A32"
+    },
+    {
+      "category": "Rarity",
+      "internal_name": "Rarity_Arcana",
+      "localized_category_name": "Rarity",
+      "localized_tag_name": "Arcana",
+      "color": "ADE55C"
+    },
+    {
+      "category": "Type",
+      "internal_name": "wearable",
+      "localized_category_name": "Type",
+      "localized_tag_name": "Wearable"
+    },
+    {
+      "category": "Slot",
+      "internal_name": "head",
+      "localized_category_name": "Slot",
+      "localized_tag_name": "Head"
+    },
+    {
+      "category": "Hero",
+      "internal_name": "npc_dota_hero_terrorblade",
+      "localized_category_name": "Hero",
+      "localized_tag_name": "Terrorblade"
+    }
+  ]
+}

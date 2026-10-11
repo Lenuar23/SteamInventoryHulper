@@ -1,0 +1,59 @@
+{
+  "appid": 570,
+  "classid": "2944822253",
+  "instanceid": "3501290646",
+  "tradable": 1,
+  "marketable": 1,
+  "market_hash_name": "Golden Bloodfeather Feast",
+  "name_color": "D2D2D2",
+  "descriptions": [
+    {
+      "type": "html",
+      "value": "Used By: Queen of Pain",
+      "name": "attribute"
+    },
+    {
+      "type": "html",
+      "value": "The strike of Akasha's blade is boon to the unkind wings that eagerly await her torments from aloft.",
+      "name": "attribute"
+    },
+    {
+      "type": "html",
+      "value": "<div style=\"white-space: nowrap; margin: 10px\"><div style=\"white-space: nowrap; padding: 3px;\"><div style=\"width: 60px; height: 32px; vertical-align: top; display: inline-block;\"><div style=\"position: relative; width: 48px; height: 32px; vertical-align: top; display: inline-block; border: 2px solid rgb(255, 255, 255);\"><div style=\"position: absolute; width: 48px; height: 32px; vertical-align: top; display: inline-block; background-size: contain; background-image: url(https://cdn.steamstatic.com/apps/570/icons/econ/sockets/gem_stat.30d7935c1f0a1b9e8e28c691c2bd28f7d5f471bc.png)\"></div></div></div><div style=\"vertical-align: top; display: inline-block; margin-left: 12px padding: 2px\"><span style=\"font-size: 18px; white-space: normal; color: rgb(255, 255, 255)\">Team First Blood, Tower or Roshan: 0</span><br><span style=\"font-size: 12px\">TI8 Rune</span></div></div><div style=\"white-space: nowrap; padding: 3px;\"><div style=\"width: 60px; height: 32px; vertical-align: top; display: inline-block;\"><div style=\"position: relative; width: 48px; height: 32px; vertical-align: top; display: inline-block; border: 2px solid rgb(255, 255, 255);\"><div style=\"position: absolute; width: 48px; height: 32px; vertical-align: top; display: inline-block; background-size: contain; background-image: url(https://cdn.steamstatic.com/apps/570/icons/econ/sockets/gem_stat_empty.512fe74cd44401dd77e872cedfafb9e558bd0092.png)\"></div></div></div><div style=\"vertical-align: top; display: inline-block; margin-left: 12px padding: 2px\"><span style=\"font-size: 18px; white-space: normal; color: rgb(255, 255, 255)\">Empty Socket</span><br><span style=\"font-size: 12px\">General</span></div></div></div>"
+    }
+  ],
+  "tags": [
+    {
+      "category": "Quality",
+      "internal_name": "unique",
+      "localized_category_name": "Quality",
+      "localized_tag_name": "Standard",
+      "color": "D2D2D2"
+    },
+    {
+      "category": "Rarity",
+      "internal_name": "Rarity_Immortal",
+      "localized_category_name": "Rarity",
+      "localized_tag_name": "Immortal",
+      "color": "e4ae39"
+    },
+    {
+      "category": "Type",
+      "internal_name": "wearable",
+      "localized_category_name": "Type",
+      "localized_tag_name": "Wearable"
+    },
+    {
+      "category": "Slot",
+      "internal_name": "weapon",
+      "localized_category_name": "Slot",
+      "localized_tag_name": "Weapon"
+    },
+    {
+      "category": "Hero",
+      "internal_name": "npc_dota_hero_queenofpain",
+      "localized_category_name": "Hero",
+      "localized_tag_name": "Queen of Pain"
+    }
+  ]
+}

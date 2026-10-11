@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "SIH Beta",
-  "version": "1.3.3",
+  "version": "1.3.4",
   "description": "Dota 2 inventory and trade prices, trade totals, Fast accept, gem previews, and native price sorting.",
   "permissions": ["tabs", "storage"],
   "host_permissions": ["https://steamprice.com/*", "*://steamcommunity.com/*"],
@@ -36,7 +36,7 @@
         "*://steamcommunity.com/profiles/*/tradeoffers*",
         "*://steamcommunity.com/id/*/tradeoffers*"
       ],
-      "js": ["gems.js", "trade-prices.js", "trade-offers.js", "trade-accept.js", "trade-content.js"],
+      "js": ["gems.js", "trade-prices.js", "trade-offers.js", "trade-accept.js", "trade-diagnostics.js", "trade-content.js"],
       "run_at": "document_idle"
     }
   ],

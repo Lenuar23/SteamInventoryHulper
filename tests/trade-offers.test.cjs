@@ -297,7 +297,7 @@ test('Genuine weather class metadata verifies catalog quality and retains nonmar
   assert.equal(details.classItems[0].catalogFingerprint, '["catalog-v1","genuine weather ash","genuine"]');
   assert.equal(details.classItems[0].ordinaryFingerprint, null);
   assert.equal(details.classItems[0].marketable, true);
-  assert.equal(details.classItems[1].catalogFingerprint, null);
+  assert.equal(details.classItems[1].catalogFingerprint, '["catalog-v1","genuine weather rain","genuine"]');
   assert.equal(details.classItems[1].marketable, false);
   const html = fixture({ historical: true, classOnly: true }).replace('classinfo/570/701/0', 'classinfo/570/86211/0')
     .replace('classinfo/570/700/0', 'classinfo/570/86212/0');
@@ -468,6 +468,198 @@ test('unavailable class descriptions preserve exact totals but never assign a cl
   }, { raw });
   assert.deepEqual(result.totalAssets, ['900']);
   assert.equal(result.badge, null);
+});
+
+function classAssetOffer(owner, partner, classes = [{ classId: '94001', instanceId: '42' }]) {
+  return { offerId: '950', meSteamId: owner, partnerSteamId: partner,
+    give: classes.map(value => ({ ownerSteamId: owner, appId: '570', contextId: null, assetId: null, amount: 1, ...value })), receive: [] };
+}
+
+function currentAsset(assetId, classId = '94001', instanceId = '42', extra = {}) {
+  return { appid: 570, contextid: '2', assetid: String(assetId), classid: classId, instanceid: instanceId, amount: '1', ...extra };
+}
+
+test('current class proof scans every inventory page and includes all matching instances without inventing historical asset IDs', async () => {
+  const owner = '76561198000000031', partner = '76561198000000032';
+  const offer = classAssetOffer(owner, partner, [{ classId: '94001', instanceId: '42' }, { classId: '94001', instanceId: '0' }, { classId: '94999', instanceId: '0' }]);
+  const original = JSON.stringify(offer);
+  const requests = [];
+  const firstPage = Array.from({ length: 2000 }, (_, index) => currentAsset(10000 + index, index === 0 ? '94001' : '94002', index === 0 ? '42' : '0'));
+  const secondPage = Array.from({ length: 215 }, (_, index) => currentAsset(12000 + index, index < 2 ? '94001' : '94002', index === 0 ? '42' : '0'));
+  const result = await Offers.fetchClassAssets(offer, owner, async (href, options) => {
+    const url = new URL(href);
+    requests.push(url.searchParams.get('start_assetid'));
+    assert.equal(url.pathname, `/inventory/${owner}/570/2/`);
+    assert.equal(url.searchParams.get('count'), '2000');
+    assert.equal(url.searchParams.get('l'), 'english');
+    assert.equal(options.credentials, 'include');
+    assert.equal(options.method, undefined);
+    return { ok: true, url: href, json: async () => ({ success: 1, assets: requests.length === 1 ? firstPage : secondPage,
+      descriptions: [{ market_hash_name: 'A heavy description that should not be retained', icon_url: 'large-image' }],
+      total_inventory_count: 2215, more_items: requests.length === 1 ? 1 : 0, last_assetid: requests.length === 1 ? '11999' : undefined }) };
+  });
+  assert.deepEqual(requests, [null, '11999'], 'finding a class on page one does not skip later matching copies');
+  assert.deepEqual(result.classAssets, [
+    { ownerSteamId: owner, appId: '570', contextId: '2', classId: '94001', instanceId: '42', assetIds: ['10000', '12000'] },
+    { ownerSteamId: owner, appId: '570', contextId: '2', classId: '94001', instanceId: '0', assetIds: ['12001'] },
+    { ownerSteamId: owner, appId: '570', contextId: '2', classId: '94999', instanceId: '0', assetIds: [] }
+  ]);
+  assert.equal(JSON.stringify(offer), original, 'the proof leaves historical item identity untouched');
+  assert.equal(result.classAssetError, undefined);
+  assert.equal(JSON.stringify(result).includes('large-image'), false);
+});
+
+test('overlapping historical offers reuse a complete owner class scan and returned candidate arrays do not mutate its cache', async () => {
+  const owner = '76561198000000033', partner = '76561198000000034';
+  const firstOffer = classAssetOffer(owner, partner);
+  const secondOffer = { ...classAssetOffer(owner, partner, [{ classId: '94002', instanceId: '0' }]), offerId: '951' };
+  let requests = 0;
+  const fetchMock = async () => {
+    requests++;
+    return { ok: true, json: async () => ({ success: 1, assets: [currentAsset('20000'), currentAsset('20001', '94002', '0')], total_inventory_count: 2 }) };
+  };
+  const [first, second] = await Promise.all([Offers.fetchClassAssets(firstOffer, owner, fetchMock), Offers.fetchClassAssets(secondOffer, owner, fetchMock)]);
+  assert.equal(requests, 1);
+  assert.deepEqual(first.classAssets[0].assetIds, ['20000']);
+  assert.deepEqual(second.classAssets[0].assetIds, ['20001']);
+  first.classAssets[0].assetIds.push('99999');
+  assert.deepEqual((await Offers.fetchClassAssets(firstOffer, owner, fetchMock)).classAssets[0].assetIds, ['20000']);
+  assert.equal(requests, 1);
+  const refreshed = await Offers.fetchClassAssets(firstOffer, owner, async () => {
+    requests++;
+    return { ok: true, json: async () => ({ success: 1, assets: [currentAsset('20002')], total_inventory_count: 1 }) };
+  }, { force: true });
+  assert.equal(requests, 2);
+  assert.deepEqual(refreshed.classAssets[0].assetIds, ['20002']);
+});
+
+test('class proof validates verified owners, Dota context and identity before fetching inventories', async () => {
+  const owner = '76561198000000035', partner = '76561198000000036';
+  let requests = 0;
+  const fetchMock = async () => { requests++; throw new Error('Unexpected network request.'); };
+  await assert.rejects(Offers.fetchClassAssets(classAssetOffer(owner, partner), partner, fetchMock), /Invalid trade offer/);
+  await assert.rejects(Offers.fetchClassAssets(classAssetOffer(owner, owner), owner, fetchMock), /Invalid trade offer/);
+  const offer = classAssetOffer(owner, partner, [
+    { classId: '94001', instanceId: '42', ownerSteamId: '76561198000000037' },
+    { classId: '94001', instanceId: '42', ownerSteamId: partner },
+    { classId: '94001', instanceId: '42', contextId: '3' },
+    { classId: '94001', instanceId: '42', appId: '440' },
+    { classId: '94001', instanceId: '42', isCurrency: true },
+    { classId: '94001', instanceId: 'bad' }
+  ]);
+  const result = await Offers.fetchClassAssets(offer, owner, fetchMock);
+  assert.deepEqual(result.classAssets, []);
+  assert.equal(requests, 0);
+});
+
+test('failed or changing inventory scans never publish a partial first-page class proof', async () => {
+  const cases = [
+    { page: { success: 1, assets: [currentAsset('30000')], total_inventory_count: 2, more_items: 1, last_assetid: '30000' }, next: { ok: false, status: 429 } },
+    { page: { success: 1, assets: [currentAsset('30000')], total_inventory_count: 2, more_items: 1, last_assetid: '30000' }, next: { ok: true, body: { success: 1, assets: [currentAsset('30001')], total_inventory_count: 3 } } },
+    { page: { success: 1, assets: [currentAsset('30000')], total_inventory_count: 2, more_items: 1, last_assetid: '30000' }, next: { ok: true, body: { success: 1, assets: [currentAsset('30000')], total_inventory_count: 2 } } },
+    { page: { success: 1, assets: [currentAsset('30000')], total_inventory_count: 2 } },
+    { page: { success: 1, assets: [currentAsset('30000')], more_items: 1, last_assetid: '0' } }
+  ];
+  for (let index = 0; index < cases.length; index++) {
+    const owner = `765611980000000${40 + index}`, partner = '76561198000000049';
+    const fixture = cases[index];
+    let requests = 0;
+    const result = await Offers.fetchClassAssets(classAssetOffer(owner, partner), owner, async () => {
+      const response = requests++ ? fixture.next : { ok: true, body: fixture.page };
+      return { ...response, json: async () => response.body };
+    });
+    assert.deepEqual(result.classAssets, [], `invalid scan ${index} does not leak a matched first-page asset`);
+    assert.ok(result.classAssetError);
+  }
+});
+
+test('foreign redirected inventories and mismatched asset metadata cannot provide current class proof', async () => {
+  const owner = '76561198000000050', partner = '76561198000000051';
+  for (const change of [
+    { url: `https://steamcommunity.com/inventory/${partner}/570/2/` },
+    { asset: { appid: 440 } }, { asset: { contextid: '3' } }, { asset: { ownerSteamId: partner } },
+    { asset: { instanceid: Number.MAX_SAFE_INTEGER + 1 } }
+  ]) {
+    const result = await Offers.fetchClassAssets(classAssetOffer(owner, partner), owner, async () => ({ ok: true,
+      url: change.url, json: async () => ({ success: 1, assets: [currentAsset('40000', '94001', '42', change.asset)], total_inventory_count: 1 })
+    }));
+    assert.deepEqual(result.classAssets, []);
+    assert.ok(result.classAssetError);
+  }
+});
+
+test('a missing or malformed total count cannot turn a partial page into complete current class proof', async () => {
+  const owner = '76561198000000056', partner = '76561198000000057';
+  for (const count of [undefined, null, '', ' ', true, false, '1.0', '01', '1e0', -1, 1.5, 100001]) {
+    const body = { success: 1, assets: [currentAsset('45000')] };
+    if (count !== undefined) body.total_inventory_count = count;
+    const result = await Offers.fetchClassAssets(classAssetOffer(owner, partner), owner, async () => ({ ok: true, json: async () => body }));
+    assert.deepEqual(result.classAssets, [], `invalid total ${String(count)} must not hide a later conflicting copy`);
+    assert.ok(result.classAssetError);
+  }
+  for (const more of [null, '', '1', 2, true]) {
+    const result = await Offers.fetchClassAssets(classAssetOffer(owner, partner), owner, async () => ({ ok: true,
+      json: async () => ({ success: 1, assets: [currentAsset('45000')], total_inventory_count: 1, more_items: more, last_assetid: '45000' })
+    }));
+    assert.deepEqual(result.classAssets, [], `malformed or contradictory pagination ${String(more)} cannot prove a complete inventory`);
+    assert.ok(result.classAssetError);
+  }
+  const validStringCount = await Offers.fetchClassAssets(classAssetOffer(owner, partner), owner,
+    async () => ({ ok: true, json: async () => ({ success: 1, assets: [currentAsset('45000')], total_inventory_count: '1' }) }));
+  assert.deepEqual(validStringCount.classAssets[0].assetIds, ['45000']);
+  const emptyOwner = '76561198000000058';
+  const empty = await Offers.fetchClassAssets(classAssetOffer(emptyOwner, partner), emptyOwner,
+    async () => ({ ok: true, json: async () => ({ success: 1, total_inventory_count: 0 }) }));
+  assert.deepEqual(empty.classAssets[0].assetIds, []);
+  assert.equal(empty.classAssetError, undefined);
+});
+
+test('class proof inventory reads share the paced Steam queue with class hover reads and keep both owners separate', async () => {
+  const owner = '76561198000000052', partner = '76561198000000053';
+  const offer = classAssetOffer(owner, partner);
+  offer.receive.push({ ownerSteamId: partner, appId: '570', classId: '94001', instanceId: '42', amount: 1 });
+  let active = 0, maximum = 0;
+  const starts = [];
+  const result = await Promise.all([
+    Offers.fetchClassAssets(offer, owner, async (href, options) => {
+      starts.push(Date.now()); active++; maximum = Math.max(maximum, active);
+      assert.equal(options.method, undefined);
+      const assetId = href.includes(owner) ? '50000' : '50001';
+      return { ok: true, json: async () => { await new Promise(resolve => setTimeout(resolve, 8)); active--; return { success: 1, assets: [currentAsset(assetId)], total_inventory_count: 1 }; } };
+    }),
+    Offers.fetchClassDescriptions({ ...offer, give: [{ ...offer.give[0], classId: '94952' }], receive: [] }, owner, async () => {
+      starts.push(Date.now()); active++; maximum = Math.max(maximum, active);
+      return { ok: true, text: async () => { await new Promise(resolve => setTimeout(resolve, 8)); active--; return classHoverHtml({ classId: '94952', instanceId: '42' }); } };
+    })
+  ]);
+  assert.equal(maximum, 1, 'the inventory and hover response bodies never decode concurrently');
+  assert.equal(active, 0);
+  assert.equal(starts.length, 3);
+  for (let index = 1; index < starts.length; index++) assert.ok(starts[index] - starts[index - 1] >= 290);
+  assert.deepEqual(result[0].classAssets.map(entry => [entry.ownerSteamId, entry.assetIds]), [[owner, ['50000']], [partner, ['50001']]]);
+});
+
+test('abandoning one offer wait leaves its shared class scan available to another offer', async () => {
+  const owner = '76561198000000054', partner = '76561198000000055';
+  const offer = classAssetOffer(owner, partner);
+  const controller = new AbortController();
+  let finish;
+  let requests = 0;
+  const fetchMock = async () => {
+    requests++;
+    return { ok: true, json: () => new Promise(resolve => { finish = resolve; }) };
+  };
+  const abandoned = Offers.fetchClassAssets(offer, owner, fetchMock, { signal: controller.signal });
+  const continuing = Offers.fetchClassAssets({ ...offer, offerId: '952' }, owner, fetchMock);
+  controller.abort();
+  await assert.rejects(abandoned, { name: 'AbortError' });
+  while (!finish) await new Promise(resolve => setTimeout(resolve, 10));
+  finish({ success: 1, assets: [currentAsset('60000')], total_inventory_count: 1 });
+  assert.deepEqual((await continuing).classAssets[0].assetIds, ['60000']);
+  assert.equal(requests, 1);
+  const alreadyAborted = new AbortController(); alreadyAborted.abort();
+  await assert.rejects(Offers.fetchClassAssets(offer, owner, fetchMock, { signal: alreadyAborted.signal }), { name: 'AbortError' });
+  assert.equal(requests, 1);
 });
 
 test('MAIN offer bridge publishes canonical metadata and never publishes session credentials', async () => {

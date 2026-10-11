@@ -17,6 +17,8 @@
     let lastRenderAt = 0, badgeEpoch = 0;
     let ordinaryEstimates = new Map(), ordinaryEstimateEpoch = 0;
     const collection = { owner: null, index: new Map(), state: 'idle', error: '', cache: null, epoch: 0 };
+    const classAssetProofs = new Map(), classDetails = new Map();
+    let classEstimates = new Map(), classEstimateEpoch = 0;
     const badgeNodes = new Set();
     const observedOffers = new WeakSet();
     const offerObserver = typeof IntersectionObserver === 'function'
@@ -89,6 +91,17 @@
 
     async function loadPrices(data, force = false) {
         const epoch = ++data.priceEpoch;
+        if (force) {
+            // A fresh price response can include a newly added matching copy.
+            // Its prices cannot be combined with an older class membership scan.
+            for (const key of classAssetProofs.keys()) if (key.startsWith(data.id + ':')) {
+                classAssetProofs.delete(key); classEstimates.delete(key);
+            }
+            classEstimateEpoch++;
+            for (const [id, entry] of classDetails) if (entry.ownerIds?.includes(data.id)) {
+                classDetails.set(id, { state: 'idle', error: '', force: true, ownerIds: entry.ownerIds });
+            }
+        }
         data.priceState = 'loading';
         data.priceError = '';
         queueRender();
@@ -105,6 +118,7 @@
             data.priceError = data.priceCache.error;
             data.priceState = 'ready';
             void rebuildOrdinaryEstimates();
+            void rebuildClassEstimates();
             queueRender();
             // A price request may have populated an empty Steamprice inventory.
             // Refresh the full value after the initial profile request settles.
@@ -156,6 +170,32 @@
         queueRender();
     }
 
+    async function rebuildClassEstimates() {
+        const epoch = ++classEstimateEpoch, estimates = new Map();
+        const proofs = [...classAssetProofs];
+        let processed = 0;
+        for (const [key, assetIds] of proofs) {
+            // No current copy means no class quote. It must not suppress an
+            // independently verified catalog quote after a successful retry.
+            if (!assetIds.length) continue;
+            const owner = key.split(':')[0], index = priceIndex(owner);
+            let cents, complete = assetIds.length > 0;
+            for (const assetId of assetIds) {
+                if (epoch !== classEstimateEpoch) return;
+                const price = index?.assetPrices?.get(owner + ':' + assetId);
+                if (!Number.isSafeInteger(price) || price < 0 || (cents !== undefined && cents !== price)) {
+                    complete = false; break;
+                }
+                cents = price;
+                if (++processed % 300 === 0) await new Promise(resolve => setTimeout(resolve, 0));
+            }
+            estimates.set(key, complete ? cents : null);
+        }
+        if (epoch !== classEstimateEpoch) return;
+        classEstimates = estimates;
+        queueRender();
+    }
+
     async function loadCollection(owner, force = false) {
         if (!validOwner(owner) || collection.state === 'loading') return;
         const epoch = ++collection.epoch;
@@ -195,7 +235,7 @@
 
     function needsCollection(items) {
         return items.some(item => item.catalogFingerprint &&
-            Prices.getPrice(priceIndex(item.ownerSteamId), item, ordinaryEstimates, collection.index).cents === null);
+            Prices.getPrice(priceIndex(item.ownerSteamId), item, ordinaryEstimates, collection.index, classEstimates).cents === null);
     }
 
     function loadProfile(data, force = false) {
@@ -266,6 +306,7 @@
             '.sih-lite-trade-button{background:#39516a;color:#fff;border:1px solid #536b83;padding:5px 8px;border-radius:3px;cursor:pointer;margin:3px 5px 3px 0}',
             '.sih-lite-trade-button:disabled{opacity:.5;cursor:default}.sih-lite-trade-button[aria-pressed="true"]{border-color:#5cff5c}',
             '.sih-lite-trade-accept-status{width:100%;overflow-wrap:anywhere}.sih-lite-trade-summary button{position:relative;z-index:4}',
+            '.sih-lite-trade-diagnostics-status{width:100%;font-size:12px}.sih-lite-trade-diagnostics-text{width:100%;height:160px;box-sizing:border-box;background:#18212a;color:#c6d4df;font-size:12px}',
             '#sih-lite-trade-inventory-panel [data-role="inventory-me"],#sih-lite-trade-inventory-panel [data-role="inventory-them"]{display:block;color:#66c0f4;font-weight:bold}',
             '#sih-lite-trade-inventory-panel [data-role="inventory-status"]{display:block;overflow-wrap:anywhere;font-size:12px}',
             '@media(max-width:700px){.sih-lite-trade-summary{gap:4px 10px}.sih-lite-trade-summary,#sih-lite-trade-inventory-panel{padding:7px}}'
@@ -299,8 +340,8 @@
     }
 
     function renderSummary(element, give, receive, me, them, extraStatus = '', completeness = {}) {
-        const a = Prices.summarize(give, priceIndex(me), ordinaryEstimates, collection.index);
-        const b = Prices.summarize(receive, priceIndex(them), ordinaryEstimates, collection.index);
+        const a = Prices.summarize(give, priceIndex(me), ordinaryEstimates, collection.index, classEstimates);
+        const b = Prices.summarize(receive, priceIndex(them), ordinaryEstimates, collection.index, classEstimates);
         if (completeness.me === false) a.complete = false;
         if (completeness.them === false) b.complete = false;
         const net = Prices.difference(a, b);
@@ -332,6 +373,9 @@
             const cached = cacheNotice(collection.cache, 'Cached collection prices');
             if (cached) status.push(cached);
         }
+        const classEstimated = (a.classEstimatedCount || 0) + (b.classEstimatedCount || 0);
+        if (classEstimated) status.push('Includes ' + classEstimated + ' current estimate' + (classEstimated === 1 ? '' : 's') +
+            ' matched by exact item class and variant in the owner’s inventory.');
         if (needsCollection([...give, ...receive])) {
             if (collection.state === 'loading') status.push('Loading Steamprice collection prices…');
             else if (collection.error) status.push('Steamprice collection prices: ' + collection.error);
@@ -350,8 +394,8 @@
 
     function renderBadge(element, item) {
         let badge = element.querySelector('.sih-lite-trade-price');
-        const price = Prices.getPrice(priceIndex(item.ownerSteamId), item, ordinaryEstimates, collection.index);
-        const value = Prices.summarize([item], priceIndex(item.ownerSteamId), ordinaryEstimates, collection.index);
+        const price = Prices.getPrice(priceIndex(item.ownerSteamId), item, ordinaryEstimates, collection.index, classEstimates);
+        const value = Prices.summarize([item], priceIndex(item.ownerSteamId), ordinaryEstimates, collection.index, classEstimates);
         if (price.cents === null || !value.complete) {
             if (badge) badge.remove();
             return;
@@ -373,6 +417,7 @@
             (price.source === 'ordinary-estimate' ? ' Current ordinary-item estimate from saved Steamprice prices; exact asset details are unavailable. Source prices may be cached.' : '') +
             (price.source === 'catalog' ? ' Current estimate from Steamprice collection; exact asset details are unavailable.' +
                 (collection.cache?.cached ? ' ' + cacheNotice(collection.cache, 'Cached collection prices') : '') : '') +
+            (price.source === 'class-estimate' ? ' Current estimate from all matching item classes and variants in this owner’s inventory. Historical asset identity is unchanged.' : '') +
             (owners.get(item.ownerSteamId)?.priceCache?.cached
                 ? ' ' + cacheNotice(owners.get(item.ownerSteamId).priceCache, 'Cached prices') : '');
     }
@@ -589,6 +634,98 @@
         }).finally(queueRender);
     }
 
+    function classCandidates(offer, force = false) {
+        const eligible = item => {
+            if (item.appId !== '570' || item.isCurrency ||
+                (item.contextId != null && item.contextId !== '2') ||
+                !/^[1-9]\d{0,19}$/.test(String(item.classId)) || !/^\d{1,20}$/.test(String(item.instanceId)) ||
+                ![true, 1].includes(item.tradable) || !priceIndex(item.ownerSteamId)?.assetPrices?.size) return false;
+            const price = Prices.getPrice(priceIndex(item.ownerSteamId), item, ordinaryEstimates, collection.index, classEstimates);
+            return price.cents === null || (force && price.source === 'class-estimate');
+        };
+        return { ...offer, meSteamId: list.meSteamId,
+            give: normalizeItems(offer.give, list.meSteamId).filter(eligible),
+            receive: normalizeItems(offer.receive, offer.partnerSteamId).filter(eligible) };
+    }
+
+    function loadClassAssets(offer) {
+        if (typeof Offers.fetchClassAssets !== 'function' || details.get(offer.offerId)?.state === 'loading' ||
+            [list.meSteamId, offer.partnerSteamId].some(id => owners.get(id)?.priceState === 'loading') ||
+            collection.state === 'loading') return;
+        const previous = classDetails.get(offer.offerId);
+        if (previous && previous.state !== 'idle') return;
+        const candidates = classCandidates(offer, previous?.force === true);
+        if (!candidates.give.length && !candidates.receive.length) return;
+        const entry = { state: 'loading', error: '', force: previous?.force === true,
+            ownerIds: [list.meSteamId, offer.partnerSteamId] };
+        classDetails.set(offer.offerId, entry);
+        const meSteamId = list.meSteamId;
+        if (entry.force) {
+            for (const item of [...candidates.give, ...candidates.receive]) {
+                const key = item.ownerSteamId + ':' + item.classId + ':' + item.instanceId;
+                classAssetProofs.delete(key); classEstimates.delete(key);
+            }
+            classEstimateEpoch++;
+        }
+        queueOperation(() => Offers.fetchClassAssets(candidates, meSteamId, undefined, { force: entry.force })).then(async data => {
+            if (classDetails.get(offer.offerId) !== entry || list.meSteamId !== meSteamId) return;
+            if (data?.offerId !== offer.offerId || data.meSteamId !== meSteamId || data.partnerSteamId !== offer.partnerSteamId ||
+                !Array.isArray(data.classAssets) || data.classAssets.length > 100000) {
+                throw new Error('Steam returned invalid current item classes.');
+            }
+            const wanted = new Set([...candidates.give, ...candidates.receive].map(item =>
+                item.ownerSteamId + ':' + item.classId + ':' + item.instanceId));
+            for (const proof of data.classAssets) {
+                const key = proof.ownerSteamId + ':' + proof.classId + ':' + proof.instanceId;
+                if (!wanted.has(key) || proof.appId !== '570' || proof.contextId !== '2' ||
+                    !Array.isArray(proof.assetIds) || proof.assetIds.length > 100000 ||
+                    proof.assetIds.some(id => typeof id !== 'string' || !/^[1-9]\d{0,19}$/.test(id))) {
+                    throw new Error('Steam returned invalid current item classes.');
+                }
+            }
+            for (const proof of data.classAssets) {
+                classAssetProofs.set(proof.ownerSteamId + ':' + proof.classId + ':' + proof.instanceId, proof.assetIds);
+            }
+            await rebuildClassEstimates();
+            entry.state = data.classAssetError ? 'error' : 'ready';
+            entry.error = data.classAssetError || '';
+        }).catch(error => {
+            if (classDetails.get(offer.offerId) !== entry) return;
+            entry.state = 'error'; entry.error = error.message;
+        }).finally(queueRender);
+    }
+
+    async function copyDiagnostics(offerId, summary, event) {
+        if (!event.isTrusted || !globalThis.SIHLiteTradeDiagnostics?.buildReport) return;
+        const offer = readOffers().find(value => value.offerId === offerId);
+        if (!offer) return;
+        const report = globalThis.SIHLiteTradeDiagnostics.buildReport({
+            version: chrome.runtime.getManifest?.().version || '1.3.4', pathname: location.pathname, offer,
+            detailState: details.get(offerId), classState: classDetails.get(offerId),
+            owners, ordinaryEstimates, collection, classAssetProofs, classEstimates
+        });
+        const value = JSON.stringify(report, null, 2);
+        let status = role(summary, 'diagnostics-status');
+        if (!status) {
+            status = document.createElement('span'); status.dataset.role = 'diagnostics-status';
+            status.className = 'sih-lite-trade-diagnostics-status'; summary.appendChild(status);
+        }
+        try {
+            await navigator.clipboard.writeText(value);
+            summary.querySelector('.sih-lite-trade-diagnostics-text')?.remove();
+            text(status, 'Price diagnostics copied.');
+        } catch (_) {
+            let field = summary.querySelector('.sih-lite-trade-diagnostics-text');
+            if (!field) {
+                field = document.createElement('textarea'); field.readOnly = true;
+                field.className = 'sih-lite-trade-diagnostics-text'; field.setAttribute('aria-label', 'Price diagnostics');
+                summary.appendChild(field);
+            }
+            field.value = value; field.focus(); field.select();
+            text(status, 'Copy the price diagnostics below.');
+        }
+    }
+
     function renderList() {
         if (!list) return;
         const seen = new Set();
@@ -607,6 +744,7 @@
             if (collection.state === 'idle' && needsCollection([...give, ...receive]) &&
                 ![me, them].some(id => owners.get(id)?.priceState === 'loading') &&
                 details.get(offer.offerId)?.state !== 'loading') void loadCollection(me);
+            loadClassAssets(offer);
             let summary = offer.element.querySelector('.sih-lite-trade-summary');
             if (!summary) {
                 summary = makeSummary();
@@ -615,24 +753,39 @@
                 const retry = makeButton('Retry prices', () => {
                     retryOwners([list.meSteamId, offer.partnerSteamId]);
                     if (details.get(offer.offerId)?.state === 'error') loadDetails(offer, true);
+                    classDetails.set(offer.offerId, { state: 'idle', error: '', force: true });
                     if (collection.owner === list.meSteamId && collection.state !== 'loading' &&
                         (collection.error || collection.cache?.cached)) void loadCollection(list.meSteamId, true);
                 });
                 retry.classList.add('sih-lite-trade-retry');
                 summary.appendChild(retry);
+                const diagnostics = makeButton('Copy price diagnostics', event => copyDiagnostics(offer.offerId, summary, event));
+                diagnostics.classList.add('sih-lite-trade-diagnostics'); summary.appendChild(diagnostics);
                 const scans = document.createElement('span'); scans.dataset.role = 'scan-links'; summary.appendChild(scans);
             }
             const detail = details.get(offer.offerId);
-            renderSummary(summary, give, receive, me, them, detail?.state === 'loading'
-                ? 'Loading trade item descriptions…' : detail?.error || (!offer.active ? 'Historical offers show current estimates, not prices at the time of the trade.' : ''));
+            const classDetail = classDetails.get(offer.offerId);
+            const extraStatus = [];
+            if (detail?.state === 'loading') extraStatus.push('Loading trade item descriptions…');
+            else if (detail?.error) extraStatus.push(detail.error);
+            if (classDetail?.state === 'loading') extraStatus.push('Loading exact current item variants…');
+            else if (classDetail?.error) extraStatus.push('Current variant prices: ' + classDetail.error);
+            if (!offer.active) extraStatus.push('Historical offers show current estimates, not prices at the time of the trade.');
+            renderSummary(summary, give, receive, me, them, extraStatus.join(' '));
+            const unpriced = [...give, ...receive].some(item =>
+                Prices.getPrice(priceIndex(item.ownerSteamId), item, ordinaryEstimates, collection.index, classEstimates).cents === null);
+            const unpricedCard = (offer.slots || []).some(slot => Prices.getPrice(priceIndex(slot.item?.ownerSteamId),
+                slot.item, ordinaryEstimates, collection.index, classEstimates).cents === null);
+            summary.querySelector('.sih-lite-trade-diagnostics').hidden = !unpriced && !unpricedCard;
             renderScanLinks(role(summary, 'scan-links'), me, them);
             summary.querySelector('.sih-lite-trade-retry').hidden =
-                !owners.get(me)?.priceError && !owners.get(them)?.priceError && !detail?.error &&
+                !unpriced && !owners.get(me)?.priceError && !owners.get(them)?.priceError && !detail?.error && !classDetail?.error &&
                 !owners.get(me)?.priceCache?.cached && !owners.get(them)?.priceCache?.cached &&
                 !owners.get(me)?.needsScan && !owners.get(them)?.needsScan &&
                 !collection.error && !collection.cache?.cached;
             summary.querySelector('.sih-lite-trade-retry').disabled =
-                [me, them].some(id => owners.get(id)?.priceState === 'loading') || detail?.state === 'loading' || collection.state === 'loading';
+                [me, them].some(id => owners.get(id)?.priceState === 'loading') || detail?.state === 'loading' ||
+                classDetail?.state === 'loading' || collection.state === 'loading';
             for (const slot of offer.slots || []) if (slot.element) {
                 badges.push([slot.element, { ...slot.item, ownerSteamId: slot.side === 'give' ? me : them }]);
             }
@@ -734,6 +887,7 @@
         } else if (listPage && message.type === 'OFFERS' && validOwner(message.meSteamId)) {
             if (list && list.meSteamId !== message.meSteamId) {
                 details.clear();
+                classDetails.clear(); classAssetProofs.clear(); classEstimates = new Map(); classEstimateEpoch++;
                 acceptStates.clear();
             }
             list = message;

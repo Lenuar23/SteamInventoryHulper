@@ -9,6 +9,10 @@
     const GEM_CAPABLE_NAME = /\b(?:fractal horns of inner abysm|baby roshan|jumo)\b/i;
     const GEM_QUALITY_NAME = /^(?:unusual|inscribed|autographed|corrupted)\s+/i;
     const NON_STANDARD_NAME = /^(?:inscribed|autographed|corrupted|frozen|heroic|cursed|genuine|favored|ascent|elder|unusual|exalted|infused|auspicious|base|legacy|sealed)\s+/i;
+    // These nine Genuine effects trade between players but cannot be listed on
+    // Steam Market. Steamprice quotes their cash value in its WEATHER catalog.
+    const CASH_WEATHER_NAMES = new Set(['ash', 'aurora', 'harvest', 'moonbeam', 'rain',
+        'pestilence', 'sirocco', 'snow', 'spring'].map(name => `genuine weather ${name}`));
     // Stable Dota gem colors, verified against Steamprice's regular gem table.
     // Prices are always obtained from the owner's API inventory, never this table.
     const REGULAR_COLORS = new Map([
@@ -63,6 +67,36 @@
     function explicitUnavailable(item) {
         return [item, item?.description].some(record => record && ['tradable', 'marketable']
             .some(field => record[field] === false || record[field] === 0));
+    }
+
+    function cashWeatherFlags(item) {
+        if (!CASH_WEATHER_NAMES.has(canonicalName(item))) return false;
+        const description = item?.description && typeof item.description === 'object' ? item.description : item;
+        if (![true, 1].includes(description?.tradable) || ![false, 0].includes(description?.marketable)) return false;
+        return ![item, item?.description].some(record => record && ['tradable', 'marketable'].some(field =>
+            Object.prototype.hasOwnProperty.call(record, field) &&
+            !(field === 'tradable' ? [true, 1] : [false, 0]).includes(record[field])));
+    }
+
+    function classEstimateKey(item, owner) {
+        const description = item?.description && typeof item.description === 'object' ? item.description : item;
+        if (![true, 1].includes(description?.tradable)) return null;
+        const records = item === description ? [item] : [item, description];
+        if (records.some(record => Object.prototype.hasOwnProperty.call(record, 'tradable') &&
+            ![true, 1].includes(record.tradable))) return null;
+        if (records.some(record => ['appId', 'appid'].some(field => record[field] != null && String(record[field]) !== '570'))) return null;
+        const values = [];
+        for (const [camel, native, pattern] of [
+            ['classId', 'classid', /^[1-9]\d{0,19}$/],
+            ['instanceId', 'instanceid', /^(?:0|[1-9]\d{0,19})$/]
+        ]) {
+            const value = item[camel] ?? item[native] ?? description[native];
+            if ((typeof value === 'number' && !Number.isSafeInteger(value)) || !pattern.test(String(value))) return null;
+            if (records.some(record => [camel, native].some(field => record[field] != null &&
+                (String(record[field]) !== String(value) || (typeof record[field] === 'number' && !Number.isSafeInteger(record[field])))))) return null;
+            values.push(String(value));
+        }
+        return `${owner}:${values[0]}:${values[1]}`;
     }
 
     function parsePrice(item) {
@@ -283,7 +317,9 @@
 
     function plainNativeDescription(item) {
         const description = item?.description && typeof item.description === 'object' ? item.description : item;
-        if (explicitUnavailable(item) || ![true, 1].includes(description?.tradable) || ![true, 1].includes(description?.marketable) || !Array.isArray(description?.descriptions)) return false;
+        const cashWeather = cashWeatherFlags(item);
+        if ((explicitUnavailable(item) && !cashWeather) || ![true, 1].includes(description?.tradable) ||
+            (![true, 1].includes(description?.marketable) && !cashWeather) || !Array.isArray(description?.descriptions)) return false;
         if ([item, description].some(record => VARIANT_FALSE_FLAGS.some(key => record[key] === true) ||
             (record.styleUnlocked != null && record.styleUnlocked !== 0) || (record.styleTotal != null && record.styleTotal !== 0))) return false;
         return !description.descriptions.some(entry => typeof entry?.value === 'string' &&
@@ -314,10 +350,21 @@
             const name = canonicalName(item);
             const quality = catalogQuality(name);
             if (!Array.isArray(parts) || parts.length !== 3 || parts[0] !== 'catalog-v1' ||
-                !name || !quality || parts[1] !== name || parts[2] !== quality || unsafeNameFallback(item, name) || explicitUnavailable(item)) return null;
+                !name || !quality || parts[1] !== name || parts[2] !== quality || unsafeNameFallback(item, name) ||
+                (explicitUnavailable(item) && !cashWeatherFlags(item))) return null;
             if ((item.description || Object.prototype.hasOwnProperty.call(item, 'descriptions')) && catalogFingerprint(item) !== JSON.stringify(parts)) return null;
             return JSON.stringify(parts);
         } catch (_) { return null; }
+    }
+
+    function catalogEstimate(item, collectionIndex) {
+        const catalog = verifiedCatalogFingerprint(item.catalogFingerprint, item) || catalogFingerprint(item);
+        const name = canonicalName(item);
+        if (catalog && collectionIndex instanceof Map && collectionIndex.has(name)) {
+            const cents = collectionIndex.get(name);
+            if (Number.isSafeInteger(cents) && cents > 0) return { cents, source: 'catalog' };
+        }
+        return { cents: null, source: 'unknown' };
     }
 
     function buildCatalogIndex(catalogItems) {
@@ -379,7 +426,7 @@
         return index;
     }
 
-    function getPrice(index, item, ordinaryEstimates, collectionIndex) {
+    function getPrice(index, item, ordinaryEstimates, collectionIndex, classEstimates) {
         const unknown = { cents: null, source: 'unknown' };
         if (!item || typeof item !== 'object') return unknown;
         const app = appId(item);
@@ -395,7 +442,14 @@
             const cents = index.assetPrices.get(`${owner}:${asset}`);
             return cents === null ? unknown : { cents, source: 'asset' };
         }
-        if (explicitUnavailable(item)) return unknown;
+        const classKey = classEstimateKey(item, owner);
+        if (classKey && classEstimates instanceof Map && classEstimates.has(classKey)) {
+            const cents = classEstimates.get(classKey);
+            return Number.isSafeInteger(cents) && cents >= 0 ? { cents, source: 'class-estimate' } : unknown;
+        }
+        // Non-marketable Weather may use only its verified cash catalog quote.
+        // It must never reach owner name aliases or the shared ordinary pool.
+        if (explicitUnavailable(item)) return cashWeatherFlags(item) ? catalogEstimate(item, collectionIndex) : unknown;
         const name = canonicalName(item);
         const bareModel = name.replace(/^(?:exalted|standard)\s+/, '');
         let fingerprint = bareModel === 'fractal horns of inner abysm'
@@ -417,12 +471,7 @@
             const cents = ordinaryEstimates.get(ordinary);
             return Number.isSafeInteger(cents) && cents >= 0 ? { cents, source: 'ordinary-estimate' } : unknown;
         }
-        const catalog = verifiedCatalogFingerprint(item.catalogFingerprint, item) || catalogFingerprint(item);
-        if (catalog && collectionIndex instanceof Map && collectionIndex.has(name)) {
-            const cents = collectionIndex.get(name);
-            return Number.isSafeInteger(cents) && cents > 0 ? { cents, source: 'catalog' } : unknown;
-        }
-        return unknown;
+        return catalogEstimate(item, collectionIndex);
     }
 
     function amountFor(item) {
@@ -433,11 +482,11 @@
         return Number.isSafeInteger(amount) && amount > 0 ? amount : null;
     }
 
-    function summarize(items, index, ordinaryEstimates, collectionIndex) {
+    function summarize(items, index, ordinaryEstimates, collectionIndex, classEstimates) {
         if (!Array.isArray(items)) throw new TypeError('Trade items must be an array.');
-        let knownCents = 0, pricedCount = 0, unpricedCount = 0, nonDotaCount = 0, estimatedCount = 0, ordinaryEstimatedCount = 0, catalogEstimatedCount = 0;
+        let knownCents = 0, pricedCount = 0, unpricedCount = 0, nonDotaCount = 0, estimatedCount = 0, ordinaryEstimatedCount = 0, catalogEstimatedCount = 0, classEstimatedCount = 0;
         for (const item of items) {
-            const price = getPrice(index, item, ordinaryEstimates, collectionIndex);
+            const price = getPrice(index, item, ordinaryEstimates, collectionIndex, classEstimates);
             const amount = amountFor(item);
             const value = price.cents !== null && amount !== null ? price.cents * amount : null;
             if (price.source === 'non-dota') nonDotaCount++;
@@ -449,9 +498,10 @@
                 if (price.source === 'variant') estimatedCount++;
                 if (price.source === 'ordinary-estimate') ordinaryEstimatedCount++;
                 if (price.source === 'catalog') catalogEstimatedCount++;
+                if (price.source === 'class-estimate') classEstimatedCount++;
             }
         }
-        return { knownCents, itemCount: items.length, pricedCount, unpricedCount, nonDotaCount, estimatedCount, ordinaryEstimatedCount, catalogEstimatedCount, complete: unpricedCount === 0 };
+        return { knownCents, itemCount: items.length, pricedCount, unpricedCount, nonDotaCount, estimatedCount, ordinaryEstimatedCount, catalogEstimatedCount, classEstimatedCount, complete: unpricedCount === 0 };
     }
 
     function difference(give, receive) {
