@@ -1,4 +1,5 @@
 importScripts('collection-prices.js');
+importScripts('market-prices.js');
 
 const STEAMPRICE_ROOT = 'https://steamprice.com';
 const REQUEST_TIMEOUT_MS = 15000;
@@ -21,8 +22,24 @@ let cacheWriteRunning = false;
 let profileEpoch = 0;
 let activeGets = 0;
 let nextGetAt = 0;
+let steampriceCooldownUntil = 0;
 let getQueueTimer = null;
 const getQueue = [];
+const MARKET_CACHE_KEY = 'sih-lite-market-quotes-v1';
+const MARKET_FRESH_MS = 15 * 60 * 1000;
+const MARKET_MISSING_MS = 90000;
+const MARKET_MAX_NAMES = 128;
+const MARKET_START_INTERVAL_MS = 1500;
+const marketCache = new Map();
+const pendingMarket = new Map();
+const marketJobs = [];
+let marketCacheReady;
+let marketJobRunning = false;
+let lastMarketStartAt = -Infinity;
+let marketCooldownUntil = 0;
+let marketCooldownMessage = 'Steam Market is rate limited. Please retry later.';
+let marketWritePending = false;
+let marketWriteRunning = false;
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 const PRICE_RECORD_FIELDS = [
     'assetid', 'assetId', 'asset_id', 'id', 'ownerSteamId', 'appId', 'appid', 'contextId', 'contextid', 'context_id',
@@ -73,6 +90,11 @@ function compactPriceRecord(item) {
 }
 
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+    if (request?.action === 'fetchMarketQuotes') {
+        fetchMarketQuotes(request.names, request.force === true).then(sendResponse,
+            error => sendResponse({ success: false, error: error.message || 'Could not load Steam Market quotes.' }));
+        return true;
+    }
     if (!request || !['fetchPrices', 'fetchProfile', 'fetchCollection'].includes(request.action)) return;
     let steamId;
     try { steamId = validateSteamId(request.steamId); }
@@ -105,22 +127,26 @@ function temporaryError(message, retryAfter = null) {
 }
 
 function drainGetQueue() {
-    if (activeGets >= MAX_GETS || getQueueTimer !== null) return;
-    while (getQueue.length && Date.now() >= getQueue[0].deadline) {
-        const expired = getQueue.shift();
+    if (activeGets >= MAX_GETS) return;
+    if (getQueueTimer !== null) { clearTimeout(getQueueTimer); getQueueTimer = null; }
+    for (let index = getQueue.length - 1; index >= 0; index--) {
+        if (Date.now() < getQueue[index].deadline) continue;
+        const [expired] = getQueue.splice(index, 1);
         clearTimeout(expired.timer);
-        expired.reject(temporaryError('Steamprice inventory loading timed out.'));
+        expired.reject(temporaryError(`${expired.service} loading timed out.`));
     }
     if (!getQueue.length) return;
-    const wait = Math.max(0, nextGetAt - Date.now());
+    // Provider cooldowns never hold the shared slot or delay the other host.
+    const readyIndex = getQueue.findIndex(entry => entry.provider === 'market' || Date.now() >= steampriceCooldownUntil);
+    const wait = Math.max(0, nextGetAt - Date.now(), readyIndex === -1 ? steampriceCooldownUntil - Date.now() : 0);
     if (wait > 0) {
         getQueueTimer = setTimeout(() => {
             getQueueTimer = null;
             drainGetQueue();
-        }, wait);
+        }, Math.min(wait, 30000));
         return;
     }
-    const entry = getQueue.shift();
+    const [entry] = getQueue.splice(readyIndex, 1);
     clearTimeout(entry.timer);
     activeGets++;
     nextGetAt = Date.now() + GET_START_INTERVAL_MS;
@@ -133,14 +159,14 @@ function drainGetQueue() {
     });
 }
 
-function acquireGet(deadline) {
+function acquireGet(deadline, service = 'Steamprice inventory') {
     return new Promise((resolve, reject) => {
-        const entry = { deadline, resolve, reject, timer: null };
+        const entry = { deadline, service, provider: service === 'Steam Market quote' ? 'market' : 'steamprice', resolve, reject, timer: null };
         getQueue.push(entry);
         entry.timer = setTimeout(() => {
             const index = getQueue.indexOf(entry);
             if (index !== -1) getQueue.splice(index, 1);
-            reject(temporaryError('Steamprice inventory loading timed out.'));
+            reject(temporaryError(`${service} loading timed out.`));
             drainGetQueue();
         }, Math.max(0, deadline - Date.now()));
         drainGetQueue();
@@ -174,7 +200,7 @@ async function fetchJson(url, deadline) {
                     const message = `Steamprice returned HTTP ${response.status}.`;
                     if ([429, 502, 503, 504].includes(response.status)) {
                         const retryAfter = retryAfterMs(response);
-                        if (retryAfter !== null) nextGetAt = Math.max(nextGetAt, Date.now() + retryAfter);
+                        if (retryAfter !== null) steampriceCooldownUntil = Math.max(steampriceCooldownUntil, Date.now() + retryAfter);
                         throw temporaryError(message, retryAfter);
                     }
                     throw new Error(message);
@@ -465,5 +491,194 @@ function persistCache() {
     }).catch(() => {}).finally(() => {
         cacheWriteRunning = false;
         if (cacheWritePending) persistCache();
+    });
+}
+
+async function fetchMarketQuotes(rawNames, force) {
+    if (!Array.isArray(rawNames) || rawNames.length > 20) throw new Error('At most 20 Steam Market item names are allowed.');
+    const names = [...new Set(rawNames.map(name => globalThis.SIHLiteMarketQuotes.validateName(name)))];
+    const deadline = Date.now() + OPERATION_TIMEOUT_MS;
+    await ensureMarketCache();
+    pruneMarketCache();
+    const results = await Promise.all(names.map(async name => {
+        try { return { name, ...(await loadMarketQuote(name, force, deadline)) }; }
+        catch (error) { return { name, error: error.message || 'Could not load Steam Market quote.' }; }
+    }));
+    return { success: true, data: {
+        items: results.filter(result => result.quote).map(result => result.quote),
+        missingNames: results.filter(result => !result.quote && !result.error).map(result => result.name),
+        errors: results.filter(result => result.error).map(result => ({ marketHashName: result.name, error: result.error })),
+        currency: 'USD'
+    } };
+}
+
+function pumpMarketJobs() {
+    if (marketJobRunning) return;
+    while (marketJobs.length) {
+        const job = marketJobs.shift();
+        clearTimeout(job.timer);
+        if (Date.now() >= job.deadline) { job.reject(temporaryError('Steam Market quote loading timed out.')); continue; }
+        marketJobRunning = true;
+        Promise.resolve().then(job.run).then(job.resolve, job.reject).finally(() => {
+            marketJobRunning = false;
+            pumpMarketJobs();
+        });
+        return;
+    }
+}
+
+function enqueueMarketJob(run, deadline) {
+    return new Promise((resolve, reject) => {
+        const job = { run, deadline, resolve, reject, timer: null };
+        job.timer = setTimeout(() => {
+            const index = marketJobs.indexOf(job);
+            if (index !== -1) marketJobs.splice(index, 1);
+            reject(temporaryError('Steam Market quote loading timed out.'));
+        }, Math.max(0, deadline - Date.now()));
+        marketJobs.push(job);
+        pumpMarketJobs();
+    });
+}
+
+async function fetchMarketPayload(name, deadline) {
+    for (let attempt = 0; attempt < 3; attempt++) {
+        if (Date.now() < marketCooldownUntil) throw temporaryError(marketCooldownMessage);
+        const wait = Math.max(0, lastMarketStartAt + MARKET_START_INTERVAL_MS - Date.now());
+        if (Date.now() + wait >= deadline) throw temporaryError('Steam Market quote loading timed out.');
+        if (wait) await delay(wait);
+        const release = await acquireGet(deadline, 'Steam Market quote');
+        const controller = new AbortController();
+        let timer;
+        let failure;
+        try {
+            lastMarketStartAt = Date.now();
+            const timeout = new Promise((_, reject) => {
+                timer = setTimeout(() => {
+                    controller.abort();
+                    reject(temporaryError('Steam Market request timed out.'));
+                }, Math.min(REQUEST_TIMEOUT_MS, Math.max(1, deadline - Date.now())));
+            });
+            const request = (async () => {
+                const url = `https://steamcommunity.com/market/priceoverview/?appid=570&currency=1&l=english&market_hash_name=${encodeURIComponent(name)}`;
+                const response = await fetch(url, { signal: controller.signal, credentials: 'omit' });
+                if (!response.ok) {
+                    const error = new Error(`Steam Market returned HTTP ${response.status}.`);
+                    if (response.status === 429) {
+                        marketCooldownUntil = Date.now() + Math.max(MARKET_START_INTERVAL_MS, retryAfterMs(response) ?? 60000);
+                        marketCooldownMessage = 'Steam Market is rate limited. Please retry later.';
+                        error.temporary = true;
+                    } else if ([502, 503, 504].includes(response.status)) {
+                        error.temporary = true;
+                        error.retryAfter = retryAfterMs(response);
+                        if (error.retryAfter !== null) {
+                            marketCooldownUntil = Math.max(marketCooldownUntil, Date.now() + error.retryAfter);
+                            marketCooldownMessage = 'Steam Market is temporarily unavailable. Please retry later.';
+                        }
+                    }
+                    error.noRetry = response.status === 429;
+                    throw error;
+                }
+                return await response.json();
+            })();
+            return await Promise.race([request, timeout]);
+        } catch (error) {
+            failure = controller.signal.aborted ? temporaryError('Steam Market request timed out.') : error;
+            if (failure?.name === 'TypeError') failure = temporaryError('Could not connect to Steam Market.');
+        } finally {
+            clearTimeout(timer);
+            release();
+        }
+        if (!failure?.temporary || failure.noRetry || attempt === 2) throw failure;
+        const backoff = Math.max(attempt === 0 ? 600 : 1800, failure.retryAfter || 0);
+        if (backoff > 10000 || Date.now() + backoff >= deadline) throw failure;
+        await delay(backoff);
+    }
+}
+
+function marketCachedResult(entry, error) {
+    if (!entry.quote) return { quote: null };
+    return { quote: { ...entry.quote, cached: true, cachedAt: entry.cachedAt, ...(error ? { error } : {}) }, ...(error ? { error } : {}) };
+}
+
+async function loadMarketQuote(name, force, deadline) {
+    const previous = marketCache.get(name);
+    const ttl = previous?.quote ? MARKET_FRESH_MS : MARKET_MISSING_MS;
+    if (!force && previous && Date.now() - previous.cachedAt < ttl) {
+        previous.usedAt = Date.now();
+        return marketCachedResult(previous);
+    }
+    let operation = pendingMarket.get(name);
+    if (!operation) {
+        if (pendingMarket.size >= MARKET_MAX_NAMES) throw new Error('Too many Steam Market quotes are already loading. Please retry later.');
+        operation = enqueueMarketJob(async () => {
+            const payload = await fetchMarketPayload(name, deadline);
+            const quote = globalThis.SIHLiteMarketQuotes.normalizeQuote(payload, name);
+            marketCache.set(name, { quote, cachedAt: Date.now(), usedAt: Date.now() });
+            pruneMarketCache();
+            persistMarketCache();
+            return { quote: quote ? { ...quote, cached: false } : null };
+        }, deadline).catch(error => {
+            const fallback = marketCache.get(name);
+            if (error?.temporary && fallback?.quote && Date.now() - fallback.cachedAt <= STALE_CACHE_MS) return marketCachedResult(fallback, error.message);
+            throw error;
+        }).finally(() => pendingMarket.delete(name));
+        pendingMarket.set(name, operation);
+    }
+    return await operation;
+}
+
+function sanitizeMarketEntry(name, entry, now) {
+    try {
+        if (globalThis.SIHLiteMarketQuotes.validateName(name) !== name || !entry ||
+            !Number.isSafeInteger(entry.cachedAt) || entry.cachedAt > now || now - entry.cachedAt > STALE_CACHE_MS) return null;
+        let quote = null;
+        if (entry.quote !== null) {
+            const value = entry.quote;
+            if (!value || value.marketHashName !== name || value.currency !== 'USD' || value.source !== 'steam-market' ||
+                value.estimateKind !== 'market-name' || !Number.isSafeInteger(value.priceCents) || value.priceCents <= 0) return null;
+            quote = { marketHashName: name, priceCents: value.priceCents, currency: 'USD', source: 'steam-market', estimateKind: 'market-name' };
+        } else if (now - entry.cachedAt >= MARKET_MISSING_MS) return null;
+        return { quote, cachedAt: entry.cachedAt, usedAt: Number.isSafeInteger(entry.usedAt) && entry.usedAt <= now ? entry.usedAt : entry.cachedAt };
+    } catch { return null; }
+}
+
+function pruneMarketCache() {
+    const now = Date.now();
+    for (const [name, entry] of marketCache) if (!sanitizeMarketEntry(name, entry, now)) marketCache.delete(name);
+    if (marketCache.size > MARKET_MAX_NAMES) {
+        const oldest = [...marketCache].sort((a, b) => a[1].usedAt - b[1].usedAt);
+        for (const [name] of oldest.slice(0, marketCache.size - MARKET_MAX_NAMES)) marketCache.delete(name);
+    }
+}
+
+function ensureMarketCache() {
+    if (!marketCacheReady) marketCacheReady = (async () => {
+        try {
+            const result = await storageCall('get', MARKET_CACHE_KEY);
+            const entries = await decodeCache(result?.[MARKET_CACHE_KEY]);
+            const now = Date.now();
+            for (const [name, entry] of Object.entries(entries || {})) {
+                const clean = sanitizeMarketEntry(name, entry, now);
+                if (clean) marketCache.set(name, clean);
+            }
+            pruneMarketCache();
+        } catch { /* Missing or corrupt storage never blocks live quotes. */ }
+    })();
+    return marketCacheReady;
+}
+
+function persistMarketCache() {
+    marketWritePending = true;
+    if (marketWriteRunning) return;
+    marketWriteRunning = true;
+    Promise.resolve().then(async () => {
+        while (marketWritePending) {
+            marketWritePending = false;
+            pruneMarketCache();
+            await storageCall('set', { [MARKET_CACHE_KEY]: { version: 1, entries: Object.fromEntries(marketCache) } });
+        }
+    }).catch(() => {}).finally(() => {
+        marketWriteRunning = false;
+        if (marketWritePending) persistMarketCache();
     });
 }

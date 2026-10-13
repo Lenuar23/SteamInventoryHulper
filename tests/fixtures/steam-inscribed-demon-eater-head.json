@@ -1,0 +1,129 @@
+{
+  "appid": "570",
+  "classid": "7846161687",
+  "instanceid": "9038145294",
+  "name": "Inscribed Demon Eater - Head",
+  "market_hash_name": "Inscribed Demon Eater - Head",
+  "market_name": "Inscribed Demon Eater - Head",
+  "name_color": "CF6A32",
+  "type": "Mythical Wearable",
+  "tradable": 1,
+  "marketable": 1,
+  "commodity": 0,
+  "descriptions": [
+    {
+      "type": "html",
+      "value": "Used By: Shadow Fiend",
+      "name": "attribute"
+    },
+    {
+      "value": "Gift From: [redacted]",
+      "color": "99ccff",
+      "name": "attribute"
+    },
+    {
+      "type": "html",
+      "value": "Date Received: [redacted]",
+      "name": "attribute"
+    },
+    {
+      "type": "html",
+      "value": " ",
+      "name": "attribute"
+    },
+    {
+      "type": "html",
+      "value": "Demon Eater Bundle",
+      "color": "9da1a9",
+      "name": "attribute",
+      "app_data": {
+        "def_index": "34211",
+        "is_itemset_name": 1
+      }
+    },
+    {
+      "type": "html",
+      "value": "Demon Eater",
+      "color": "6c7075",
+      "name": "attribute",
+      "app_data": {
+        "def_index": "6996"
+      }
+    },
+    {
+      "type": "html",
+      "value": "Demon Eater - Head",
+      "color": "6c7075",
+      "name": "attribute",
+      "app_data": {
+        "def_index": "34184"
+      }
+    },
+    {
+      "type": "html",
+      "value": "Demon Eater - Shoulders",
+      "color": "6c7075",
+      "name": "attribute",
+      "app_data": {
+        "def_index": "34185"
+      }
+    },
+    {
+      "type": "html",
+      "value": "Demon Eater - Arms",
+      "color": "6c7075",
+      "name": "attribute",
+      "app_data": {
+        "def_index": "34186"
+      }
+    },
+    {
+      "type": "html",
+      "value": " ",
+      "name": "attribute"
+    },
+    {
+      "type": "html",
+      "value": "( Not Usable in Crafting )",
+      "name": "attribute"
+    },
+    {
+      "type": "html",
+      "value": "<div style=\"white-space: nowrap; margin: 10px\"><div style=\"white-space: nowrap; padding: 3px;\"><div style=\"width: 60px; height: 32px; vertical-align: top; display: inline-block;\"><div style=\"position: relative; width: 48px; height: 32px; vertical-align: top; display: inline-block; border: 2px solid rgb(255, 255, 255);\"><div style=\"position: absolute; width: 48px; height: 32px; vertical-align: top; display: inline-block; background-size: contain; background-image: url(https://cdn.steamstatic.com/apps/570/icons/econ/sockets/gem_stat.30d7935c1f0a1b9e8e28c691c2bd28f7d5f471bc.png)\"></div></div></div><div style=\"vertical-align: top; display: inline-block; margin-left: 12px padding: 2px\"><span style=\"font-size: 18px; white-space: normal; color: rgb(255, 255, 255)\">Three Shadowraze Combo: 5</span><br><span style=\"font-size: 12px\">Inscribed Gem</span></div></div></div>"
+    }
+  ],
+  "tags": [
+    {
+      "internal_name": "strange",
+      "name": "Inscribed",
+      "category": "Quality",
+      "color": "CF6A32",
+      "category_name": "Quality"
+    },
+    {
+      "internal_name": "Rarity_Mythical",
+      "name": "Mythical",
+      "category": "Rarity",
+      "color": "8847ff",
+      "category_name": "Rarity"
+    },
+    {
+      "internal_name": "wearable",
+      "name": "Wearable",
+      "category": "Type",
+      "category_name": "Type"
+    },
+    {
+      "internal_name": "head",
+      "name": "Head",
+      "category": "Slot",
+      "category_name": "Slot"
+    },
+    {
+      "internal_name": "npc_dota_hero_nevermore",
+      "name": "Shadow Fiend",
+      "category": "Hero",
+      "category_name": "Hero"
+    }
+  ]
+}

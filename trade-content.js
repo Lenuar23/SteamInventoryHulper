@@ -19,6 +19,8 @@
     const collection = { owner: null, index: new Map(), state: 'idle', error: '', cache: null, epoch: 0 };
     const classAssetProofs = new Map(), classDetails = new Map();
     let classEstimates = new Map(), classEstimateEpoch = 0;
+    const marketEstimates = new Map(), marketStates = new Map(), marketQueued = new Map();
+    let marketBatchPending = false, marketBatchTimer = null;
     const badgeNodes = new Set();
     const observedOffers = new WeakSet();
     const offerObserver = typeof IntersectionObserver === 'function'
@@ -73,6 +75,116 @@
                 reject(error);
             }
         }));
+    }
+
+    function marketName(item) {
+        const name = item?.marketHashName || item?.market_hash_name || item?.description?.market_hash_name;
+        if (typeof name !== 'string' || !name.trim() || name.trim().length > 512) return null;
+        const key = name.trim().toLowerCase();
+        // Probe the same price resolver with a prospective quote. A stronger
+        // price or an ambiguous native match must prevent fallback requests.
+        const probe = new Map([[key, { marketHashName: name.trim(), priceCents: 1,
+            currency: 'USD', source: 'steam-market', estimateKind: 'market-name' }]]);
+        return Prices.getPrice(priceIndex(item.ownerSteamId), item, ordinaryEstimates, collection.index,
+            classEstimates, probe).source === 'steam-market' ? name.trim() : null;
+    }
+
+    function loadMarketEstimates(items) {
+        for (const item of items) {
+            const name = marketName(item);
+            if (!name) continue;
+            const key = name.toLowerCase(), state = marketStates.get(key);
+            if (state && state.state !== 'idle') continue;
+            if (marketQueued.size >= 128) continue;
+            marketQueued.set(key, { name, force: state?.force === true });
+            marketStates.set(key, { state: 'loading', error: '' });
+        }
+        if (marketQueued.size && !marketBatchPending && marketBatchTimer === null) {
+            marketBatchTimer = setTimeout(() => { marketBatchTimer = null; void fetchMarketBatch(); }, 50);
+        }
+    }
+
+    function retryMarketEstimates(items) {
+        for (const item of items) {
+            const name = marketName(item);
+            if (name && marketStates.get(name.toLowerCase())?.state !== 'loading') {
+                marketStates.set(name.toLowerCase(), { state: 'idle', error: '', force: true });
+            }
+        }
+    }
+
+    async function fetchMarketBatch() {
+        if (marketBatchPending || !marketQueued.size) return;
+        marketBatchPending = true;
+        const batch = [...marketQueued.entries()].slice(0, 20);
+        for (const [key] of batch) marketQueued.delete(key);
+        const fail = (key, error) => {
+            marketStates.set(key, { state: 'error', error });
+            const previous = marketEstimates.get(key);
+            if (previous && Date.now() - previous.cachedAt <= 24 * 60 * 60 * 1000) {
+                marketEstimates.set(key, { ...previous, cached: true, error });
+            } else marketEstimates.delete(key);
+        };
+        try {
+            const response = await queueOperation(() => new Promise((resolve, reject) => {
+                const timer = setTimeout(() => reject(new Error('Steam Market estimates timed out. Please retry.')), 240000);
+                try {
+                    chrome.runtime.sendMessage({ action: 'fetchMarketQuotes', names: batch.map(([, entry]) => entry.name),
+                        force: batch.some(([, entry]) => entry.force) }, result => {
+                        clearTimeout(timer);
+                        if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+                        else if (!result?.success) reject(new Error(result?.error || 'Steam Market estimates are unavailable.'));
+                        else resolve(result.data);
+                    });
+                } catch (error) { clearTimeout(timer); reject(error); }
+            }));
+            if (response?.currency !== 'USD' || !Array.isArray(response.items) || response.items.length > 20 ||
+                !Array.isArray(response.missingNames) || !Array.isArray(response.errors) || response.errors.length > 20) {
+                throw new Error('Steam Market returned invalid USD estimates.');
+            }
+            const expected = new Set(batch.map(([key]) => key)), quotes = new Map();
+            for (const quote of response.items) {
+                const key = typeof quote?.marketHashName === 'string' ? quote.marketHashName.trim().toLowerCase() : '';
+                if (!expected.has(key) || quotes.has(key) || quote.currency !== 'USD' || quote.source !== 'steam-market' ||
+                    quote.estimateKind !== 'market-name' || !Number.isSafeInteger(quote.priceCents) || quote.priceCents <= 0) {
+                    throw new Error('Steam Market returned invalid USD estimates.');
+                }
+                quotes.set(key, { marketHashName: quote.marketHashName, priceCents: quote.priceCents,
+                    currency: 'USD', source: 'steam-market', estimateKind: 'market-name', cached: quote.cached === true,
+                    cachedAt: Number.isSafeInteger(quote.cachedAt) ? quote.cachedAt : Date.now(),
+                    error: typeof quote.error === 'string' ? quote.error : '' });
+            }
+            for (const [key] of batch) {
+                const quote = quotes.get(key);
+                if (quote) {
+                    marketEstimates.delete(key); marketEstimates.set(key, quote);
+                    marketStates.set(key, { state: 'ready', error: quote.error });
+                } else {
+                    const error = response.errors.find(entry => typeof entry?.marketHashName === 'string' &&
+                        entry.marketHashName.trim().toLowerCase() === key)?.error;
+                    if (error) fail(key, String(error));
+                    else {
+                        marketEstimates.delete(key);
+                        marketStates.set(key, { state: 'ready', error: 'Steam Market has no current listing quote for this name.' });
+                    }
+                }
+            }
+        } catch (error) {
+            for (const [key] of batch) fail(key, error.message);
+        } finally {
+            marketBatchPending = false;
+            while (marketEstimates.size > 128) {
+                const key = marketEstimates.keys().next().value;
+                marketEstimates.delete(key);
+                if (marketStates.get(key)?.state !== 'loading') marketStates.delete(key);
+            }
+            for (const [key, state] of marketStates) {
+                if (marketStates.size <= 256) break;
+                if (state.state !== 'loading' && !marketEstimates.has(key)) marketStates.delete(key);
+            }
+            queueRender();
+            if (marketQueued.size) void fetchMarketBatch();
+        }
     }
 
     function ownerData(id, profile = false, prices = true) {
@@ -303,6 +415,7 @@
             '.sih-lite-trade-summary [data-role="status"]{width:100%;font-size:12px;color:#b8b9ba;overflow-wrap:anywhere}',
             '.sih-lite-trade-gain{color:#5cff5c}.sih-lite-trade-loss{color:#ffad86}',
             '.sih-lite-trade-price{position:absolute!important;bottom:2px!important;right:2px!important;z-index:5;background:rgba(0,0,0,.92);color:#5cff5c;border:1px solid #5cff5c;font-size:11px;font-weight:bold;line-height:1.2;padding:2px 4px;border-radius:3px;pointer-events:none}',
+            '.sih-lite-trade-price.sih-lite-trade-market-price{color:#ffc878;border-color:#ffc878}',
             '.sih-lite-trade-button{background:#39516a;color:#fff;border:1px solid #536b83;padding:5px 8px;border-radius:3px;cursor:pointer;margin:3px 5px 3px 0}',
             '.sih-lite-trade-button:disabled{opacity:.5;cursor:default}.sih-lite-trade-button[aria-pressed="true"]{border-color:#5cff5c}',
             '.sih-lite-trade-accept-status{width:100%;overflow-wrap:anywhere}.sih-lite-trade-summary button{position:relative;z-index:4}',
@@ -335,25 +448,28 @@
             element.dataset.role = name;
             summary.appendChild(element);
         }
-        summary.title = 'Dota 2 values in USD from Steamprice. Cached valuations may differ from market sale prices.';
+        summary.title = 'Dota 2 values in USD. Steam Market fallbacks are labeled estimates and may exclude attached-gem premiums.';
         return summary;
     }
 
     function renderSummary(element, give, receive, me, them, extraStatus = '', completeness = {}) {
-        const a = Prices.summarize(give, priceIndex(me), ordinaryEstimates, collection.index, classEstimates);
-        const b = Prices.summarize(receive, priceIndex(them), ordinaryEstimates, collection.index, classEstimates);
+        const a = Prices.summarize(give, priceIndex(me), ordinaryEstimates, collection.index, classEstimates, marketEstimates);
+        const b = Prices.summarize(receive, priceIndex(them), ordinaryEstimates, collection.index, classEstimates, marketEstimates);
         if (completeness.me === false) a.complete = false;
         if (completeness.them === false) b.complete = false;
         const net = Prices.difference(a, b);
+        const marketEstimated = (a.marketEstimatedCount || 0) + (b.marketEstimatedCount || 0);
         const subtotal = side => !side.complete && side.itemCount > 0 && side.pricedCount === 0
-            ? 'Unavailable' : money(side.knownCents) + (side.complete ? '' : ' (known)');
+            ? 'Unavailable' : money(side.knownCents) + (side.marketEstimatedCount > 0
+                ? side.complete ? ' (estimated)' : ' (known, estimated)' : side.complete ? '' : ' (known)');
         text(role(element, 'give'), 'You give: ' + subtotal(a));
         text(role(element, 'receive'), 'You receive: ' + subtotal(b));
         const netElement = role(element, 'net');
-        text(netElement, !net.complete ? 'Known difference: ' + (a.pricedCount + b.pricedCount === 0
+        text(netElement, !net.complete ? (marketEstimated ? 'Known estimated difference: ' : 'Known difference: ') + (a.pricedCount + b.pricedCount === 0
             ? 'Unavailable' : signedMoney(net.knownCents || 0))
-            : net.cents > 0 ? 'Net gain: ' + signedMoney(net.cents)
-                : net.cents < 0 ? 'Net loss: ' + signedMoney(net.cents) : 'Even: $0.00');
+            : net.cents > 0 ? (marketEstimated ? 'Estimated gain: ' : 'Net gain: ') + signedMoney(net.cents)
+                : net.cents < 0 ? (marketEstimated ? 'Estimated loss: ' : 'Net loss: ') + signedMoney(net.cents)
+                    : marketEstimated ? 'Estimated difference: $0.00' : 'Even: $0.00');
         const className = net.complete && net.cents !== 0
             ? net.cents > 0 ? 'sih-lite-trade-gain' : 'sih-lite-trade-loss' : '';
         if (netElement.className !== className) netElement.className = className;
@@ -376,6 +492,18 @@
         const classEstimated = (a.classEstimatedCount || 0) + (b.classEstimatedCount || 0);
         if (classEstimated) status.push('Includes ' + classEstimated + ' current estimate' + (classEstimated === 1 ? '' : 's') +
             ' matched by exact item class and variant in the owner’s inventory.');
+        if (marketEstimated) status.push('Includes ' + marketEstimated + ' Steam Market USD listing estimate' +
+            (marketEstimated === 1 ? '.' : 's.') + ' Steam wallet prices may differ from cash prices and do not establish attached-gem or autograph premiums.');
+        const marketNames = new Set([...give, ...receive].map(marketName).filter(Boolean).map(name => name.toLowerCase()));
+        if ([...marketNames].some(name => marketStates.get(name)?.state === 'loading')) status.push('Loading Steam Market estimates…');
+        const marketErrors = new Set();
+        for (const name of marketNames) {
+            const state = marketStates.get(name), quote = marketEstimates.get(name);
+            if (state?.error) marketErrors.add(state.error);
+            const cached = cacheNotice(quote, 'Cached Steam Market estimate');
+            if (quote?.cached && cached && !status.includes(cached)) status.push(cached);
+        }
+        for (const error of [...marketErrors].slice(0, 3)) status.push('Steam Market: ' + error);
         if (needsCollection([...give, ...receive])) {
             if (collection.state === 'loading') status.push('Loading Steamprice collection prices…');
             else if (collection.error) status.push('Steamprice collection prices: ' + collection.error);
@@ -394,8 +522,9 @@
 
     function renderBadge(element, item) {
         let badge = element.querySelector('.sih-lite-trade-price');
-        const price = Prices.getPrice(priceIndex(item.ownerSteamId), item, ordinaryEstimates, collection.index, classEstimates);
-        const value = Prices.summarize([item], priceIndex(item.ownerSteamId), ordinaryEstimates, collection.index, classEstimates);
+        const market = listPage || element.closest('#your_slots, #their_slots') ? marketEstimates : null;
+        const price = Prices.getPrice(priceIndex(item.ownerSteamId), item, ordinaryEstimates, collection.index, classEstimates, market);
+        const value = Prices.summarize([item], priceIndex(item.ownerSteamId), ordinaryEstimates, collection.index, classEstimates, market);
         if (price.cents === null || !value.complete) {
             if (badge) badge.remove();
             return;
@@ -411,7 +540,15 @@
             if (getComputedStyle(element).position === 'static') element.style.position = 'relative';
             element.dataset.sihTradePositioned = 'true';
         }
-        text(badge, money(value.knownCents));
+        badge.classList.toggle('sih-lite-trade-market-price', price.source === 'steam-market');
+        text(badge, (price.source === 'steam-market' ? '~' : '') + money(value.knownCents));
+        if (price.source === 'steam-market') {
+            const quote = marketEstimates.get((item.marketHashName || item.market_hash_name || '').trim().toLowerCase());
+            badge.title = 'Steam Market USD estimate: ' + money(price.cents) + ' each, quantity ' + String(item.amount ?? 1) +
+                '. Current lowest listing for the exact market name. Steam wallet prices may differ from cash prices; attached-gem and autograph premiums are not established.' +
+                (quote?.cached ? ' ' + cacheNotice(quote, 'Cached Steam Market estimate') : '');
+            return;
+        }
         badge.title = 'Steamprice: ' + money(price.cents) + ' each, quantity ' + String(item.amount ?? 1) + '.' +
             (price.source === 'variant' ? ' Current estimate for the matching gem variant; exact asset details are unavailable.' : '') +
             (price.source === 'ordinary-estimate' ? ' Current ordinary-item estimate from saved Steamprice prices; exact asset details are unavailable. Source prices may be cached.' : '') +
@@ -441,6 +578,8 @@
         }
         const retry = makeButton('Retry prices', () => {
             retryOwners([editor?.owners?.me?.steamId, editor?.owners?.them?.steamId]);
+            retryMarketEstimates([...normalizeItems(editor?.offers?.me, editor?.owners?.me?.steamId),
+                ...normalizeItems(editor?.offers?.them, editor?.owners?.them?.steamId)]);
         });
         retry.id = 'sih-lite-trade-retry';
         panel.appendChild(retry);
@@ -462,6 +601,7 @@
         const activeOwner = editor.active?.supported ? editor.active.ownerSteamId : null;
         ownerData(me, true, activeOwner === me || give.some(item => String(item.appId) === '570'));
         ownerData(them, true, activeOwner === them || receive.some(item => String(item.appId) === '570'));
+        if (![me, them].some(id => owners.get(id)?.priceState === 'loading')) loadMarketEstimates([...give, ...receive]);
         let summary = document.getElementById('sih-lite-trade-editor-summary');
         const target = document.getElementById('trade_box') || document.getElementById('trade_area');
         if (!summary && target) {
@@ -495,9 +635,12 @@
                     (button.dataset.tradeOrder !== 'original' && data?.priceState !== 'ready'));
                 button.setAttribute('aria-pressed', String(button.dataset.tradeOrder === (active.order || 'original')));
             }
-            document.getElementById('sih-lite-trade-retry').hidden = !errors.length;
+            const marketNames = [...give, ...receive].map(marketName).filter(Boolean).map(name => name.toLowerCase());
+            document.getElementById('sih-lite-trade-retry').hidden = !errors.length &&
+                !marketNames.some(name => marketStates.get(name)?.error || marketEstimates.get(name)?.cached);
             document.getElementById('sih-lite-trade-retry').disabled = [me, them].some(id =>
-                owners.get(id)?.priceState === 'loading' || owners.get(id)?.profileState === 'loading');
+                owners.get(id)?.priceState === 'loading' || owners.get(id)?.profileState === 'loading') ||
+                marketNames.some(name => marketStates.get(name)?.state === 'loading');
             text(role(panel, 'inventory-status'), [sortStatus, ...errors].filter(Boolean).join(' '));
             renderScanLinks(role(panel, 'scan-links'), me, them);
         }
@@ -700,9 +843,9 @@
         const offer = readOffers().find(value => value.offerId === offerId);
         if (!offer) return;
         const report = globalThis.SIHLiteTradeDiagnostics.buildReport({
-            version: chrome.runtime.getManifest?.().version || '1.3.4', pathname: location.pathname, offer,
+            version: chrome.runtime.getManifest?.().version || '1.3.5', pathname: location.pathname, offer,
             detailState: details.get(offerId), classState: classDetails.get(offerId),
-            owners, ordinaryEstimates, collection, classAssetProofs, classEstimates
+            owners, ordinaryEstimates, collection, classAssetProofs, classEstimates, marketEstimates, marketStates
         });
         const value = JSON.stringify(report, null, 2);
         let status = role(summary, 'diagnostics-status');
@@ -745,6 +888,9 @@
                 ![me, them].some(id => owners.get(id)?.priceState === 'loading') &&
                 details.get(offer.offerId)?.state !== 'loading') void loadCollection(me);
             loadClassAssets(offer);
+            if (![me, them].some(id => owners.get(id)?.priceState === 'loading') &&
+                details.get(offer.offerId)?.state !== 'loading' && classDetails.get(offer.offerId)?.state !== 'loading' &&
+                collection.state !== 'loading') loadMarketEstimates([...give, ...receive]);
             let summary = offer.element.querySelector('.sih-lite-trade-summary');
             if (!summary) {
                 summary = makeSummary();
@@ -752,6 +898,8 @@
                 offer.element.appendChild(summary);
                 const retry = makeButton('Retry prices', () => {
                     retryOwners([list.meSteamId, offer.partnerSteamId]);
+                    const current = readOffers().find(value => value.offerId === offer.offerId);
+                    if (current) retryMarketEstimates([...current.give, ...current.receive]);
                     if (details.get(offer.offerId)?.state === 'error') loadDetails(offer, true);
                     classDetails.set(offer.offerId, { state: 'idle', error: '', force: true });
                     if (collection.owner === list.meSteamId && collection.state !== 'loading' &&
@@ -773,19 +921,24 @@
             if (!offer.active) extraStatus.push('Historical offers show current estimates, not prices at the time of the trade.');
             renderSummary(summary, give, receive, me, them, extraStatus.join(' '));
             const unpriced = [...give, ...receive].some(item =>
-                Prices.getPrice(priceIndex(item.ownerSteamId), item, ordinaryEstimates, collection.index, classEstimates).cents === null);
+                Prices.getPrice(priceIndex(item.ownerSteamId), item, ordinaryEstimates, collection.index, classEstimates, marketEstimates).cents === null);
             const unpricedCard = (offer.slots || []).some(slot => Prices.getPrice(priceIndex(slot.item?.ownerSteamId),
-                slot.item, ordinaryEstimates, collection.index, classEstimates).cents === null);
-            summary.querySelector('.sih-lite-trade-diagnostics').hidden = !unpriced && !unpricedCard;
+                slot.item, ordinaryEstimates, collection.index, classEstimates, marketEstimates).cents === null);
+            const marketNames = [...give, ...receive].map(marketName).filter(Boolean).map(name => name.toLowerCase());
+            const marketUsed = [...give, ...receive].some(item => Prices.getPrice(priceIndex(item.ownerSteamId), item,
+                ordinaryEstimates, collection.index, classEstimates, marketEstimates).source === 'steam-market');
+            summary.querySelector('.sih-lite-trade-diagnostics').hidden = !unpriced && !unpricedCard && !marketUsed;
             renderScanLinks(role(summary, 'scan-links'), me, them);
             summary.querySelector('.sih-lite-trade-retry').hidden =
                 !unpriced && !owners.get(me)?.priceError && !owners.get(them)?.priceError && !detail?.error && !classDetail?.error &&
                 !owners.get(me)?.priceCache?.cached && !owners.get(them)?.priceCache?.cached &&
                 !owners.get(me)?.needsScan && !owners.get(them)?.needsScan &&
-                !collection.error && !collection.cache?.cached;
+                !collection.error && !collection.cache?.cached &&
+                !marketNames.some(name => marketStates.get(name)?.error || marketEstimates.get(name)?.cached);
             summary.querySelector('.sih-lite-trade-retry').disabled =
                 [me, them].some(id => owners.get(id)?.priceState === 'loading') || detail?.state === 'loading' ||
-                classDetail?.state === 'loading' || collection.state === 'loading';
+                classDetail?.state === 'loading' || collection.state === 'loading' ||
+                marketNames.some(name => marketStates.get(name)?.state === 'loading');
             for (const slot of offer.slots || []) if (slot.element) {
                 badges.push([slot.element, { ...slot.item, ownerSteamId: slot.side === 'give' ? me : them }]);
             }

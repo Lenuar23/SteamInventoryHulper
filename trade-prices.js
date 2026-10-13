@@ -383,6 +383,113 @@
         return index;
     }
 
+    function marketQuality(name) {
+        for (const quality of ['genuine', 'inscribed', 'autographed']) {
+            if (name.startsWith(quality + ' ') && name.length > quality.length + 1) return quality;
+        }
+        return NON_STANDARD_NAME.test(name) ? null : 'standard';
+    }
+
+    function marketProofFlags(item) {
+        if (!item || typeof item !== 'object') return false;
+        const description = item.description && typeof item.description === 'object' ? item.description : item;
+        const records = item === description ? [item] : [item, description];
+        const name = canonicalName(item);
+        if (!name || /[\u0000-\u001f\u007f]/.test(name) || !marketQuality(name) || GEM_CAPABLE_NAME.test(name) ||
+            /\b(?:courier|greevil)\b/i.test(name) || /\b(?:bundle|set)\s*$/i.test(name) ||
+            /^(?:prismatic|ethereal|kinetic|inscribed|autograph|unusual effect)\s*:/i.test(name)) return false;
+        if (String(appId(item)) !== '570' || ![true, 1].includes(description.tradable) || ![true, 1].includes(description.marketable)) return false;
+        for (const record of records) {
+            if (['appId', 'appid'].some(field => record[field] != null && String(record[field]) !== '570') ||
+                ['contextId', 'contextid', 'context_id'].some(field => record[field] != null && String(record[field]) !== '2') ||
+                ['tradable', 'marketable'].some(field => Object.prototype.hasOwnProperty.call(record, field) && ![true, 1].includes(record[field])) ||
+                ['isCurrency', 'is_currency', 'currency', 'hasColoredGem', 'isLegacy'].some(field =>
+                    record[field] != null && ![false, 0].includes(record[field])) ||
+                ['currencyId', 'currencyid'].some(field => record[field] != null) ||
+                VARIANT_FALSE_FLAGS.some(field => [true, 1].includes(record[field])) ||
+                ['styleTotal', 'styleUnlocked'].some(field => record[field] != null && record[field] !== 0) ||
+                ['styles', 'style', 'legacyRgb', 'paintSeed', 'wearRating', 'infuser', 'greevil', 'collectorSetPiece'].some(field => record[field] != null) ||
+                ['prismaticGems', 'etherealGems', 'unusualEffectGems'].some(field => record[field] != null &&
+                    (!Array.isArray(record[field]) || record[field].length))) return false;
+            if (record.ownerSteamId != null && !ownerId(record.ownerSteamId)) return false;
+            for (const field of ['market_hash_name', 'marketHashName']) {
+                if (record[field] != null && (typeof record[field] !== 'string' || record[field].trim().toLowerCase() !== name)) return false;
+            }
+            if (record.gems != null && (!Array.isArray(record.gems) || record.gems.some(gem =>
+                !gem || typeof gem !== 'object' || !/^(?:inscribed gem|ti8 rune|kinetic gem|autograph rune)$/i.test(String(gem.type))))) return false;
+        }
+        const owners = records.map(record => record.ownerSteamId).filter(value => value != null);
+        if (owners.some(owner => owner !== owners[0])) return false;
+        return true;
+    }
+
+    function nativeMarketFingerprint(item) {
+        if (!marketProofFlags(item)) return null;
+        const description = item.description && typeof item.description === 'object' ? item.description : item;
+        if (!Array.isArray(description.descriptions)) return null;
+        const tags = Array.isArray(description.tags) ? description.tags : [];
+        const types = tags.filter(tag => tag && String(tag.category).toLowerCase() === 'type');
+        const knownTypes = new Set(['wearable', 'ward', 'taunt', 'announcer', 'mega_kill_announcer', 'hud', 'hud_skin',
+            'music', 'music_pack', 'loading_screen', 'terrain', 'weather', 'emoticon']);
+        if (types.length > 1 || types.some(tag => !knownTypes.has(String(tag.internal_name).toLowerCase()))) return null;
+        if (!types.length && !/\b(?:wearable|boots?|arms?|shoulders?|burning soul|ward|announcer|music|taunt|terrain)\b/i.test(String(description.type || ''))) return null;
+        if (/\b(?:courier|курьер|gem|rune|bundle)\b/i.test(String(description.type || ''))) return null;
+        const allowedSockets = new Set(['gem_stat', 'gem_animation', 'gem_kinetic', 'gem_empty', 'gem_stat_empty']);
+        let autograph = false;
+        for (const entry of description.descriptions) {
+            if (!entry || typeof entry.value !== 'string') return null;
+            const text = entry.value.replace(/<[^>]*>/g, ' ');
+            if (/\b(?:styles?|bugged|duped|duplicated|favored|giftable|gift\s+only|may\s+be\s+gifted)\b|стил[ьиі]/i.test(text) ||
+                /style/i.test(String(entry.name || '')) || /(?:[?&]style(?:id)?=|(?:class|id|data-[\w-]+)\s*=\s*["'][^"']*(?:^|[_\s-])styles?(?:$|[_\s-]))/i.test(entry.value)) return null;
+            const socketIcons = [...entry.value.matchAll(/\/econ\/sockets\/([a-z0-9_]+)(?=[.?/])/gi)];
+            if (/\/econ\/sockets\//i.test(entry.value) && (!socketIcons.length || socketIcons.some(icon => !allowedSockets.has(icon[1].toLowerCase())))) return null;
+            const tools = [...entry.value.matchAll(/\/econ\/tools\/([a-z0-9_]+)(?=[.?/])/gi)];
+            if (/\/econ\/tools\//i.test(entry.value) && (!tools.length || tools.some(icon => icon[1].toLowerCase() !== 'sign_autograph'))) return null;
+            autograph ||= tools.some(icon => icon[1].toLowerCase() === 'sign_autograph');
+            // Unknown named effects cannot pass merely because a socket icon
+            // was missing or moved to another HTML attribute.
+            if (/\b(?:prismatic|ethereal|unusual effect|ascendant|spectator|foulfell|bloodstone|empowered)\s+(?:gem|rune)\b/i.test(text)) return null;
+            if (/\b(?:gem|rune|socket)\b/i.test(text) && !socketIcons.length && !tools.length) return null;
+        }
+        const name = canonicalName(item), quality = marketQuality(name);
+        const qualities = tags.filter(tag => tag && String(tag.category).toLowerCase() === 'quality');
+        if (qualities.length > 1) return null;
+        const raw = String(qualities[0]?.internal_name || '').toLowerCase();
+        const expected = { standard: 'unique', genuine: 'genuine', inscribed: 'strange', autographed: 'autographed' }[quality];
+        const color = String(description.name_color || '').toLowerCase();
+        const expectedColor = { standard: 'd2d2d2', genuine: '4d7455', inscribed: 'cf6a32', autographed: 'd2d2d2' }[quality];
+        if (raw && raw !== expected && !(quality === 'autographed' && raw === 'unique' && autograph)) return null;
+        if (!raw && (color !== expectedColor || (quality === 'autographed' && !autograph))) return null;
+        if (color && color !== expectedColor) return null;
+        if (autograph && quality !== 'autographed') return null;
+        return JSON.stringify(['steam-market-v1', name, quality]);
+    }
+
+    // Compact proofs are produced only from the full native class description.
+    // Recheck names, eligibility flags, and any metadata supplied alongside one.
+    function marketFingerprint(item) {
+        if (!marketProofFlags(item)) return null;
+        if (item.description || Object.prototype.hasOwnProperty.call(item, 'descriptions')) return nativeMarketFingerprint(item);
+        if (typeof item.marketFingerprint !== 'string' || item.marketFingerprint.length > 600) return null;
+        try {
+            const parts = JSON.parse(item.marketFingerprint);
+            const name = canonicalName(item);
+            if (!Array.isArray(parts) || parts.length !== 3 || parts[0] !== 'steam-market-v1' ||
+                parts[1] !== name || parts[2] !== marketQuality(name)) return null;
+            return JSON.stringify(parts);
+        } catch (_) { return null; }
+    }
+
+    function marketEstimate(item, marketEstimates) {
+        const fingerprint = marketFingerprint(item);
+        if (!fingerprint || !(marketEstimates instanceof Map)) return { cents: null, source: 'unknown' };
+        const quote = marketEstimates.get(canonicalName(item));
+        if (!quote || typeof quote.marketHashName !== 'string' || quote.marketHashName.trim().toLowerCase() !== canonicalName(item) ||
+            quote.source !== 'steam-market' || quote.currency !== 'USD' || quote.estimateKind !== 'market-name' ||
+            !Number.isSafeInteger(quote.priceCents) || quote.priceCents <= 0) return { cents: null, source: 'unknown' };
+        return { cents: quote.priceCents, source: 'steam-market' };
+    }
+
     function buildIndex(apiItems, ownerSteamId) {
         if (!Array.isArray(apiItems)) throw new TypeError('Price items must be an array.');
         if (apiItems.length > MAX_INDEX_ITEMS) throw new RangeError('Steamprice inventory exceeds the supported 100000 price items.');
@@ -426,7 +533,7 @@
         return index;
     }
 
-    function getPrice(index, item, ordinaryEstimates, collectionIndex, classEstimates) {
+    function getPrice(index, item, ordinaryEstimates, collectionIndex, classEstimates, marketEstimates) {
         const unknown = { cents: null, source: 'unknown' };
         if (!item || typeof item !== 'object') return unknown;
         const app = appId(item);
@@ -460,9 +567,9 @@
             const cents = index.variants.get(`${owner}:${fingerprint}`);
             return cents === null ? unknown : { cents, source: 'variant' };
         }
-        if (!name || unsafeNameFallback(item, name)) return unknown;
+        const safeName = name && !unsafeNameFallback(item, name);
         const exact = `${owner}:${name}`;
-        if (index.exactNames.has(exact)) {
+        if (safeName && index.exactNames.has(exact)) {
             const cents = index.exactNames.get(exact);
             return cents === null ? unknown : { cents, source: 'name' };
         }
@@ -471,7 +578,9 @@
             const cents = ordinaryEstimates.get(ordinary);
             return Number.isSafeInteger(cents) && cents >= 0 ? { cents, source: 'ordinary-estimate' } : unknown;
         }
-        return catalogEstimate(item, collectionIndex);
+        const catalog = verifiedCatalogFingerprint(item.catalogFingerprint, item) || catalogFingerprint(item);
+        if (catalog && collectionIndex instanceof Map && collectionIndex.has(name)) return catalogEstimate(item, collectionIndex);
+        return marketEstimate(item, marketEstimates);
     }
 
     function amountFor(item) {
@@ -482,11 +591,11 @@
         return Number.isSafeInteger(amount) && amount > 0 ? amount : null;
     }
 
-    function summarize(items, index, ordinaryEstimates, collectionIndex, classEstimates) {
+    function summarize(items, index, ordinaryEstimates, collectionIndex, classEstimates, marketEstimates) {
         if (!Array.isArray(items)) throw new TypeError('Trade items must be an array.');
-        let knownCents = 0, pricedCount = 0, unpricedCount = 0, nonDotaCount = 0, estimatedCount = 0, ordinaryEstimatedCount = 0, catalogEstimatedCount = 0, classEstimatedCount = 0;
+        let knownCents = 0, pricedCount = 0, unpricedCount = 0, nonDotaCount = 0, estimatedCount = 0, ordinaryEstimatedCount = 0, catalogEstimatedCount = 0, classEstimatedCount = 0, marketEstimatedCount = 0;
         for (const item of items) {
-            const price = getPrice(index, item, ordinaryEstimates, collectionIndex, classEstimates);
+            const price = getPrice(index, item, ordinaryEstimates, collectionIndex, classEstimates, marketEstimates);
             const amount = amountFor(item);
             const value = price.cents !== null && amount !== null ? price.cents * amount : null;
             if (price.source === 'non-dota') nonDotaCount++;
@@ -499,9 +608,10 @@
                 if (price.source === 'ordinary-estimate') ordinaryEstimatedCount++;
                 if (price.source === 'catalog') catalogEstimatedCount++;
                 if (price.source === 'class-estimate') classEstimatedCount++;
+                if (price.source === 'steam-market') marketEstimatedCount++;
             }
         }
-        return { knownCents, itemCount: items.length, pricedCount, unpricedCount, nonDotaCount, estimatedCount, ordinaryEstimatedCount, catalogEstimatedCount, classEstimatedCount, complete: unpricedCount === 0 };
+        return { knownCents, itemCount: items.length, pricedCount, unpricedCount, nonDotaCount, estimatedCount, ordinaryEstimatedCount, catalogEstimatedCount, classEstimatedCount, marketEstimatedCount, complete: unpricedCount === 0 };
     }
 
     function difference(give, receive) {
@@ -514,7 +624,7 @@
         return { knownCents, cents: complete ? knownCents : null, complete };
     }
 
-    const api = { buildIndex, getPrice, summarize, difference, variantFingerprint, ordinaryFingerprint, buildCatalogIndex, catalogFingerprint };
+    const api = { buildIndex, getPrice, summarize, difference, variantFingerprint, ordinaryFingerprint, buildCatalogIndex, catalogFingerprint, marketFingerprint };
     root.SIHLiteTradePrices = api;
     if (typeof module === 'object' && module && module.exports) module.exports = api;
 })(globalThis);

@@ -24,6 +24,7 @@ function setup(fetchImpl, options = {}) {
     let listener;
     const requests = [];
     const requestTimes = [];
+    const requestOptions = [];
     const tabs = { created: [], removed: [] };
     const runtime = {
         onMessage: { addListener(callback) { listener = callback; } },
@@ -45,13 +46,14 @@ function setup(fetchImpl, options = {}) {
         atob,
         btoa,
         importScripts(filename) {
-            assert.equal(filename, 'collection-prices.js');
+            assert.ok(['collection-prices.js', 'market-prices.js'].includes(filename));
             imports.push(filename);
             vm.runInContext(fs.readFileSync(path.join(__dirname, '..', filename), 'utf8'), context, { filename });
         },
         fetch: async (url, init) => {
             requests.push(url);
             requestTimes.push(now);
+            requestOptions.push(init);
             return fetchImpl(url, init, requests.length);
         },
         setTimeout: (callback, ms) => {
@@ -98,6 +100,7 @@ function setup(fetchImpl, options = {}) {
     return {
         requests,
         requestTimes,
+        requestOptions,
         tabs,
         timers,
         imports,
@@ -868,7 +871,7 @@ test('collection action returns Weather cash quotes and never transfers collecti
     assert.equal(result.cached, false);
     assert.equal(result.needsScan, undefined);
     assert.equal(result.scanned, undefined);
-    assert.deepEqual(env.imports, ['collection-prices.js']);
+    assert.deepEqual(env.imports, ['collection-prices.js', 'market-prices.js']);
     assert.deepEqual(JSON.parse(JSON.stringify(result.data)), {
         items: [
             { marketHashName: 'Genuine Weather Rain', priceCents: 613 },
@@ -1036,4 +1039,372 @@ test('large collection catalogs cache only compact prices and survive compressed
     assert.equal(restored.data.items[999].priceCents, 1099);
     assert.equal(restored.data.items[999].image, undefined);
     assert.equal(restarted.requests.length, 0);
+});
+
+const marketStorageKey = 'sih-lite-market-quotes-v1';
+const MARKET_NAME = 'Inscribed Mecha Boots of Travel Mk III';
+const marketOk = (price = '$1.10') => ok({ success: true, lowest_price: price, median_price: '$99.99', volume: '500' });
+const marketSend = (env, names = [MARKET_NAME], extra = {}) => env.send('fetchMarketQuotes', null, { names, ...extra });
+
+test('Market quotes validate bounded exact names before any API call without requiring an owner', async () => {
+    const env = setup(async () => marketOk());
+    for (const names of [null, 'Name', [null], [''], ['x'.repeat(513)], ['Bad\nName'], ['<b>Name</b>'], ['https://bad.example/'], Array(21).fill('Name')]) {
+        const result = await marketSend(env, names);
+        assert.equal(result.success, false, JSON.stringify(names));
+    }
+    assert.equal(env.requests.length, 0);
+    const before = env.requests.length;
+    const invalid = await env.send('fetchMarketQuotes', null);
+    assert.equal(invalid.success, false);
+    assert.equal(env.requests.length, before);
+    const empty = await marketSend(env, []);
+    assert.equal(empty.success, true);
+    assert.equal(empty.data.items.length, 0);
+    assert.equal(empty.data.currency, 'USD');
+    assert.equal(env.requests.length, before);
+});
+
+test('Market request fixes Dota/USD/English, omits credentials, preserves quality and deduplicates exact names', async () => {
+    const env = setup(async () => marketOk());
+    const result = await marketSend(env, [` ${MARKET_NAME} `, MARKET_NAME, 'Autographed Wraithbinder']);
+    assert.equal(result.success, true);
+    assert.equal(result.data.items.length, 2);
+    assert.equal(result.data.errors.length, 0);
+    assert.equal(result.data.missingNames.length, 0);
+    for (let index = 0; index < env.requests.length; index++) {
+        const url = new URL(env.requests[index]);
+        assert.equal(url.origin, 'https://steamcommunity.com');
+        assert.equal(url.pathname, '/market/priceoverview/');
+        assert.equal(url.searchParams.get('appid'), '570');
+        assert.equal(url.searchParams.get('currency'), '1');
+        assert.equal(url.searchParams.get('l'), 'english');
+        assert.equal(env.requestOptions[index].credentials, 'omit');
+        assert.equal(env.requestOptions[index].method, undefined);
+    }
+    assert.equal(new URL(env.requests[0]).searchParams.get('market_hash_name'), MARKET_NAME);
+    assert.equal(new URL(env.requests[1]).searchParams.get('market_hash_name'), 'Autographed Wraithbinder');
+    const quote = result.data.items[0];
+    assert.equal(quote.marketHashName, MARKET_NAME);
+    assert.equal(quote.priceCents, 110);
+    assert.equal(quote.source, 'steam-market');
+    assert.equal(quote.currency, 'USD');
+    assert.equal(quote.estimateKind, 'market-name');
+    assert.equal(quote.cached, false);
+    assert.equal(quote.assetid, undefined);
+    assert.ok(env.requestTimes[1] - env.requestTimes[0] >= 1500);
+    assert.equal(env.tabs.created.length, 0);
+});
+
+test('Market no-quote and invalid USD fields remain missing and never use median or volume', async () => {
+    const responses = [{ success: false }, { success: true, median_price: '$5.00', volume: '90' },
+        { success: true, lowest_price: '€1.10' }, { success: true, lowest_price: '$0.00' },
+        { success: true, lowest_price: '$1,23.45' }, { success: true, lowest_price: '$1,234.56', currency: 'EUR' }, null];
+    for (const payload of responses) {
+        const env = setup(async () => ok(payload));
+        const result = await marketSend(env);
+        assert.equal(result.success, true);
+        assert.equal(result.data.items.length, 0);
+        assert.deepEqual(Array.from(result.data.missingNames), [MARKET_NAME]);
+        assert.equal(result.data.errors.length, 0);
+        assert.equal(env.requests.length, 1);
+    }
+    const env = setup(async () => marketOk('$1,234.56'));
+    assert.equal((await marketSend(env)).data.items[0].priceCents, 123456);
+});
+
+test('Market batches preserve successful quotes alongside missing names and permanent errors', async () => {
+    const env = setup(async url => {
+        const name = new URL(url).searchParams.get('market_hash_name');
+        return name === 'Good' ? marketOk('$2.50') : name === 'Unlisted' ? ok({ success: false }) : http(403);
+    });
+    const result = await marketSend(env, ['Good', 'Unlisted', 'Unavailable']);
+    assert.equal(result.success, true);
+    assert.deepEqual(Array.from(result.data.items, quote => quote.marketHashName), ['Good']);
+    assert.deepEqual(Array.from(result.data.missingNames), ['Unlisted']);
+    assert.equal(result.data.errors.length, 1);
+    assert.equal(result.data.errors[0].marketHashName, 'Unavailable');
+    assert.match(result.data.errors[0].error, /Steam Market.*403/);
+    assert.equal(env.requests.length, 3);
+});
+
+test('Market GET retries are bounded, paced, and keep successful batch rows', async () => {
+    let attempts = 0;
+    const env = setup(async url => {
+        const name = new URL(url).searchParams.get('market_hash_name');
+        if (name === MARKET_NAME && ++attempts < 3) return attempts === 1 ? http(502) : http(504);
+        return marketOk();
+    });
+    const result = await marketSend(env, [MARKET_NAME, 'Second Item']);
+    assert.equal(result.data.items.length, 2);
+    assert.equal(attempts, 3);
+    assert.equal(env.requests.length, 4);
+    for (let index = 1; index < env.requests.length; index++) assert.ok(env.requestTimes[index] - env.requestTimes[index - 1] >= 1500);
+    const failed = setup(async () => http(503));
+    const failure = await marketSend(failed);
+    assert.equal(failure.success, true);
+    assert.equal(failure.data.items.length, 0);
+    assert.match(failure.data.errors[0].error, /Steam Market.*503/);
+    assert.equal(failed.requests.length, 3);
+});
+
+test('Market network timeouts and TypeErrors retry without producing fabricated quotes', async () => {
+    for (const fetchImpl of [async () => { throw new TypeError('Offline'); }, async () => new Promise(() => {})]) {
+        const env = setup(fetchImpl, { immediateTimeout: true });
+        const result = await marketSend(env);
+        assert.equal(result.data.items.length, 0);
+        assert.equal(result.data.errors.length, 1);
+        assert.match(result.data.errors[0].error, /Steam Market/);
+        assert.equal(env.requests.length, 3);
+    }
+});
+
+test('Market 429 establishes a shared cooldown without retrying or blocking Steamprice', async () => {
+    for (const [retryAfter, cooldown] of [[undefined, 60000], ['10', 10000]]) {
+        let marketCalls = 0;
+        const env = setup(async url => {
+            if (url.includes('/market/')) return ++marketCalls === 1 ? http(429, retryAfter) : marketOk();
+            return ok({ totalValueCents: 50 });
+        });
+        const failed = await marketSend(env, [MARKET_NAME, 'Other Name', 'Third Name']);
+        assert.equal(failed.data.items.length, 0);
+        assert.equal(failed.data.errors.length, 3);
+        assert.equal(marketCalls, 1);
+        assert.match(failed.data.errors[0].error, /429/);
+        assert.match(failed.data.errors[1].error, /rate limited/);
+        const retry = await marketSend(env, [MARKET_NAME], { force: true });
+        assert.equal(retry.data.errors.length, 1);
+        assert.equal(marketCalls, 1);
+        const profile = await env.send('fetchProfile');
+        assert.equal(profile.success, true);
+        assert.equal(profile.data.totalValueCents, 50);
+        env.advance(cooldown + 1);
+        assert.equal((await marketSend(env, [MARKET_NAME], { force: true })).data.items.length, 1);
+        assert.equal(marketCalls, 2);
+    }
+});
+
+test('Market batches share per-name in-flight work across callers and forced refreshes', async () => {
+    let release;
+    const env = setup(async () => new Promise(resolve => { release = () => resolve(marketOk()); }));
+    const first = marketSend(env);
+    const second = marketSend(env, [MARKET_NAME], { force: true });
+    await env.flush();
+    assert.equal(env.requests.length, 1);
+    release();
+    const results = await Promise.all([first, second]);
+    assert.equal(results[0].data.items[0].priceCents, 110);
+    assert.equal(results[1].data.items[0].priceCents, 110);
+    assert.equal(env.requests.length, 1);
+});
+
+test('Market cache is fresh for 15 minutes, force bypasses it, and persistent rows survive worker restart', async () => {
+    const stored = { unrelated: 'keep' };
+    const env = setup(async (_, __, count) => marketOk(`$${count}.00`), { stored });
+    const first = await marketSend(env);
+    assert.equal(first.data.items[0].cached, false);
+    const cachedAt = env.currentTime;
+    env.advance(899999);
+    const fresh = await marketSend(env);
+    assert.equal(fresh.data.items[0].cached, true);
+    assert.equal(fresh.data.items[0].cachedAt, cachedAt);
+    assert.equal(env.requests.length, 1);
+    const forced = await marketSend(env, [MARKET_NAME], { force: true });
+    assert.equal(forced.data.items[0].cached, false);
+    assert.equal(forced.data.items[0].priceCents, 200);
+    await env.flush();
+    const restarted = setup(async () => { throw new Error('Cache expected'); }, { stored, now: env.currentTime });
+    const restored = await marketSend(restarted);
+    assert.equal(restored.data.items[0].cached, true);
+    assert.equal(restored.data.items[0].priceCents, 200);
+    assert.equal(restarted.requests.length, 0);
+    assert.equal(stored.unrelated, 'keep');
+    assert.ok(stored[marketStorageKey]);
+    assert.equal(stored[cacheKey], undefined);
+});
+
+test('unquoted Market names use only a short negative cache and force can refresh them', async () => {
+    let available = false;
+    const env = setup(async () => available ? marketOk() : ok({ success: false }));
+    assert.equal((await marketSend(env)).data.missingNames.length, 1);
+    available = true;
+    assert.equal((await marketSend(env)).data.missingNames.length, 1);
+    assert.equal(env.requests.length, 1);
+    const forced = await marketSend(env, [MARKET_NAME], { force: true });
+    assert.equal(forced.data.items.length, 1);
+    assert.equal(env.requests.length, 2);
+    const missing = setup(async () => ok({ success: false }));
+    await marketSend(missing);
+    missing.advance(90000);
+    await marketSend(missing);
+    assert.equal(missing.requests.length, 2);
+});
+
+test('Market temporary outage returns a labeled last full quote but never an expired or permanent-error quote', async () => {
+    let failure = null;
+    const env = setup(async () => failure || marketOk());
+    const live = await marketSend(env);
+    const cachedAt = env.currentTime;
+    env.advance(900000);
+    failure = http(502);
+    const stale = await marketSend(env);
+    const quote = stale.data.items[0];
+    assert.equal(quote.priceCents, live.data.items[0].priceCents);
+    assert.equal(quote.cached, true);
+    assert.equal(quote.cachedAt, cachedAt);
+    assert.match(quote.error, /502/);
+    assert.match(stale.data.errors[0].error, /502/);
+    failure = http(403);
+    assert.equal((await marketSend(env, [MARKET_NAME], { force: true })).data.items.length, 0);
+    failure = http(502);
+    env.advance(86400001);
+    assert.equal((await marketSend(env)).data.items.length, 0);
+});
+
+test('a successful no-quote response clears an old Market quote rather than silently retaining it', async () => {
+    let unavailable = false;
+    const env = setup(async () => unavailable ? ok({ success: false }) : marketOk());
+    await marketSend(env);
+    unavailable = true;
+    const result = await marketSend(env, [MARKET_NAME], { force: true });
+    assert.equal(result.data.items.length, 0);
+    assert.deepEqual(Array.from(result.data.missingNames), [MARKET_NAME]);
+    assert.equal(result.data.errors.length, 0);
+    assert.equal((await marketSend(env)).data.items.length, 0);
+});
+
+test('Market quote decoding shares one active GET slot with all Steamprice actions', async () => {
+    let release;
+    let active = 0;
+    let maximum = 0;
+    const env = setup(async url => {
+        active++;
+        maximum = Math.max(maximum, active);
+        if (url.includes('/market/')) return { ok: true, status: 200, json: async () => {
+            await new Promise(resolve => { release = resolve; });
+            active--;
+            return { success: true, lowest_price: '$1.10' };
+        } };
+        active--;
+        return ok(url.includes('/profile/') ? { totalValueCents: 2 } : url.includes('/collection/') ? collectionCatalog() : { items: [{ assetid: '1' }] });
+    });
+    const market = marketSend(env);
+    await env.flush();
+    const others = [env.send('fetchProfile'), env.send('fetchPrices'), env.send('fetchCollection')];
+    await env.flush();
+    assert.equal(env.requests.length, 1);
+    release();
+    const results = await Promise.all([market, ...others]);
+    assert.ok(results.every(result => result.success));
+    assert.equal(maximum, 1);
+    assert.equal(env.requests.length, 4);
+});
+
+test('Market cache is bounded to 128 exact names and never overwrites unrelated storage or Steamprice snapshots', async () => {
+    const stored = { unrelated: 'keep', [cacheKey]: { version: 1, entries: {} } };
+    const env = setup(async () => marketOk(), { stored });
+    for (let start = 0; start < 140; start += 20) {
+        await marketSend(env, Array.from({ length: 20 }, (_, index) => `Name ${start + index}`));
+    }
+    await env.flush();
+    const entries = stored[marketStorageKey].entries;
+    assert.equal(Object.keys(entries).length, 128);
+    assert.equal(entries['Name 0'], undefined);
+    assert.ok(entries['Name 139']);
+    assert.equal(stored.unrelated, 'keep');
+    assert.deepEqual(stored[cacheKey], { version: 1, entries: {} });
+});
+
+test('persisted Market cache rejects wrong source/currency/identity/timestamps and discards extra fields', async () => {
+    const now = 1800000000000;
+    const base = { quote: { marketHashName: MARKET_NAME, priceCents: 123, currency: 'USD', source: 'steam-market', estimateKind: 'market-name' }, cachedAt: now, usedAt: now };
+    for (const patch of [{ cachedAt: now + 1 }, { cachedAt: now - 86400001 },
+        { quote: { ...base.quote, currency: 'EUR' } }, { quote: { ...base.quote, source: 'steamprice' } },
+        { quote: { ...base.quote, marketHashName: 'Mecha Boots of Travel Mk III' } },
+        { quote: { ...base.quote, priceCents: 0 } }]) {
+        const stored = { [marketStorageKey]: { version: 1, entries: { [MARKET_NAME]: { ...base, ...patch } } } };
+        const env = setup(async () => marketOk(), { stored, now });
+        assert.equal((await marketSend(env)).data.items[0].cached, false);
+        assert.equal(env.requests.length, 1);
+    }
+    const stored = { [marketStorageKey]: { version: 1, entries: { [MARKET_NAME]: { ...base, quote: { ...base.quote, assetid: '123', cookie: 'not-real' } } } } };
+    const env = setup(async () => { throw new Error('Must use sanitized cache'); }, { stored, now });
+    const quote = (await marketSend(env)).data.items[0];
+    assert.equal(quote.cached, true);
+    assert.equal(quote.assetid, undefined);
+    assert.equal(quote.cookie, undefined);
+    assert.equal(env.requests.length, 0);
+});
+
+test('Market storage failures leave live quotes and their memory cache usable', async () => {
+    for (const options of [{ storage: false }, { getError: true }, { setError: true }]) {
+        const env = setup(async () => marketOk(), options);
+        assert.equal((await marketSend(env)).data.items[0].cached, false);
+        await env.flush();
+        assert.equal((await marketSend(env)).data.items[0].cached, true);
+        assert.equal(env.requests.length, 1);
+    }
+});
+
+test('Market service Retry-After is respected without freezing cash loading or probing other names', async () => {
+    let marketAttempts = 0;
+    const env = setup(async url => url.includes('/market/')
+        ? ++marketAttempts === 1 ? http(503, '2') : marketOk()
+        : ok({ totalValueCents: 1 }));
+    const successful = await marketSend(env);
+    assert.equal(successful.data.items.length, 1);
+    assert.ok(env.requestTimes[1] - env.requestTimes[0] >= 2000);
+    const long = setup(async url => url.includes('/market/') ? http(503, '60') : ok({ totalValueCents: 2 }));
+    const result = await marketSend(long, [MARKET_NAME, 'Another Item']);
+    assert.equal(result.data.errors.length, 2);
+    assert.equal(long.requests.length, 1);
+    assert.match(result.data.errors[1].error, /temporarily unavailable/);
+    assert.equal((await long.send('fetchProfile')).data.totalValueCents, 2);
+});
+
+test('a stale Market quote survives a queued operation deadline with explicit cache metadata', async () => {
+    const now = 1800000000000;
+    const stored = { [marketStorageKey]: { version: 1, entries: { [MARKET_NAME]: {
+        quote: { marketHashName: MARKET_NAME, priceCents: 500, currency: 'USD', source: 'steam-market', estimateKind: 'market-name' },
+        cachedAt: now - 1200000, usedAt: now - 1200000
+    } } } };
+    let release;
+    const env = setup(async () => new Promise(resolve => { release = () => resolve(marketOk()); }), {
+        stored, now, timerDelay: ms => ms === 180000 ? 0 : undefined
+    });
+    const held = marketSend(env, ['Held Item']);
+    await env.flush();
+    const result = await marketSend(env);
+    assert.equal(result.data.items.length, 1);
+    assert.equal(result.data.items[0].priceCents, 500);
+    assert.equal(result.data.items[0].cached, true);
+    assert.equal(result.data.items[0].cachedAt, now - 1200000);
+    assert.match(result.data.items[0].error, /timed out/);
+    assert.equal(result.data.errors.length, 1);
+    assert.equal(env.requests.length, 1);
+    release();
+    await held;
+    const refreshed = marketSend(env, [MARKET_NAME], { force: true });
+    await env.flush();
+    assert.equal(env.requests.length, 2);
+    release();
+    assert.equal((await refreshed).data.items[0].cached, false);
+});
+
+test('Steamprice Retry-After cannot block a healthy Market quote while all cash owners retain their cooldown', async () => {
+    const env = setup(async url => url.includes('/market/') ? marketOk() : http(429, '120'), {
+        timerDelay: ms => ms === 30000 ? 5 : undefined
+    });
+    const first = await env.send('fetchProfile');
+    assert.equal(first.success, false);
+    assert.equal(env.requests.length, 1);
+    const queuedCash = env.send('fetchProfile', owner(1));
+    const market = await marketSend(env);
+    assert.equal(market.data.items.length, 1);
+    const marketIndex = env.requests.findIndex(url => url.includes('/market/'));
+    assert.equal(marketIndex, 1, 'ready Market request bypasses a cash owner in provider cooldown');
+    assert.ok(env.requestTimes[marketIndex] - env.requestTimes[0] < 120000);
+    env.advance(120000);
+    const cash = await queuedCash;
+    assert.equal(cash.success, false);
+    assert.ok(env.requestTimes[2] - env.requestTimes[0] >= 120000);
 });

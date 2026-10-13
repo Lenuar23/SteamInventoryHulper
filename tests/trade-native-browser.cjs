@@ -139,6 +139,7 @@ const HTML = `<!doctype html><html><head><style>
       });
     }, { me: ME, them: THEM });
     await page.addScriptTag({ path: path.join(__dirname, '..', 'gems.js') });
+    await page.addScriptTag({ path: path.join(__dirname, '..', 'trade-prices.js') });
     await page.addScriptTag({ path: path.join(__dirname, '..', 'trade-inject.js') });
 
     async function editor() {
@@ -365,7 +366,7 @@ const HTML = `<!doctype html><html><head><style>
         marketHashName: `Item ${index}`, priceCents: (index + 1) * 100 })),
       [THEM]: Array.from({ length: 35 }, (_, index) => ({ assetid: String(3000 + index),
         marketHashName: index < 2 ? 'Shared Wearable' : `Item ${index}`, priceCents: index === 0 ? 3000 : 200 + index,
-        ...(index === 0 ? { prismaticGems: ['Bright Green'] } : {}) })).filter(item => item.assetid !== '3001')
+        ...(index === 0 ? { prismaticGems: ['Bright Green'] } : {}) })).filter(item => !['3001', '3015'].includes(item.assetid))
     };
     await isolated(`window.fixtureRuntimeRequests = []; window.chrome = { runtime: {
       sendMessage(request, callback) {
@@ -373,7 +374,9 @@ const HTML = `<!doctype html><html><head><style>
         const prices = ${JSON.stringify(priceData)};
         const totals = ${JSON.stringify({ [ME]: 12345, [THEM]: 54321 })};
         const data = request.action === 'fetchPrices' ? { items: prices[request.steamId] || [] }
-          : { totalValueCents: totals[request.steamId] };
+          : request.action === 'fetchMarketQuotes' ? { currency: 'USD', errors: [], missingNames: [], items: request.names.map(name => ({
+            marketHashName: name, priceCents: 209, currency: 'USD', source: 'steam-market', estimateKind: 'market-name'
+          })) } : { totalValueCents: totals[request.steamId] };
         setTimeout(() => callback({ success: true, data }), 0);
       }
     }}; window.fetch = () => { throw new Error('Trade smoke must not call a real endpoint.'); };`);
@@ -412,6 +415,40 @@ const HTML = `<!doctype html><html><head><style>
     await page.locator('#sih-lite-trade-inventory-panel [data-trade-order="original"]').click();
     await page.locator('#sih-lite-trade-inventory-panel [data-role="inventory-status"]').filter({ hasText: 'Steam order restored.' }).waitFor();
     assert.deepEqual(await ids('me'), Array.from({ length: 40 }, (_, i) => String(1000 + i)));
+
+    // A market-name estimate values an offered ordinary Inscribed item only.
+    // Its price never enters inventory badges, full totals, or native sort maps.
+    const inscribedHead = JSON.parse(fs.readFileSync(path.join(__dirname, 'fixtures', 'steam-inscribed-demon-eater-head.json'), 'utf8'));
+    await page.evaluate(description => {
+      const oldItem = fixtureInventories.them.rgInventory['3015'];
+      const item = { ...oldItem, ...description, id: oldItem.id, appid: 570, contextid: '2' };
+      fixtureInventories.them.rgInventory[item.id] = item;
+      item.element.rgItem = item;
+      item.homeElement.rgItem = item;
+      TradePageSelectInventory(UserThem, 570, '2');
+      fixtureInventories.them.SetActivePage(0);
+      item.element.dispatchEvent(new MouseEvent('dblclick', { bubbles: true, cancelable: true }));
+    }, inscribedHead);
+    await page.locator('#sih-lite-trade-editor-summary [data-role="receive"]').filter({ hasText: '$2.09 (estimated)' }).waitFor();
+    assert.equal(await page.locator('#their_slots .item[data-sih-trade-asset="3015"] .sih-lite-trade-price').textContent(), '~$2.09');
+    assert.match(await page.locator('#their_slots .item[data-sih-trade-asset="3015"] .sih-lite-trade-price').getAttribute('title'), /Steam Market.*estimate/i);
+    assert.equal(await page.locator('#sih-lite-trade-inventory-panel [data-role="inventory-them"]').textContent(), 'Partner Dota 2 inventory: $543.21');
+    const marketRequests = (await isolated('fixtureRuntimeRequests')).filter(request => request.action === 'fetchMarketQuotes');
+    assert.equal(marketRequests.length, 1);
+    assert.deepEqual(marketRequests[0].names, ['Inscribed Demon Eater - Head']);
+    assert.equal('steamId' in marketRequests[0], false);
+    await page.evaluate(() => fixtureInventories.them.rgInventory['3015'].element.dispatchEvent(
+      new MouseEvent('dblclick', { bubbles: true, cancelable: true })));
+    await page.locator('#sih-lite-trade-editor-summary [data-role="receive"]').filter({ hasText: 'You receive: $0.00' }).waitFor();
+    await editor();
+    assert.equal(await page.locator('#inventories .item[data-sih-trade-asset="3015"] .sih-lite-trade-price').count(), 0);
+    await page.locator('#sih-lite-trade-inventory-panel [data-trade-order="desc"]').click();
+    await page.locator('#sih-lite-trade-inventory-panel [data-role="inventory-status"]').filter({ hasText: 'Sorted 35 items.' }).waitFor();
+    assert.deepEqual((await ids('them')).slice(-2).sort(), ['3001', '3015'], 'market-only item remains among unpriced inventory holders');
+    const latestSort = (await page.evaluate(() => fixtureMessages)).filter(message => message.type === 'SORT_RESULT').at(-1);
+    assert.equal(latestSort.success, true);
+    assert.equal((await isolated('fixtureRuntimeRequests')).filter(request => request.action === 'fetchMarketQuotes').length, 1,
+      'native inventory sorting never fetches market estimates');
 
     assert.deepEqual(errors, [], 'Official native scripts and the bridge raised no browser errors');
     console.log('PASS: official legacy Steam trade scripts: both owners, native pagination/filtering/sort restoration, preserved drag/double-click callbacks, offered-node identity, stack amounts, pending sort with complete more/start loading, safe gem pricing; real isolated UI owner prices/profile, native offer updates and sort buttons.');

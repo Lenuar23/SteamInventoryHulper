@@ -101,7 +101,10 @@
         const ownerSteamId = steamId(user);
         const count = quantity(amount === undefined ? asset?.amount : amount);
         const key = [side, ownerSteamId, String(app), String(context), assetId(asset), count,
-            desc.market_hash_name, desc.market_name, desc.name, desc.tradable, desc.marketable];
+            desc.market_hash_name, desc.marketHashName, desc.market_name, desc.name, desc.tradable, desc.marketable,
+            desc.appid, desc.classid, desc.instanceid, desc.name_color, desc.type, desc.tags,
+            desc.styles, desc.styleTotal, desc.styleUnlocked, desc.allStylesUnlocked, desc.hasColoredGem,
+            desc.prismaticGems, desc.etherealGems];
         const cached = asset && typeof asset === 'object' ? itemSnapshots.get(asset) : null;
         if (cached && cached.description === desc && cached.descriptions === desc.descriptions &&
             key.every((value, index) => cached.key[index] === value)) return cached.data;
@@ -116,6 +119,8 @@
             if ([true, 1, '1'].includes(desc[field])) data[field] = true;
             else if ([false, 0, '0'].includes(desc[field])) data[field] = false;
         }
+        const market = globalThis.SIHLiteTradePrices?.marketFingerprint({ ownerSteamId, appId: String(app), contextId: String(context), description: desc });
+        if (market) data.marketFingerprint = market;
         if (asset && typeof asset === 'object') itemSnapshots.set(asset, { key, description: desc, descriptions: desc.descriptions, data });
         return data;
     }

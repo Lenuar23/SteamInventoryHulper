@@ -55,6 +55,32 @@
         return { present: true, cents: null, invalid: true };
     }
 
+    function marketQuoteInfo(map, key) {
+        if (!key || !(map instanceof Map) || !map.has(key)) return null;
+        const value = map.get(key);
+        if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+        const name = typeof value.marketHashName === 'string' && value.marketHashName.trim().length > 0 &&
+            value.marketHashName.trim().length <= 512 && !/[\u0000-\u001f\u007f]/.test(value.marketHashName)
+            ? value.marketHashName.trim().toLowerCase() : null;
+        return {
+            marketHashName: name,
+            priceCents: Number.isSafeInteger(value.priceCents) && value.priceCents > 0 ? value.priceCents : null,
+            source: value.source === 'steam-market' ? value.source : null,
+            currency: value.currency === 'USD' ? value.currency : null,
+            estimateKind: value.estimateKind === 'market-name' ? value.estimateKind : null,
+            cached: value.cached === true,
+            cachedAt: Number.isSafeInteger(value.cachedAt) && value.cachedAt >= 0 ? value.cachedAt : null,
+            error: safeError(value.error)
+        };
+    }
+
+    function marketMatch(map, key, quote) {
+        if (!key || !(map instanceof Map) || !map.has(key)) return { present: false };
+        if (quote?.priceCents !== null && quote?.priceCents !== undefined && quote.source === 'steam-market' &&
+            quote.currency === 'USD' && quote.estimateKind === 'market-name' && quote.marketHashName === key) return { present: true, cents: quote.priceCents };
+        return { present: true, cents: null, invalid: true };
+    }
+
     function canonicalName(item) {
         const value = item?.marketHashName || item?.market_hash_name || item?.description?.market_hash_name;
         return typeof value === 'string' && value.trim().length > 0 && value.trim().length <= 512
@@ -80,6 +106,10 @@
                 if (parts.length !== 3 || parts[1] !== 'standard' || !name || parts[2] !== name) return null;
             } else if (kind === 'catalog-v1') {
                 if (parts.length !== 3 || !name || parts[1] !== name || !['standard', 'genuine'].includes(parts[2])) return null;
+            } else if (kind === 'steam-market-v1') {
+                const quality = /^(genuine|inscribed|autographed)\s+\S/.exec(name)?.[1] || 'standard';
+                if (parts.length !== 3 || !name || parts[1] !== name || parts[2] !== quality ||
+                    /^(?:unusual|corrupted|frozen|heroic|cursed|favored|ascent|elder|exalted|infused|auspicious|base|legacy|sealed)\s+/i.test(name)) return null;
             }
             return JSON.stringify(parts);
         } catch (_) { return null; }
@@ -138,6 +168,13 @@
         };
     }
 
+    function marketReason(record) {
+        if (!record.market.eligible) return null;
+        if (record.market.state === 'loading') return { code: 'steam-market-loading' };
+        if (record.market.state === 'error') return { code: 'steam-market-error' };
+        return { code: 'steam-market-no-quote' };
+    }
+
     function reasonFor(record, ctx, data) {
         const { identity: id, flags, matches, fingerprints, price, classProof } = record;
         if (price.cents !== null) return { code: record.amount === null ? 'invalid-quantity' : 'price-known' };
@@ -161,7 +198,7 @@
         if (!id.market_hash_name) return { code: 'missing-canonical-name' };
         if (matches.variant.present) return { code: matches.variant.invalid ? 'variant-price-invalid'
             : matches.variant.cents === null ? 'variant-price-conflict' : 'variant-match-unverified' };
-        if (flags.hasGems || flags.hasColoredGem || /\b(?:fractal horns of inner abysm|baby roshan|jumo)\b/i.test(id.market_hash_name)) {
+        if (!record.market.eligible && (flags.hasGems || flags.hasColoredGem || /\b(?:fractal horns of inner abysm|baby roshan|jumo)\b/i.test(id.market_hash_name))) {
             return { code: classProof.present && classProof.count === 0 ? 'class-owner-assets-absent'
                 : (fingerprints.variant.provided || fingerprints.variant.computed) ? 'variant-owner-price-missing' : 'gem-variant-unverified' };
         }
@@ -169,9 +206,11 @@
             : matches.ownerName.cents === null ? 'owner-name-price-conflict' : 'owner-name-match-unverified' };
         if (matches.ordinary.present) return { code: matches.ordinary.invalid ? 'pooled-ordinary-price-invalid'
             : matches.ordinary.cents === null ? 'pooled-ordinary-price-conflict' : 'pooled-ordinary-match-unverified' };
-        if (!(fingerprints.catalog.provided || fingerprints.catalog.computed)) return { code: 'catalog-eligibility-unverified' };
+        if (!(fingerprints.catalog.provided || fingerprints.catalog.computed)) return marketReason(record) || { code: 'catalog-eligibility-unverified' };
         if (matches.catalog.present) return { code: matches.catalog.invalid ? 'catalog-price-invalid'
             : matches.catalog.cents === null ? 'catalog-price-conflict' : 'catalog-match-unverified' };
+        const missingMarket = marketReason(record);
+        if (missingMarket) return missingMarket;
         if (ctx.collection?.state === 'loading') return { code: 'collection-loading' };
         if (ctx.collection?.state === 'error') return { code: 'collection-error' };
         if (ctx.collection?.state !== 'ready') return { code: 'collection-not-requested' };
@@ -182,7 +221,8 @@
         const id = identity(item);
         const data = ctx.owners instanceof Map ? ctx.owners.get(id.ownerSteamId) : null;
         const fingerprints = {};
-        for (const [name, kind, method] of [['variant', 'tb-v1', 'variantFingerprint'], ['ordinary', 'ordinary-v1', 'ordinaryFingerprint'], ['catalog', 'catalog-v1', 'catalogFingerprint']]) {
+        for (const [name, kind, method] of [['variant', 'tb-v1', 'variantFingerprint'], ['ordinary', 'ordinary-v1', 'ordinaryFingerprint'],
+            ['catalog', 'catalog-v1', 'catalogFingerprint'], ['market', 'steam-market-v1', 'marketFingerprint']]) {
             fingerprints[name] = {
                 provided: fingerprint(item?.[method], kind, id.market_hash_name),
                 computed: computedFingerprint(item, method, kind, id.market_hash_name)
@@ -195,18 +235,25 @@
                 ? id.ownerSteamId + ':' + (fingerprints.variant.provided || fingerprints.variant.computed) : null,
             ordinary: fingerprints.ordinary.provided || fingerprints.ordinary.computed,
             catalog: id.market_hash_name || null,
+            market: id.market_hash_name || null,
             class: id.ownerSteamId && id.classId && id.instanceId ? id.ownerSteamId + ':' + id.classId + ':' + id.instanceId : null
         };
+        const marketQuote = marketQuoteInfo(ctx.marketEstimates, keys.market);
+        const marketState = stateInfo(ctx.marketStates instanceof Map ? ctx.marketStates.get(keys.market) : null);
+        // The price helper verifies both full descriptions and reduced proofs;
+        // diagnostic eligibility must use the same decision as the actual quote.
+        const marketEligible = Boolean(fingerprints.market.computed);
         const matches = {
             asset: mapMatch(data?.index?.assetPrices, keys.asset),
             ownerName: mapMatch(data?.index?.exactNames, keys.ownerName),
             variant: mapMatch(data?.index?.variants, keys.variant),
             ordinary: mapMatch(ctx.ordinaryEstimates, keys.ordinary),
             catalog: mapMatch(ctx.collection?.index, keys.catalog),
+            market: marketMatch(ctx.marketEstimates, keys.market, marketQuote),
             class: mapMatch(ctx.classEstimates, keys.class)
         };
         let result;
-        try { result = Prices?.getPrice(data?.index, item, ctx.ordinaryEstimates, ctx.collection?.index, ctx.classEstimates); }
+        try { result = Prices?.getPrice(data?.index, item, ctx.ordinaryEstimates, ctx.collection?.index, ctx.classEstimates, ctx.marketEstimates); }
         catch (_) { result = null; }
         const amount = quantity(item);
         const cents = Number.isSafeInteger(result?.cents) && result.cents >= 0 ? result.cents : null;
@@ -216,10 +263,12 @@
                 hasGems: item?.hasGems === true, hasColoredGem: item?.hasColoredGem === true,
                 isCurrency: item?.isCurrency === true || item?.is_currency === true },
             fingerprints, keys, matches,
+            market: { ...marketState, eligible: marketEligible, quote: marketQuote },
             classProof: proofInfo(ctx.classAssetProofs, keys.class, data?.index?.assetPrices, id.ownerSteamId),
             price: { cents, source: boundedText(result?.source, 40) || 'unknown',
                 totalCents: cents !== null && amount !== null && Number.isSafeInteger(cents * amount) ? cents * amount : null }
         };
+        if (report.price.source === 'steam-market') report.price.currency = marketQuote?.currency || null;
         if (counterpart) report.cardIdentity = identity(counterpart);
         report.reason = reasonFor(report, ctx, data);
         return report;
@@ -230,7 +279,7 @@
             tradable: flag(item, 'tradable'), marketable: flag(item, 'marketable'),
             hasGems: item?.hasGems === true, hasColoredGem: item?.hasColoredGem === true,
             variantFingerprint: item?.variantFingerprint, ordinaryFingerprint: item?.ordinaryFingerprint,
-            catalogFingerprint: item?.catalogFingerprint });
+            catalogFingerprint: item?.catalogFingerprint, marketFingerprint: item?.marketFingerprint });
     }
 
     function buildReport(ctx = {}) {
@@ -255,7 +304,7 @@
         }
         const ownerIds = [...new Set([ownerId(offer.meSteamId), ownerId(offer.partnerSteamId)].filter(Boolean))];
         return {
-            schemaVersion: 1,
+            schemaVersion: 2,
             version: typeof ctx.version === 'string' && /^\d+\.\d+\.\d+(?:\.\d+)?$/.test(ctx.version) ? ctx.version : 'unknown',
             pathname: typeof ctx.pathname === 'string' && ctx.pathname.startsWith('/')
                 ? boundedText(ctx.pathname.split(/[?#]/)[0], 256) : '',

@@ -49,6 +49,10 @@ function harness(items = [asset(1, 'Plain')], options = {}) {
             }));
         }
     }
+    if (options.marketProofs) {
+        window.SIHLiteGems = require('../gems.js');
+        window.SIHLiteTradePrices = require('../trade-prices.js');
+    }
     const prototype = options.prototypeValues ? 'Object.values = function(object) { const result = []; for (const key in object) result.push(object[key]); return result; };' : '';
     vm.runInNewContext(prototype + bridge, { window, document, globalThis: window });
     const send = (data, event = {}) => listeners.get('message')({ source: window, origin: window.location.origin, ...event,
@@ -122,6 +126,31 @@ test('nonmarketable copies and missing canonical names cannot borrow trade sorti
     const updated = h.state();
     assert.equal(updated.inventories[0].items.find(item => item.assetId === '1').marketable, true,
         'metadata cache must notice marketability changes');
+});
+
+test('native editor publishes compact verified Market proofs and drops them when eligibility changes', async () => {
+    const description = structuredClone(require('./fixtures/steam-inscribed-demon-eater-head.json'));
+    const original = asset(1, description.market_hash_name, { description });
+    const h = harness([original, asset(2, 'Plain')], { marketProofs: true });
+    h.window.g_rgCurrentTradeStatus.me.assets = [{ appid: 570, contextid: '2', assetid: '1', amount: 2 }];
+    const proof = require('../trade-prices.js').marketFingerprint(description);
+    let state = h.state();
+    assert.equal(state.offers.me[0].marketFingerprint, proof);
+    assert.equal(state.offers.me[0].amount, 2);
+    assert.equal(state.offers.me[0].marketable, true);
+    assert.ok(!JSON.stringify(state).includes('/econ/sockets/'), 'native socket HTML never crosses the page bridge');
+    assert.ok(!Object.hasOwn(state.offers.me[0], 'description'));
+    h.sort({ prices: { assetPrices: [['2', 100]], namePrices: [['inscribed demon eater - head', 9999]] } });
+    await flush();
+    assert.deepEqual(h.own.rgItemElements.map(holder => holder.rgItem.id), ['2', '1'], 'Market proof does not enter native inventory price sorting');
+    description.styleTotal = 2;
+    state = h.state();
+    assert.equal(state.offers.me[0].marketFingerprint, undefined, 'metadata cache notices newly supplied style metadata');
+    delete description.styleTotal;
+    description.marketable = 0;
+    state = h.state();
+    assert.equal(state.offers.me[0].marketFingerprint, undefined);
+    assert.equal(state.offers.me[0].marketable, false);
 });
 
 test('pending native replacement loads fully, reports owner progress and rejects a concurrent sort', async () => {

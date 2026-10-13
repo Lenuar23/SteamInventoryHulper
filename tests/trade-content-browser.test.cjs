@@ -1,4 +1,5 @@
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
 const path = require('node:path');
 const { before, after, test } = require('node:test');
 const { chromium } = require('playwright');
@@ -134,6 +135,7 @@ async function openFixture(t, options = {}) {
         } });
         window.__tradeSnapshot = config.snapshot;
         window.__sortReply = config.sortReply || { success: true, count: 4 };
+        for (const id of config.hiddenOfferIds || []) document.getElementById('tradeofferid_' + id)?.style.setProperty('margin-top', '2000px');
         const callCounts = new Map();
         window.chrome = { runtime: {
             lastError: undefined,
@@ -147,7 +149,11 @@ async function openFixture(t, options = {}) {
                     success: true, data: request.action === 'fetchPrices'
                         ? { items: config.prices[request.steamId] || [] }
                         : request.action === 'fetchCollection' ? { items: config.collection || [] }
-                            : { totalValueCents: config.totals[request.steamId] ?? '0' }
+                            : request.action === 'fetchMarketQuotes' ? {
+                                items: (config.marketQuotes || []).filter(quote => request.names.includes(quote.marketHashName)),
+                                missingNames: request.names.filter(name => !(config.marketQuotes || []).some(quote => quote.marketHashName === name)),
+                                errors: [], currency: 'USD'
+                            } : { totalValueCents: config.totals[request.steamId] ?? '0' }
                 };
                 if (response?.hold) window.__pendingResponses.push({ request, callback });
                 else setTimeout(() => callback(response), 0);
@@ -194,9 +200,11 @@ async function openFixture(t, options = {}) {
         totals: options.totals || { [OWNER]: '12345', [PARTNER]: '67890', [THIRD_OWNER]: '54321' },
         plans: options.plans, sortReply: options.sortReply,
         collection: options.collection,
+        marketQuotes: options.marketQuotes,
         fetchPlans: options.fetchPlans, sessionId: options.sessionId === undefined ? 'fixture_session_123' : options.sessionId,
         monitorWork: options.monitorWork === true,
-        clipboardFailure: options.clipboardFailure === true
+        clipboardFailure: options.clipboardFailure === true,
+        hiddenOfferIds: options.hiddenOfferIds
     });
     for (const file of ['gems.js', 'trade-prices.js', 'trade-offers.js', 'trade-accept.js', 'trade-diagnostics.js', 'trade-content.js']) {
         await page.addScriptTag({ path: path.join(__dirname, '..', file) });
@@ -1085,6 +1093,153 @@ function currentClassInventory(assets, extra = {}) {
     return { success: 1, assets, total_inventory_count: assets.length, more_items: 0, ...extra };
 }
 
+function nativeMarketFixture(name) {
+    return JSON.parse(fs.readFileSync(path.join(__dirname, 'fixtures', name), 'utf8'));
+}
+
+function nativeMarketHoverPlans(descriptions) {
+    return Object.fromEntries(descriptions.map(description => [
+        `https://steamcommunity.com/economy/itemclasshover/570/${description.classid}/${description.instanceid}?content_only=1&l=english`,
+        [{ text: `<script>BuildHover('economy_item_fixture', ${JSON.stringify(description)});</script>` }]
+    ]));
+}
+
+function marketClassItem(description, amount = '1') {
+    return item(PARTNER, null, '', amount, { classId: String(description.classid), instanceId: String(description.instanceid) });
+}
+
+function marketQuote(name, cents, extra = {}) {
+    return { marketHashName: name, priceCents: cents, currency: 'USD', source: 'steam-market', estimateKind: 'market-name', ...extra };
+}
+
+test('the five reported historical classes use full Steam Market names and share labeled USD quotes across visible offers', async t => {
+    const examples = [
+        ['steam-inscribed-demon-eater-head.json', 209], ['steam-inscribed-demon-eater.json', 1777],
+        ['steam-inscribed-mecha-boots-travel.json', 110], ['steam-autographed-wraithbinder.json', 119],
+        ['steam-inscribed-arms-of-desolation.json', 972]
+    ].map(([file, cents]) => ({ description: nativeMarketFixture(file), cents }));
+    const descriptions = examples.map(example => example.description);
+    const snapshot = listSnapshot([
+        listOffer('650', { active: false, give: [item(OWNER, '100', 'Your Exact Cash Item')], receive: descriptions.map(description => marketClassItem(description)) }),
+        listOffer('651', { active: false, give: [], receive: [marketClassItem(descriptions[0], '2')] }),
+        listOffer('652', { active: false, give: [], receive: [item(PARTNER, null, '', '1', { classId: '65000', instanceId: '0' })] })
+    ]);
+    const page = await openList(t, { snapshot, hiddenOfferIds: ['652'],
+        url: `https://steamcommunity.com/profiles/${OWNER}/tradeoffers/?token=private_market_url_token`, sessionId: 'private_market_cookie',
+        prices: { [OWNER]: [{ assetid: '100', marketHashName: 'Your Exact Cash Item', priceCents: 6023 }],
+            [PARTNER]: [{ assetid: '7999', marketHashName: 'Unrelated Current Item', priceCents: 100 }] },
+        marketQuotes: examples.map(example => marketQuote(example.description.market_hash_name, example.cents)),
+        fetchPlans: { ...nativeMarketHoverPlans(descriptions),
+            [`https://steamcommunity.com/inventory/${PARTNER}/570/2/?l=english&count=2000`]: [{ data: currentClassInventory([]) }] }
+    });
+    await waitText(listBadge(page, 'give', 0, '650'), '$60.23');
+    for (let index = 0; index < examples.length; index++) {
+        await waitText(listBadge(page, 'receive', index, '650'), '~$' + (examples[index].cents / 100).toFixed(2));
+        assert.match(await listBadge(page, 'receive', index, '650').getAttribute('title'), /Steam Market USD estimate.*exact market name.*wallet prices may differ from cash/i);
+        assert.equal(await listBadge(page, 'receive', index, '650').evaluate(element => element.classList.contains('sih-lite-trade-market-price')), true);
+    }
+    await waitText(listBadge(page, 'receive', 0, '651'), '~$4.18');
+    assert.equal(await offerSummary(page, '650').locator('[data-role="give"]').textContent(), 'You give: $60.23');
+    assert.equal(await offerSummary(page, '650').locator('[data-role="receive"]').textContent(), 'You receive: $31.87 (estimated)');
+    assert.equal(await offerSummary(page, '650').locator('[data-role="net"]').textContent(), 'Estimated loss: −$28.36');
+    assert.match(await offerSummary(page, '650').locator('[data-role="status"]').textContent(), /Includes 5 Steam Market USD listing estimates/);
+    assert.equal(await offerSummary(page, '651').locator('[data-role="receive"]').textContent(), 'You receive: $4.18 (estimated)');
+    assert.match(await listBadge(page, 'receive', 0, '650').getAttribute('title'), /\$2\.09 each/,
+        'the Head suffix must never borrow the full Demon Eater price');
+    const requests = await page.evaluate(() => window.__chromeRequests.filter(request => request.action === 'fetchMarketQuotes'));
+    assert.ok(requests.length <= 2, 'the single-class offer can finish before the remaining serialized class hovers');
+    assert.deepEqual(requests.flatMap(request => request.names).sort(), descriptions.map(description => description.market_hash_name).sort(),
+        'each exact full name is quoted once even when multiple offers use it');
+    assert.ok(requests.every(request => !('steamId' in request) && request.force === false && request.names.length <= 20));
+    assert.equal((await page.evaluate(() => window.__fetchRequests)).some(request => request.url.includes('/65000/')), false,
+        'an offscreen offer starts no class or market requests');
+    const before = await page.evaluate(() => ({ steam: window.__fetchRequests.length, runtime: window.__chromeRequests.length }));
+    await offerSummary(page, '650').locator('.sih-lite-trade-diagnostics').click();
+    await waitText(offerSummary(page, '650').locator('[data-role="diagnostics-status"]'), 'Price diagnostics copied.');
+    const copied = await page.evaluate(() => window.__copiedDiagnostics.at(-1)), report = JSON.parse(copied);
+    assert.equal(report.schemaVersion, 2);
+    const received = report.items.filter(record => record.location.startsWith('summary.receive'));
+    assert.equal(received.length, 5);
+    for (const [index, record] of received.entries()) {
+        assert.equal(record.identity.assetId, null);
+        assert.equal(record.identity.classId, String(descriptions[index].classid));
+        assert.equal(record.flags.marketable, true);
+        assert.equal(record.flags.hasColoredGem, false);
+        assert.equal(record.price.source, 'steam-market');
+        assert.equal(record.price.currency, 'USD');
+        assert.equal(record.market.quote.estimateKind, 'market-name');
+        assert.equal(record.market.quote.priceCents, examples[index].cents);
+        assert.equal(record.keys.market, descriptions[index].market_hash_name.toLowerCase());
+        assert.equal(record.classProof.count, 0);
+    }
+    assert.doesNotMatch(copied, /private_market|sessionid|token=|cookie|\?/i);
+    assert.deepEqual(await page.evaluate(() => ({ steam: window.__fetchRequests.length, runtime: window.__chromeRequests.length })), before);
+    assert.equal(await page.locator('#list_650_receive_0').getAttribute('data-economy-item'),
+        `classinfo/570/${descriptions[0].classid}/${descriptions[0].instanceid}/a:1`);
+});
+
+test('a failed full-name quote stays unknown until manual retry recovers a labeled cached USD estimate with stack quantity', async t => {
+    const description = nativeMarketFixture('steam-inscribed-demon-eater-head.json');
+    const snapshot = listSnapshot([listOffer('653', { active: false,
+        give: [item(OWNER, '100', 'Shared Item')], receive: [marketClassItem(description, '2')] })]);
+    const page = await openList(t, { snapshot,
+        prices: { [OWNER]: DEFAULT_PRICES[OWNER], [PARTNER]: [{ assetid: '7999', marketHashName: 'Unrelated Item', priceCents: 100 }] },
+        plans: { fetchMarketQuotes: [
+            { success: false, error: 'Steam Market returned HTTP 429.' },
+            { success: true, data: { currency: 'USD', errors: [], missingNames: [], items: [marketQuote(description.market_hash_name, 209,
+                { cached: true, cachedAt: Date.now(), error: 'Steam Market returned HTTP 429.' })] } }
+        ] }, fetchPlans: { ...nativeMarketHoverPlans([description]),
+            [`https://steamcommunity.com/inventory/${PARTNER}/570/2/?l=english&count=2000`]: [{ data: currentClassInventory([]) }] }
+    });
+    await page.waitForFunction(() => document.querySelector('#tradeofferid_653 .sih-lite-trade-summary')?.textContent.includes('Steam Market returned HTTP 429'));
+    assert.equal(await listBadge(page, 'receive', 0, '653').count(), 0);
+    assert.equal(await offerSummary(page, '653').locator('[data-role="receive"]').textContent(), 'You receive: Unavailable');
+    assert.equal(await offerSummary(page, '653').locator('[data-role="net"]').textContent(), 'Known difference: −$2.50');
+    await offerSummary(page, '653').locator('.sih-lite-trade-retry:enabled').click();
+    await waitText(listBadge(page, 'receive', 0, '653'), '~$4.18');
+    assert.equal(await offerSummary(page, '653').locator('[data-role="receive"]').textContent(), 'You receive: $4.18 (estimated)');
+    assert.equal(await offerSummary(page, '653').locator('[data-role="net"]').textContent(), 'Estimated gain: +$1.68');
+    assert.match(await listBadge(page, 'receive', 0, '653').getAttribute('title'), /Cached Steam Market estimate/);
+    assert.match(await offerSummary(page, '653').locator('[data-role="status"]').textContent(), /Cached Steam Market estimate/);
+    assert.equal(await offerSummary(page, '653').locator('.sih-lite-trade-retry').isVisible(), true);
+    const requests = await page.evaluate(() => window.__chromeRequests.filter(request => request.action === 'fetchMarketQuotes'));
+    assert.equal(requests.length, 2);
+    assert.deepEqual(requests.map(request => request.names), [[description.market_hash_name], [description.market_hash_name]]);
+    assert.equal(requests[1].force, true);
+    await offerSummary(page, '653').locator('.sih-lite-trade-diagnostics').click();
+    await waitText(offerSummary(page, '653').locator('[data-role="diagnostics-status"]'), 'Price diagnostics copied.');
+    const report = JSON.parse(await page.evaluate(() => window.__copiedDiagnostics.at(-1)));
+    const received = report.items.find(record => record.location === 'summary.receive[0]');
+    assert.equal(received.market.quote.cached, true);
+    assert.equal(received.price.totalCents, 418);
+});
+
+test('colored TB and nontradable Candy never request generic market prices, and malformed currency quotes stay unknown', async t => {
+    const head = nativeMarketFixture('steam-inscribed-demon-eater-head.json');
+    const colored = nativeMarketFixture('steam-inscribed-terrorblade-deep-blue.json');
+    const candy = { appid: 570, classid: '65002', instanceid: '0', market_hash_name: 'Candy Pie', tradable: 0, marketable: 0,
+        name_color: 'D2D2D2', tags: [{ category: 'Quality', internal_name: 'unique' }], descriptions: [] };
+    const snapshot = listSnapshot([listOffer('654', { active: false,
+        give: [item(OWNER, '100', 'Shared Item')], receive: [head, colored, candy].map(description => marketClassItem(description)) })]);
+    const page = await openList(t, { snapshot,
+        prices: { [OWNER]: DEFAULT_PRICES[OWNER], [PARTNER]: [{ assetid: '7999', marketHashName: 'Unrelated Item', priceCents: 100 }] },
+        plans: { fetchMarketQuotes: [{ success: true, data: { currency: 'USD', errors: [], missingNames: [],
+            items: [marketQuote(head.market_hash_name, 209, { currency: 'EUR' })] } }] },
+        fetchPlans: { ...nativeMarketHoverPlans([head, colored, candy]),
+            [`https://steamcommunity.com/inventory/${PARTNER}/570/2/?l=english&count=2000`]: [{ data: currentClassInventory([]) }] }
+    });
+    await page.waitForFunction(() => window.__chromeRequests.some(request => request.action === 'fetchMarketQuotes'));
+    await offerSummary(page, '654').locator('.sih-lite-trade-retry:enabled').waitFor();
+    await frames(page);
+    for (let index = 0; index < 3; index++) assert.equal(await listBadge(page, 'receive', index, '654').count(), 0);
+    assert.match(await offerSummary(page, '654').locator('[data-role="status"]').textContent(), /invalid USD estimates/);
+    assert.match(await offerSummary(page, '654').locator('[data-role="status"]').textContent(), /3 items unpriced/);
+    assert.equal(await offerSummary(page, '654').locator('[data-role="net"]').textContent(), 'Known difference: −$2.50');
+    const requests = await page.evaluate(() => window.__chromeRequests.filter(request => request.action === 'fetchMarketQuotes'));
+    assert.equal(requests.length, 1);
+    assert.deepEqual(requests[0].names, [head.market_hash_name]);
+});
+
 test('historical rune, kinetic and Inscribed TB cards use labeled owner class estimates after every public inventory page is verified', async t => {
     const snapshot = listSnapshot([listOffer('610', { active: false, incoming: false,
         give: [item(OWNER, null, '', '1', { classId: '6100', instanceId: '0' }),
@@ -1177,7 +1332,7 @@ test('conflicting or missing class candidate quotes remain unknown and copied di
     await waitText(offerSummary(page, '611').locator('[data-role="diagnostics-status"]'), 'Price diagnostics copied.');
     const copied = await page.evaluate(() => window.__copiedDiagnostics.at(-1));
     const report = JSON.parse(copied);
-    assert.equal(report.version, '1.3.4');
+    assert.equal(report.version, '1.3.5');
     assert.equal(report.offer.offerId, '611');
     assert.equal(report.offer.meSteamId, OWNER);
     assert.equal(report.offer.partnerSteamId, PARTNER);

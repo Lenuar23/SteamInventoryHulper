@@ -1,0 +1,63 @@
+{
+  "appid": "570",
+  "classid": "3481251699",
+  "instanceid": "9040948511",
+  "name": "Autographed Wraithbinder",
+  "market_hash_name": "Autographed Wraithbinder",
+  "market_name": "Autographed Wraithbinder",
+  "name_color": "D2D2D2",
+  "type": "Immortal shoulder",
+  "tradable": 1,
+  "marketable": 1,
+  "commodity": 0,
+  "descriptions": [
+    {
+      "type": "html",
+      "value": "Used By: Arc Warden",
+      "name": "attribute"
+    },
+    {
+      "type": "html",
+      "value": "Though unable to cross over of their own will, some types of wraith love nothing more than to consume the energies of the mortal plane. Because each shred of power they absorb manifests tenfold in their home realm, they gladly trade service to Zett for the access he grants to our world.",
+      "name": "attribute"
+    },
+    {
+      "type": "html",
+      "value": "<div style=\"white-space: nowrap; margin: 10px\"><div style=\"white-space: nowrap; padding: 3px;\"><div style=\"width: 60px; height: 32px; vertical-align: top; display: inline-block;\"><div style=\"position: relative; width: 48px; height: 32px; vertical-align: top; display: inline-block; border: 2px solid rgb(255, 255, 255);\"><div style=\"position: absolute; width: 48px; height: 32px; vertical-align: top; display: inline-block; background-size: contain; background-image: url(https://cdn.steamstatic.com/apps/570/icons/econ/tools/sign_autograph.77eb3878121ec884b4622a2f347a03018b3a8cc6.png)\"></div></div></div><div style=\"vertical-align: top; display: inline-block; margin-left: 12px padding: 2px\"><span style=\"font-size: 18px; white-space: normal; color: rgb(255, 255, 255)\">International 2019 Autograph by Owen 'ODPixel' Davies</span><br><span style=\"font-size: 12px\">Autograph Rune</span></div><div style=\"position: absolute; width: 148px; vertical-align: top; display: inline-block; background-size: contain; background-image: url(https://cdn.steamstatic.com/apps/570/econ/autographs/odpixel_ti9)\"></div></div></div>"
+    }
+  ],
+  "tags": [
+    {
+      "internal_name": "unique",
+      "name": "Standard",
+      "category": "Quality",
+      "color": "D2D2D2",
+      "category_name": "Quality"
+    },
+    {
+      "internal_name": "Rarity_Immortal",
+      "name": "Immortal",
+      "category": "Rarity",
+      "color": "e4ae39",
+      "category_name": "Rarity"
+    },
+    {
+      "internal_name": "wearable",
+      "name": "Wearable",
+      "category": "Type",
+      "category_name": "Type"
+    },
+    {
+      "internal_name": "shoulder",
+      "name": "Shoulder",
+      "category": "Slot",
+      "category_name": "Slot"
+    },
+    {
+      "internal_name": "npc_dota_hero_arc_warden",
+      "name": "Arc Warden",
+      "category": "Hero",
+      "category_name": "Hero"
+    }
+  ]
+}

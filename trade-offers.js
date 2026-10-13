@@ -94,6 +94,9 @@
     if (typeof value.catalogFingerprint === 'string' && value.catalogFingerprint.length <= 600) {
       item.catalogFingerprint = value.catalogFingerprint;
     }
+    if (typeof value.marketFingerprint === 'string' && value.marketFingerprint.length <= 600) {
+      item.marketFingerprint = value.marketFingerprint;
+    }
     const currencyId = numericId(value.currencyId ?? value.currencyid);
     if (value.isCurrency === true || value.is_currency === true || currencyId) {
       item.isCurrency = true;
@@ -152,7 +155,7 @@
         const item = normalizeItem({ ...old, market_hash_name: metadata.market_hash_name,
           hasGems: old.hasGems || metadata.hasGems, hasColoredGem: old.hasColoredGem || metadata.hasColoredGem,
           variantFingerprint: metadata.variantFingerprint, ordinaryFingerprint: metadata.ordinaryFingerprint,
-          catalogFingerprint: metadata.catalogFingerprint,
+          catalogFingerprint: metadata.catalogFingerprint, marketFingerprint: metadata.marketFingerprint,
           tradable: old.tradable === false || old.tradable === 0 || metadata.tradable === false || metadata.tradable === 0 ? false : metadata.tradable ?? old.tradable,
           marketable: old.marketable === false || old.marketable === 0 || metadata.marketable === false || metadata.marketable === 0 ? false : metadata.marketable ?? old.marketable }, old.ownerSteamId);
         if (!item) continue;
@@ -484,7 +487,8 @@
             hasGems: Boolean(gems?.hasGems), hasColoredGem: Boolean(gems?.hasColoredGem),
             variantFingerprint: Prices?.variantFingerprint(description) || null,
             ordinaryFingerprint: Prices?.ordinaryFingerprint(description) || null,
-            catalogFingerprint: Prices?.catalogFingerprint(description) || null };
+            catalogFingerprint: Prices?.catalogFingerprint(description) || null,
+            marketFingerprint: Prices?.marketFingerprint(description) || null };
           for (const field of ['tradable', 'marketable']) {
             if (description[field] === false || description[field] === 0) entry[field] = false;
             else if (description[field] === true || description[field] === 1) entry[field] = true;

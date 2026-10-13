@@ -1,0 +1,69 @@
+{
+  "appid": "570",
+  "classid": "9024431975",
+  "instanceid": "9040948513",
+  "name": "''серктерные сапожки''",
+  "market_hash_name": "Inscribed Mecha Boots of Travel Mk III",
+  "market_name": "Inscribed Mecha Boots of Travel Mk III",
+  "name_color": "CF6A32",
+  "type": "Immortal Boots",
+  "tradable": 1,
+  "marketable": 1,
+  "commodity": 0,
+  "descriptions": [
+    {
+      "type": "html",
+      "value": "Used By: Tinker",
+      "name": "attribute"
+    },
+    {
+      "type": "html",
+      "value": "The International 2014",
+      "color": "99ccff",
+      "name": "attribute"
+    },
+    {
+      "type": "html",
+      "value": "Why rely on uncertain sorcery when an unstable machine can be just as dangerous? Painstakingly reconstructed from half-remembered schematics, the transdimensional technologies built into these boots is theorized to have caused the Violet Plateau Incident. Of course, that couldn't possibly happen again. Er, could it?",
+      "name": "attribute"
+    },
+    {
+      "type": "html",
+      "value": "<div style=\"white-space: nowrap; margin: 10px\"><div style=\"white-space: nowrap; padding: 3px;\"><div style=\"width: 60px; height: 32px; vertical-align: top; display: inline-block;\"><div style=\"position: relative; width: 48px; height: 32px; vertical-align: top; display: inline-block; border: 2px solid rgb(255, 255, 255);\"><div style=\"position: absolute; width: 48px; height: 32px; vertical-align: top; display: inline-block; background-size: contain; background-image: url(https://cdn.steamstatic.com/apps/570/icons/econ/sockets/gem_stat.30d7935c1f0a1b9e8e28c691c2bd28f7d5f471bc.png)\"></div></div></div><div style=\"vertical-align: top; display: inline-block; margin-left: 12px padding: 2px\"><span style=\"font-size: 18px; white-space: normal; color: rgb(255, 255, 255)\">Laser Kills: 298</span><br><span style=\"font-size: 12px\">Inscribed Gem</span></div></div><div style=\"white-space: nowrap; padding: 3px;\"><div style=\"width: 60px; height: 32px; vertical-align: top; display: inline-block;\"><div style=\"position: relative; width: 48px; height: 32px; vertical-align: top; display: inline-block; border: 2px solid rgb(255, 255, 255);\"><div style=\"position: absolute; width: 48px; height: 32px; vertical-align: top; display: inline-block; background-size: contain; background-image: url(https://cdn.steamstatic.com/apps/570/icons/econ/sockets/gem_stat.30d7935c1f0a1b9e8e28c691c2bd28f7d5f471bc.png)\"></div></div></div><div style=\"vertical-align: top; display: inline-block; margin-left: 12px padding: 2px\"><span style=\"font-size: 18px; white-space: normal; color: rgb(255, 255, 255)\">Heat-Seeking Missile Double Kills: 14</span><br><span style=\"font-size: 12px\">Inscribed Gem</span></div></div><div style=\"white-space: nowrap; padding: 3px;\"><div style=\"width: 60px; height: 32px; vertical-align: top; display: inline-block;\"><div style=\"position: relative; width: 48px; height: 32px; vertical-align: top; display: inline-block; border: 2px solid rgb(255, 255, 255);\"><div style=\"position: absolute; width: 48px; height: 32px; vertical-align: top; display: inline-block; background-size: contain; background-image: url(https://cdn.steamstatic.com/apps/570/icons/econ/sockets/gem_stat.30d7935c1f0a1b9e8e28c691c2bd28f7d5f471bc.png)\"></div></div></div><div style=\"vertical-align: top; display: inline-block; margin-left: 12px padding: 2px\"><span style=\"font-size: 18px; white-space: normal; color: rgb(255, 255, 255)\">Teleports to Base: 4260</span><br><span style=\"font-size: 12px\">Inscribed Gem</span></div></div><div style=\"white-space: nowrap; padding: 3px;\"><div style=\"width: 60px; height: 32px; vertical-align: top; display: inline-block;\"><div style=\"position: relative; width: 48px; height: 32px; vertical-align: top; display: inline-block; border: 2px solid rgb(255, 255, 255);\"><div style=\"position: absolute; width: 48px; height: 32px; vertical-align: top; display: inline-block; background-size: contain; background-image: url(https://cdn.steamstatic.com/apps/570/icons/econ/sockets/gem_stat.30d7935c1f0a1b9e8e28c691c2bd28f7d5f471bc.png)\"></div></div></div><div style=\"vertical-align: top; display: inline-block; margin-left: 12px padding: 2px\"><span style=\"font-size: 18px; white-space: normal; color: rgb(255, 255, 255)\">Rearms: 16460</span><br><span style=\"font-size: 12px\">Inscribed Gem</span></div></div><div style=\"white-space: nowrap; padding: 3px;\"><div style=\"width: 60px; height: 32px; vertical-align: top; display: inline-block;\"><div style=\"position: relative; width: 48px; height: 32px; vertical-align: top; display: inline-block; border: 2px solid rgb(255, 255, 255);\"><div style=\"position: absolute; width: 48px; height: 32px; vertical-align: top; display: inline-block; background-size: contain; background-image: url(https://cdn.steamstatic.com/apps/570/icons/econ/sockets/gem_animation.5382a038dccfcc17afca6e4c429993fed96a5482.png)\"></div></div></div><div style=\"vertical-align: top; display: inline-block; margin-left: 12px padding: 2px\"><span style=\"font-size: 18px; white-space: normal; color: rgb(255, 255, 255)\">Booties of Travel!</span><br><span style=\"font-size: 12px\">Kinetic Gem</span></div></div></div>"
+    }
+  ],
+  "tags": [
+    {
+      "internal_name": "strange",
+      "name": "Inscribed",
+      "category": "Quality",
+      "color": "CF6A32",
+      "category_name": "Quality"
+    },
+    {
+      "internal_name": "Rarity_Immortal",
+      "name": "Immortal",
+      "category": "Rarity",
+      "color": "e4ae39",
+      "category_name": "Rarity"
+    },
+    {
+      "internal_name": "wearable",
+      "name": "Wearable",
+      "category": "Type",
+      "category_name": "Type"
+    },
+    {
+      "internal_name": "misc",
+      "name": "Misc",
+      "category": "Slot",
+      "category_name": "Slot"
+    },
+    {
+      "internal_name": "npc_dota_hero_tinker",
+      "name": "Tinker",
+      "category": "Hero",
+      "category_name": "Hero"
+    }
+  ]
+}

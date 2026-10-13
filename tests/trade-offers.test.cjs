@@ -258,6 +258,44 @@ test('verified hover variant fingerprints survive class-only hydration without i
   assert.equal(result.item.variantFingerprint, details.classItems[0].variantFingerprint);
 });
 
+test('public original-five quality classes carry exact Market proofs through native historical card hydration', async () => {
+  const descriptions = ['steam-inscribed-mecha-boots-travel.json', 'steam-autographed-wraithbinder.json',
+    'steam-inscribed-demon-eater-head.json', 'steam-inscribed-arms-of-desolation.json', 'steam-inscribed-demon-eater.json']
+    .map(file => require('./fixtures/' + file));
+  const offer = { offerId: '500', meSteamId: ME, partnerSteamId: PARTNER,
+    give: descriptions.map(description => ({ ownerSteamId: ME, appId: '570', classId: description.classid,
+      instanceId: description.instanceid, assetId: null, amount: 1 })), receive: [] };
+  let requests = 0;
+  const details = await Offers.fetchClassDescriptions(offer, ME, async href => {
+    requests++;
+    const description = descriptions.find(value => href.includes(`/${value.classid}/${value.instanceid}?`));
+    assert.ok(description);
+    return { ok: true, text: async () => `<script>BuildHover('economy_item_test',${JSON.stringify(description)});</script>` };
+  });
+  assert.equal(requests, 5);
+  assert.ok(details.classItems.every(item => item.marketFingerprint && item.tradable === true && item.marketable === true));
+  assert.ok(details.classItems.every(item => !Object.hasOwn(item, 'descriptions') && !Object.hasOwn(item, 'description')));
+  const ownSlots = descriptions.map(description => `<div class="trade_item" data-economy-item="classinfo/570/${description.classid}/${description.instanceid}"></div>`).join('');
+  const html = fixture({ incoming: false, historical: true, classOnly: true })
+    .replace('<div class="trade_item" data-economy-item="classinfo/570/700/0"></div>', ownSlots)
+    .replace('<div class="trade_item" data-economy-item="classinfo/570/701/0"></div>', '');
+  const result = await inDocument(html, ({ me, details }) => {
+    const [offer] = SIHLiteTradeOffers.read(document, { meSteamId: me }, { '500': details });
+    return { active: offer.active, items: offer.give };
+  }, { details });
+  assert.equal(result.active, false);
+  const Prices = require('../trade-prices.js');
+  result.items.forEach((item, index) => {
+    assert.equal(item.assetId, null);
+    assert.equal(item.market_hash_name, descriptions[index].market_hash_name);
+    assert.equal(Prices.marketFingerprint(item), details.classItems[index].marketFingerprint);
+  });
+  const first = details.classItems[0];
+  const unavailable = Offers.normalizeItem({ ...first, marketable: false }, ME);
+  assert.equal(unavailable.marketable, false);
+  assert.equal(Prices.marketFingerprint(unavailable), null, 'native unavailable flags cannot be masked by a supplied proof');
+});
+
 test('verified plain Standard class metadata carries an ordinary estimate key without asset or context identity', async () => {
   const offer = { offerId: '500', meSteamId: ME, partnerSteamId: PARTNER,
     give: [{ ownerSteamId: ME, appId: '570', classId: '86111', instanceId: '0', assetId: null, amount: 1 }],

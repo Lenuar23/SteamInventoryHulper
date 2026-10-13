@@ -33,20 +33,35 @@
     const result = { ...slot.item };
     if (!value) return result;
     const description = value.description && typeof value.description === 'object' ? value.description : value;
-    const owner = value.ownerSteamId ?? value.owner;
-    if (owner && String(owner) !== result.ownerSteamId) return result;
-    const classId = value.classid ?? description.classid;
-    const instanceId = value.instanceid ?? description.instanceid;
-    if (result.classId && classId != null && String(classId) !== result.classId) return result;
-    if (result.instanceId != null && instanceId != null && String(instanceId) !== result.instanceId) return result;
+    const records = value === description ? [value] : [value, description];
+    const classes = [], instances = [];
+    for (const record of records) {
+      const owner = record.ownerSteamId ?? record.owner;
+      if (owner && String(owner) !== result.ownerSteamId) return result;
+      if (['appId', 'appid'].some(field => record[field] != null && String(record[field]) !== result.appId)) return result;
+      if (result.contextId != null && ['contextId', 'contextid', 'context_id'].some(field => record[field] != null && String(record[field]) !== result.contextId)) return result;
+      for (const field of ['classId', 'classid']) if (record[field] != null) classes.push(String(record[field]));
+      for (const field of ['instanceId', 'instanceid']) if (record[field] != null) instances.push(String(record[field]));
+    }
+    if (classes.some(id => id !== classes[0] || (result.classId && id !== result.classId))) return result;
+    if (instances.some(id => id !== instances[0] || (result.instanceId != null && id !== result.instanceId))) return result;
+    const nativeAssetId = String(value.assetid ?? value.assetId ?? value.id ?? '');
+    // A class hover cannot establish ownership or an asset's identity.
+    if (result.assetId && nativeAssetId && nativeAssetId !== result.assetId) return result;
     const canonical = description.market_hash_name ?? description.marketHashName;
     if (typeof canonical === 'string' && canonical.length <= 512) result.market_hash_name = canonical;
-    const nativeAssetId = String(value.assetid ?? '');
-    // A class hover cannot establish ownership or an asset's identity.
-    if (result.assetId && nativeAssetId && nativeAssetId !== result.assetId) return slot.item;
     const info = globalThis.SIHLiteGems?.analyzeSteamAsset(value);
     if (info?.hasGems) result.hasGems = true;
     if (info?.hasColoredGem) result.hasColoredGem = true;
+    for (const field of ['tradable', 'marketable']) {
+      const flags = records.map(record => record[field]);
+      if (flags.some(flag => flag === false || flag === 0)) result[field] = false;
+      else if (flags.some(flag => flag === true || flag === 1)) result[field] = true;
+    }
+    const malformedFlags = records.some(record => ['tradable', 'marketable'].some(field =>
+      Object.prototype.hasOwnProperty.call(record, field) && ![true, false, 1, 0].includes(record[field])));
+    const fingerprint = !malformedFlags && globalThis.SIHLiteTradePrices?.marketFingerprint({ ...result, description });
+    if (fingerprint) result.marketFingerprint = fingerprint;
     return result;
   }
 
